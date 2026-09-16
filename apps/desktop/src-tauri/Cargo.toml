@@ -1,0 +1,33 @@
+[package]
+name = "desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "desktop_lib"
+crate-type = ["lib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+automation-core = { path = "../../../crates/automation-core" }
+platform-mock = { path = "../../../crates/platform-mock" }
+storage = { path = "../../../crates/storage" }
+vision = { path = "../../../crates/vision" }
+tauri = { version = "2.0.0", features = [] }
+tauri-plugin-opener = "2.0.0"
+# 仅用于把标定预览的 PNG 以 base64 回传给界面。
+base64 = "0.22"
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+platform-windows = { path = "../../../crates/platform-windows" }
+
+[dev-dependencies]
+# `test` 特性提供 `tauri::test::mock_builder` / `MockRuntime`，
+# 让命令层可以在不启动真实窗口的前提下被自动化验证。
+tauri = { version = "2.0.0", features = ["test"] }

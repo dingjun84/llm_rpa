@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+    这份清单只给 `cargo test` 产出的测试二进制用。
+
+    测试目标不会经过 tauri-build 的清单嵌入流程，因此默认没有
+    Microsoft.Windows.Common-Controls v6 声明。没有它时，Windows 会把
+    comctl32.dll 解析到 System32 下的 v5，而 tauri 依赖链里的 muda
+    会导入只存在于 v6 的 TaskDialogIndirect，于是进程在进入 main 之前
+    就因 STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) 直接死掉——
+    表现是 `cargo test` 报 "test exited abnormally" 且没有任何输出。
+
+    build.rs 通过 `cargo:rustc-link-arg-tests` 把这份清单塞进测试目标。
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>

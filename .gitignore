@@ -1,0 +1,59 @@
+# ============================================================
+# 只提交源代码与文档；一切构建产物、依赖、运行期数据都不入库
+# ============================================================
+
+# ---------- Rust / Cargo 构建产物 ----------
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+*.ilk
+*.exp
+
+# ---------- Node / 前端依赖与产物 ----------
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+dist-ssr/
+.vite/
+*.tsbuildinfo
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- Tauri 自动生成的 ACL / schema 快照 ----------
+apps/desktop/src-tauri/gen/schemas/
+
+# ---------- 运行期数据：审计库 / 证据截图 / 日志 ----------
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+/data/
+/evidence/
+/logs/
+*.log
+
+# ---------- 环境变量与密钥 ----------
+.env
+.env.*
+!.env.example
+
+# ---------- 编辑器 / 系统垃圾 ----------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 本地 AI 工具链数据（非项目源码）----------
+.workbuddy-ai/
