@@ -38,6 +38,22 @@ pub struct WindowsDesktopConfig {
     pub clipboard_read_timeout: Duration,
     /// 单次捕获允许的最大像素数，防止误传整屏导致内存暴涨。
     pub max_capture_pixels: u64,
+    /// 只读预览允许的最大像素数。
+    ///
+    /// 比 [`Self::max_capture_pixels`] 宽松得多，因为标定**本来就要看整个窗口**，
+    /// 而窗口可能是最大化的。默认 4000 万像素（约 8K），足以覆盖任何真实显示器，
+    /// 又能挡住"某个窗口谎报了一个天文数字般的矩形"这种情况。
+    pub preview_max_pixels: u64,
+    /// 发出置前请求后，等前台真正切过去的最长时间。默认 400ms。
+    ///
+    /// `SetForegroundWindow` 返回成功只表示"请求被接受"，实际切换由窗口管理器
+    /// **异步**完成。立刻去读 `GetForegroundWindow()` 会把"还没切完"误判成
+    /// "切换失败"，于是明明能用的窗口被判成不可用。
+    ///
+    /// 400ms 的依据：真实切换通常在几十毫秒内完成；而被前台锁定策略吞掉的请求
+    /// **永远不会**生效，等再久也没用。所以这是个"等结算"而不是"等重试"的窗口，
+    /// 取一个远大于正常耗时、又短到不会让人察觉的值。
+    pub foreground_settle_timeout: Duration,
 }
 
 impl Default for WindowsDesktopConfig {
@@ -49,6 +65,8 @@ impl Default for WindowsDesktopConfig {
             clear_clipboard_after_paste: true,
             clipboard_read_timeout: Duration::from_millis(600),
             max_capture_pixels: 4_000_000,
+            preview_max_pixels: 40_000_000,
+            foreground_settle_timeout: Duration::from_millis(400),
         }
     }
 }

@@ -193,6 +193,40 @@ fn input_is_refused_when_no_window_has_been_located() {
     assert!(matches!(send, Err(AutomationError::ClientNotReady)));
 }
 
+/// 滚动与点击受同一套守卫保护：没定位到窗口就不许滚。
+///
+/// 滚轮事件送给**光标下**的窗口，滚错窗口会把别人的界面滚走——
+/// 所以它和点击一样需要"前台窗口 == 目标窗口"这道闸。
+#[test]
+fn scrolling_is_refused_when_no_window_has_been_located() {
+    let desktop = WindowsDesktop::new(WindowsDesktopConfig::for_title_prefix("不存在的窗口标题"));
+
+    let err = desktop
+        .scroll(
+            automation_core::Point { x: 1, y: 1 },
+            3,
+            Rect { x: 0, y: 0, width: 100, height: 100 },
+        )
+        .unwrap_err();
+    assert!(matches!(err, AutomationError::ClientNotReady));
+}
+
+/// 滚 0 格是合法的空操作，但同样要先有已定位的窗口——
+/// 不能因为"反正什么都不做"就绕开守卫。
+#[test]
+fn scrolling_zero_notches_still_requires_a_located_window() {
+    let desktop = WindowsDesktop::new(WindowsDesktopConfig::for_title_prefix("不存在的窗口标题"));
+
+    let err = desktop
+        .scroll(
+            automation_core::Point { x: 1, y: 1 },
+            0,
+            Rect { x: 0, y: 0, width: 100, height: 100 },
+        )
+        .unwrap_err();
+    assert!(matches!(err, AutomationError::ClientNotReady));
+}
+
 #[test]
 fn capture_is_refused_before_a_window_is_located() {
     let desktop = WindowsDesktop::new(WindowsDesktopConfig::for_title_prefix("不存在的窗口标题"));
@@ -222,6 +256,113 @@ fn oversized_capture_is_refused() {
 fn finding_a_window_that_does_not_exist_reports_an_error() {
     let result = winapi::find_window_by_title_prefix("绝对不存在的窗口标题_7f3a9c");
     assert!(result.is_err());
+}
+
+/// 回归：`preview` 的"只读"承诺必须成立——**不抢焦点**。
+///
+/// 区域标定用的是 `preview` 而不是 `focus_wecom`，理由正是
+/// `SetForegroundWindow` 在 Windows 前台锁定策略下经常被拒绝
+/// （调用方自身不在前台时），会让这个功能时灵时不灵。
+///
+/// 这个用例把"不抢焦点"变成可执行的断言：如果以后有人为了"让截图更好看"
+/// 往 `preview` 里加一次置前，这里会立刻失败。
+#[test]
+fn preview_does_not_steal_the_foreground_window() {
+    let before = winapi::foreground_window();
+
+    // `Progman` 是桌面窗口，任何交互式会话里都存在，且正常不会是前台窗口。
+    let desktop = WindowsDesktop::new(WindowsDesktopConfig {
+        window_matcher: WindowMatcher::ClassName("Progman".to_string()),
+        ..WindowsDesktopConfig::default()
+    });
+
+    let preview = match desktop.preview() {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("跳过：当前会话没有可用的交互式桌面（{err}）");
+            return;
+        }
+    };
+
+    let after = winapi::foreground_window();
+    assert!(
+        winapi::same_window(before, after),
+        "preview 改变了前台窗口：标定预览绝不能抢焦点"
+    );
+
+    let (rect, shot) = preview;
+    assert!(!rect.is_degenerate(), "窗口矩形不应退化：{rect:?}");
+    assert_eq!(
+        shot.width, rect.width as u32,
+        "截图宽度应与窗口矩形一致"
+    );
+    assert_eq!(
+        shot.height, rect.height as u32,
+        "截图高度应与窗口矩形一致"
+    );
+    assert_eq!(
+        shot.pixels.len(),
+        rect.width as usize * rect.height as usize * 4,
+        "应为 BGRA 每像素 4 字节"
+    );
+    assert_eq!(shot.fingerprint.len(), 64);
+}
+
+/// `preview` 是只读的：即使从没调用过 `focus_wecom`，也应该能独立定位并截图。
+///
+/// 这一点很重要——标定面板是用户打开应用后**第一件**要做的事，
+/// 此时还没有任何任务跑过，`self.target` 还是空的。
+#[test]
+fn preview_works_without_a_prior_focus_call() {
+    let desktop = WindowsDesktop::new(WindowsDesktopConfig {
+        window_matcher: WindowMatcher::ClassName("Progman".to_string()),
+        ..WindowsDesktopConfig::default()
+    });
+
+    match desktop.preview() {
+        Ok((rect, shot)) => {
+            assert!(!rect.is_degenerate());
+            assert!(shot.pixels.iter().any(|byte| *byte != 0), "画面不应全黑");
+        }
+        Err(err) => eprintln!("跳过：当前会话没有可用的交互式桌面（{err}）"),
+    }
+}
+
+/// 定位不到窗口时，`preview` 必须报错而不是返回一张空白图。
+#[test]
+fn preview_refuses_when_the_window_is_absent() {
+    let desktop = WindowsDesktop::new(WindowsDesktopConfig {
+        window_matcher: WindowMatcher::ClassName("绝对不存在的窗口类_7f3a9c".to_string()),
+        ..WindowsDesktopConfig::default()
+    });
+
+    let err = desktop.preview().unwrap_err();
+    assert!(
+        matches!(err, AutomationError::ClientNotReady),
+        "找不到窗口时必须报 ClientNotReady，不能拿空白图糊弄：{err:?}"
+    );
+}
+
+/// 预览也要有资源上限：窗口矩形是外部数据，不能拿它直接分配内存。
+#[test]
+fn preview_is_refused_when_the_window_exceeds_the_preview_budget() {
+    let config = WindowsDesktopConfig {
+        window_matcher: WindowMatcher::ClassName("Progman".to_string()),
+        preview_max_pixels: 100,
+        ..WindowsDesktopConfig::default()
+    };
+    let desktop = WindowsDesktop::new(config);
+
+    match desktop.preview() {
+        Err(AutomationError::NeedsHumanReview(message)) => {
+            assert!(
+                message.contains("预览上限"),
+                "应说明是被预览上限拒绝：{message}"
+            );
+        }
+        Err(other) => eprintln!("跳过：当前会话没有可用的交互式桌面（{other}）"),
+        Ok(_) => panic!("超过预览上限时必须拒绝，而不是照单全收"),
+    }
 }
 
 /// 回归：`capture` 曾经会**自己把自己锁死**。
@@ -263,4 +404,52 @@ fn capture_does_not_deadlock_on_its_own_lock() {
              —— 不要在 match 的受检表达式里持锁，再去调用会再次加锁的方法"
         ),
     }
+}
+
+// ── 「用鼠标指认目标窗口」的地基 ────────────────────────────────────────
+
+#[test]
+fn cursor_position_is_readable() {
+    let (x, y) = winapi::cursor_position().expect("应能读取光标位置");
+    // 多显示器下出现负坐标是合法的，所以不能断言 >= 0；
+    // 但 ±32767 这种值说明读到的是未初始化的内存。
+    assert!(x.abs() < 32_768 && y.abs() < 32_768, "光标坐标异常：({x},{y})");
+}
+
+#[test]
+fn window_from_point_is_total() {
+    // 屏外坐标：不能 panic，且应当没有窗口。
+    assert!(
+        winapi::window_from_point(-100_000, -100_000).is_none(),
+        "屏外坐标不该返回窗口"
+    );
+
+    let (x, y) = winapi::cursor_position().expect("应能读取光标位置");
+    let Some(hwnd) = winapi::window_from_point(x, y) else {
+        // 光标停在桌面本体上，这是合法情况，跳过。
+        return;
+    };
+    assert!(!hwnd.0.is_null());
+    // 拿到的一定是**顶层**窗口：它必须有有效的边界。
+    let rect = winapi::window_rect(hwnd).expect("顶层窗口应当有有效边界");
+    assert!(rect.width > 0 && rect.height > 0, "窗口边界无效：{rect:?}");
+}
+
+#[test]
+fn window_process_path_points_at_a_real_executable() {
+    let foreground = winapi::foreground_window();
+    if foreground.0.is_null() {
+        return; // 无头环境：跳过，不把环境问题当缺陷。
+    }
+    let path = match winapi::window_process_path(foreground) {
+        Ok(path) => path,
+        // 权限受限时读不到进程路径，这也是环境问题，不是缺陷。
+        Err(_) => return,
+    };
+    assert!(path.is_file(), "进程路径应当真实存在：{}", path.display());
+    assert!(
+        path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("exe")),
+        "可执行文件应当以 .exe 结尾：{}",
+        path.display()
+    );
 }

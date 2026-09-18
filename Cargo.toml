@@ -6,6 +6,9 @@ members = [
   "crates/storage",
   "crates/vision",
   "apps/desktop/src-tauri",
+  # 独立的 WebView 渲染探针：只用来判断"界面出不来"是环境问题还是主应用前端栈的问题。
+  # 与主应用没有任何代码依赖，删掉它（连同这一行）不影响主应用。
+  "apps/webview-probe",
   "tools/winocr",
 ]
 resolver = "2"

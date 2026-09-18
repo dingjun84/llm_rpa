@@ -2655,6 +2655,9 @@ name = "platform-windows"
 version = "0.1.0"
 dependencies = [
  "automation-core",
+ "image",
+ "serde",
+ "serde_json",
  "sha2",
  "vision",
  "windows 0.62.2",
@@ -4493,6 +4496,16 @@ dependencies = [
  "pkg-config",
  "soup3-sys",
  "system-deps",
+]
+
+[[package]]
+name = "webview-probe"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
 ]
 
 [[package]]

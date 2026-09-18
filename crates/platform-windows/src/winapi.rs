@@ -5,18 +5,20 @@
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use automation_core::Rect;
 use sha2::{Digest, Sha256};
-use windows::core::{BOOL, PCWSTR};
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND, LPARAM};
+use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HWND, LPARAM, MAX_PATH, POINT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     GetDeviceCaps, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
     HGDIOBJ, LOGPIXELSX, SRCCOPY,
 };
+// `PrintWindow` 虽然在 user32 里，但 windows-rs 把它归到了 `Storage::Xps` 下。
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetOpenClipboardWindow, OpenClipboard, SetClipboardData,
 };
@@ -24,27 +26,39 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessW, OpenProcess, QueryFullProcessImageNameW, PROCESS_INFORMATION,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, VIRTUAL_KEY, VK_A, VK_CONTROL,
-    VK_DELETE, VK_RETURN, VK_V,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_A,
+    VK_CONTROL, VK_DELETE, VK_RETURN, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible, SetCursorPos,
-    SetForegroundWindow, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE,
+    EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, SetCursorPos,
+    SetForegroundWindow, ShowWindow, WindowFromPoint, GA_ROOT, PW_RENDERFULLCONTENT, SM_CXSCREEN,
+    SM_CYSCREEN, SW_RESTORE,
 };
 
 /// `CF_UNICODETEXT`：Win32 中稳定的剪贴板格式常量。
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 
-pub type WinResult<T> = Result<T, String>;
+/// 窗口类名的最大长度。
+///
+/// Win32 规定类名**不超过 256 个字符**（`MAX_CLASS_NAME`），所以这个缓冲区
+/// 不可能截断。这里写死是**照规范来**，不是为了省事——不需要做成可配置的。
+const MAX_CLASS_NAME_CHARS: usize = 256;
 
-fn wide(text: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(text).encode_wide().chain(std::iter::once(0)).collect()
-}
+/// 读取进程可执行文件路径的缓冲区长度。
+///
+/// `MAX_PATH` 是 260，但带 `\\?\` 前缀的长路径可以远超它，所以按 4 倍开。
+/// 注意这个值**不是正确性边界**：`QueryFullProcessImageNameW` 在缓冲区不够时
+/// 会直接失败并报错，不会静默截断，所以"够用就行"。
+const PROCESS_PATH_BUFFER_CHARS: usize = MAX_PATH as usize * 4;
+
+pub type WinResult<T> = Result<T, String>;
 
 /// 捕获到的一帧画面（BGRA，自上而下）。
 pub struct CapturedFrame {
@@ -82,14 +96,131 @@ unsafe extern "system" fn enum_title_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     BOOL(1)
 }
 
+/// 按窗口类名查找**可见**的顶层窗口。
+///
+/// 为什么不用 `FindWindowW(class, null)`：它**不区分可见性**，而 Qt 系程序
+/// （微信 4.x 就是）**所有顶层窗口共用同一个类名**——主窗口、登录窗、设置窗，
+/// 以及各种隐藏的辅助窗口，类名全是 `Qt51514QWindowIcon`。
+/// `FindWindowW` 只按 Z 序返回第一个命中的，那个很可能是隐藏窗口，
+/// 于是"定位成功"却拿到一个退化矩形（0×0）或根本不是用户想要的那个窗口。
+///
+/// 改成 `EnumWindows` + `IsWindowVisible` + 类名比对，与按标题查找
+/// （[`find_window_by_title_prefix`]）的严格程度**完全一致**。`EnumWindows`
+/// 按 Z 序枚举（最上层在前），所以拿到的是**最靠上的那个可见匹配**。
+///
+/// `IsWindowVisible` 对**最小化**窗口返回真（它查的是 `WS_VISIBLE` 样式位，
+/// 与是否最小化、是否被遮挡无关），所以这个过滤不会误杀正常可用的窗口。
+///
+/// 注意这里**仍不校验窗口属于哪个进程**——需要那一层请用
+/// [`find_window_by_class_in_process`]。
 pub fn find_window_by_class(class_name: &str) -> WinResult<HWND> {
-    let class = wide(class_name);
-    let hwnd = unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }
-        .map_err(|err| format!("按类名查找窗口失败：{err}"))?;
-    if hwnd.0.is_null() {
-        return Err(format!("未找到类名为「{class_name}」的窗口"));
+    let mut ctx = ClassSearch { class: class_name.to_string(), found: None };
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_class_proc),
+            LPARAM(&mut ctx as *mut ClassSearch as isize),
+        );
     }
-    Ok(hwnd)
+    ctx.found.ok_or_else(|| format!("未找到类名为「{class_name}」的可见窗口"))
+}
+
+/// 按窗口类名查找**属于指定程序**的可见顶层窗口。
+///
+/// 为什么需要这一层：Qt 系程序（微信 4.x 就是）所有顶层窗口共用同一个类名，
+/// 主窗口、登录窗、设置窗、各种隐藏辅助窗口全是 `Qt51514QWindowIcon`。
+/// 只按类名匹配，拿到的是"Z 序最靠上的那个"，很可能不是你要的那个。
+/// 加上"属于哪个 exe"这一条，才能把"目标窗口"这件事说清楚。
+///
+/// 同样按 Z 序枚举，返回**最靠上的**可见匹配。
+pub fn find_window_by_class_in_process(class_name: &str, exe: &Path) -> WinResult<HWND> {
+    let mut ctx = OwnedClassSearch {
+        class: class_name.to_string(),
+        exe: exe.to_path_buf(),
+        found: None,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_class_in_process_proc),
+            LPARAM(&mut ctx as *mut OwnedClassSearch as isize),
+        );
+    }
+    ctx.found.ok_or_else(|| {
+        format!(
+            "未找到属于「{}」且类名为「{class_name}」的可见窗口",
+            exe.display()
+        )
+    })
+}
+
+struct OwnedClassSearch {
+    class: String,
+    exe: PathBuf,
+    found: Option<HWND>,
+}
+
+unsafe extern "system" fn enum_class_in_process_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let ctx = unsafe { &mut *(lparam.0 as *mut OwnedClassSearch) };
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return BOOL(1);
+    }
+    if window_class_name(hwnd) != ctx.class {
+        return BOOL(1);
+    }
+    if !process_matches(hwnd, &ctx.exe) {
+        return BOOL(1);
+    }
+    ctx.found = Some(hwnd);
+    BOOL(0)
+}
+
+/// 该窗口所属进程的可执行文件是不是 `exe`。
+///
+/// 比较用规范化后的路径、忽略大小写（Windows 路径不区分大小写）。
+/// `canonicalize` 失败（例如权限受限读不到）就退回原样比较——
+/// 宁可比较得松一点，也不要因为拿不到规范路径就断定"不是同一个程序"。
+///
+/// 读不到路径时返回 `false`：调用方是拿它当**准入条件**用的，
+/// "读不出来"不该被当成"就是它"。
+pub fn process_matches(hwnd: HWND, exe: &Path) -> bool {
+    let Ok(actual) = window_process_path(hwnd) else {
+        return false;
+    };
+    let normalize = |path: &Path| {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    };
+    normalize(&actual).eq_ignore_ascii_case(&normalize(exe))
+}
+
+/// 系统是否认为该窗口**未响应**。
+///
+/// `IsHungAppWindow` 由窗口管理器判定：窗口所属线程超过 5 秒没有从消息队列取消息，
+/// 系统就把它标记为未响应。它是**纯只读**查询——不发送消息、不改变焦点、
+/// 不等待对方线程，所以可以安全地放在每次点击之前。
+///
+/// 它只回答"界面线程还在不在转"，回答不了"界面有没有刷新"。
+/// 后者要靠画面变化来判断，两者是互补的，缺一不可。
+pub fn is_hung_window(hwnd: HWND) -> bool {
+    unsafe { IsHungAppWindow(hwnd).as_bool() }
+}
+
+struct ClassSearch {
+    class: String,
+    found: Option<HWND>,
+}
+
+unsafe extern "system" fn enum_class_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let ctx = unsafe { &mut *(lparam.0 as *mut ClassSearch) };
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return BOOL(1);
+    }
+    if window_class_name(hwnd) == ctx.class {
+        ctx.found = Some(hwnd);
+        return BOOL(0);
+    }
+    BOOL(1)
 }
 
 pub fn find_window_by_title_prefix(prefix: &str) -> WinResult<HWND> {
@@ -159,7 +290,7 @@ pub fn list_visible_windows() -> Vec<WindowInfo> {
 }
 
 pub fn window_class_name(hwnd: HWND) -> String {
-    let mut buffer = vec![0u16; 256];
+    let mut buffer = vec![0u16; MAX_CLASS_NAME_CHARS];
     let copied = unsafe { GetClassNameW(hwnd, &mut buffer) };
     if copied <= 0 {
         return String::new();
@@ -178,6 +309,65 @@ pub fn window_title(hwnd: HWND) -> String {
         return String::new();
     }
     OsString::from_wide(&buffer[..copied as usize]).to_string_lossy().into_owned()
+}
+
+/// 光标当前的屏幕坐标。
+///
+/// 只读，不改变任何状态。
+pub fn cursor_position() -> WinResult<(i32, i32)> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }.map_err(|err| format!("读取光标位置失败：{err}"))?;
+    Ok((point.x, point.y))
+}
+
+/// 屏幕坐标下那个**顶层**窗口。
+///
+/// `WindowFromPoint` 返回的可能是子控件（比如输入框本身），所以再上溯到根窗口 ——
+/// 调用方要的是「操作者指着哪个窗口」，不是「哪个控件」。
+///
+/// 该点落在桌面本体上时返回 `None`。
+///
+/// 只读，不改变焦点、不产生任何输入。这是「让操作者用鼠标指认目标窗口」
+/// 这个方案的地基：不需要知道窗口类名，也不需要把窗口置前。
+pub fn window_from_point(x: i32, y: i32) -> Option<HWND> {
+    let hwnd = unsafe { WindowFromPoint(POINT { x, y }) };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    Some(if root.0.is_null() { hwnd } else { root })
+}
+
+/// 窗口所属进程的可执行文件路径。
+///
+/// 这是**窗口身份校验**的关键一环：窗口类名可以被别的程序复用，
+/// 但「这个窗口属于哪个 exe」是进程级事实，靠它才能回答
+/// 「找到的这个窗口到底是不是目标程序」。
+///
+/// 用 `PROCESS_QUERY_LIMITED_INFORMATION` 而不是 `PROCESS_QUERY_INFORMATION`：
+/// 前者对权限的要求低得多，不需要提权，读到的信息已经够用。
+pub fn window_process_path(hwnd: HWND) -> WinResult<PathBuf> {
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 {
+        return Err("无法读取窗口所属进程 ID".to_string());
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(|err| format!("打开进程 {pid} 失败：{err}"))?;
+
+    let mut buffer = vec![0u16; PROCESS_PATH_BUFFER_CHARS];
+    let mut size = buffer.len() as u32;
+    let queried = unsafe {
+        QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size)
+    };
+    // 无论成败都要关句柄，否则每次调用漏一个内核对象。
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+
+    queried.map_err(|err| format!("读取进程 {pid} 的可执行文件路径失败：{err}"))?;
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..size as usize])))
 }
 
 pub fn window_rect(hwnd: HWND) -> WinResult<Rect> {
@@ -208,6 +398,29 @@ pub fn bring_to_foreground(hwnd: HWND) -> WinResult<()> {
 
 pub fn foreground_window() -> HWND {
     unsafe { GetForegroundWindow() }
+}
+
+/// 有界等待 `hwnd` 成为前台窗口；超时返回 `false`。
+///
+/// **为什么需要等**：`SetForegroundWindow` 返回 `true` 只表示"请求被接受"，
+/// **不代表前台已经切过去了**——实际切换由窗口管理器完成，且仍可能被
+/// 前台锁定策略吞掉（表现为任务栏闪一下）。所以调用后**不能立刻**
+/// 用 `GetForegroundWindow()` 判定，否则会把"还没切完"误判成"切换失败"。
+///
+/// 注意这不是"重试到成功"：**只等这一次请求生效**，超时就认失败。
+/// 本项目明确禁止反复重试到成功，所以这里等的是一个有界的结算窗口，
+/// 而不是"再试一次"。
+pub fn wait_until_foreground(hwnd: HWND, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if same_window(foreground_window(), hwnd) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
 }
 
 pub fn same_window(a: HWND, b: HWND) -> bool {
@@ -310,6 +523,86 @@ pub fn capture_region(region: Rect) -> WinResult<CapturedFrame> {
     Ok(CapturedFrame { pixels, width: width as u32, height: height as u32, fingerprint })
 }
 
+/// 用 `PrintWindow` 抓**窗口自己渲染出来的画面**。
+///
+/// 与 [`capture_region`] 的区别很要紧：
+///
+/// - `capture_region` 走的是**屏幕 DC 的 `BitBlt`**，拿到的是「此刻屏幕上这块矩形里的像素」。
+///   窗口被遮挡时会截到上层窗口；而 **Chromium / WebView2 这类用 GPU 合成的内容，
+///   `BitBlt` 常常抓回来一片白或一片黑** —— 那是截图方式的局限，不是页面没渲染。
+/// - `PrintWindow` 是让窗口自己把内容画到给定 DC 上，因此能拿到 WebView2 的真实画面。
+///   必须带 `PW_RENDERFULLCONTENT`（值 2），少了它 DirectComposition 类窗口同样只给空白。
+///
+/// 只读：不改变窗口状态、不影响焦点。仅用于诊断，不参与业务流程。
+pub fn print_window(hwnd: HWND) -> WinResult<CapturedFrame> {
+    let region = window_rect(hwnd)?;
+    if region.width <= 0 || region.height <= 0 {
+        return Err("窗口尺寸无效（可能已最小化）".to_string());
+    }
+    let width = region.width;
+    let height = region.height;
+    let stride = width as usize * 4;
+    let mut pixels = vec![0u8; stride * height as usize];
+
+    unsafe {
+        let screen_dc = GetDC(None);
+        if screen_dc.is_invalid() {
+            return Err("获取屏幕设备上下文失败".to_string());
+        }
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        if mem_dc.is_invalid() {
+            let _ = ReleaseDC(None, screen_dc);
+            return Err("创建兼容设备上下文失败".to_string());
+        }
+        let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return Err("创建兼容位图失败".to_string());
+        }
+        let previous = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+
+        let printed = PrintWindow(hwnd, mem_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool();
+
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+
+        let copied = if printed {
+            GetDIBits(
+                mem_dc,
+                bitmap,
+                0,
+                height as u32,
+                Some(pixels.as_mut_ptr() as *mut std::ffi::c_void),
+                &mut info,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+
+        SelectObject(mem_dc, previous);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+
+        if copied == 0 {
+            return Err("PrintWindow 没取到画面（窗口可能不响应 WM_PRINT）".to_string());
+        }
+    }
+
+    let fingerprint = fingerprint_of(&pixels, width as u32, height as u32);
+    Ok(CapturedFrame { pixels, width: width as u32, height: height as u32, fingerprint })
+}
+
 /// 截图的稳定指纹：尺寸 + 像素内容的 SHA-256。
 pub fn fingerprint_of(pixels: &[u8], width: u32, height: u32) -> String {
     let mut hasher = Sha256::new();
@@ -335,17 +628,59 @@ fn key_input(vk: VIRTUAL_KEY, up: bool) -> INPUT {
 }
 
 fn mouse_input(flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS) -> INPUT {
+    mouse_input_with(flags, 0)
+}
+
+fn mouse_input_with(
+    flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+    mouse_data: i32,
+) -> INPUT {
     let mut input = INPUT::default();
     input.r#type = INPUT_MOUSE;
     input.Anonymous.mi = MOUSEINPUT {
         dx: 0,
         dy: 0,
-        mouseData: 0,
+        mouseData: mouse_data as u32,
         dwFlags: flags,
         time: 0,
         dwExtraInfo: 0,
     };
     input
+}
+
+/// Win32 的 `WHEEL_DELTA`：滚轮一格对应的 `mouseData` 增量。
+const WHEEL_DELTA_UNITS: i32 = 120;
+
+/// 逐格发送滚轮事件之间的间隔。
+///
+/// 把多格合并成一次 `SendInput`（`mouseData = ±360`）在多数程序里可用，
+/// 但 WebView 类界面（微信 4.x 就是）可能只当作一次滚动，实际滚动量不足。
+/// 逐格发送更接近真实滚轮——这是**为了稳妥的刻意选择**，不是在真机上对比测出的结论。
+const WHEEL_STEP_DELAY: Duration = Duration::from_millis(15);
+
+/// 在光标当前位置滚动鼠标滚轮。
+///
+/// `notches > 0` 表示**向下滚动内容**（看列表里更靠后的项），`< 0` 表示向上。
+/// 注意 Win32 的约定与直觉相反：`mouseData` 为**正**表示滚轮向远离用户的方向转，
+/// 内容向上移动；所以向下滚要传负值。
+///
+/// 调用方必须先把光标移到目标控件上——滚轮事件只会送给光标下的窗口。
+pub fn scroll_wheel(notches: i32) -> WinResult<()> {
+    if notches == 0 {
+        return Ok(());
+    }
+    let step = if notches > 0 { -WHEEL_DELTA_UNITS } else { WHEEL_DELTA_UNITS };
+    for index in 0..notches.unsigned_abs() {
+        let input = mouse_input_with(MOUSEEVENTF_WHEEL, step);
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        if sent != 1 {
+            return Err(format!("发送滚轮事件失败（第 {} 格）", index + 1));
+        }
+        if index + 1 < notches.unsigned_abs() {
+            std::thread::sleep(WHEEL_STEP_DELAY);
+        }
+    }
+    Ok(())
 }
 
 pub fn move_cursor(x: i32, y: i32) -> WinResult<()> {

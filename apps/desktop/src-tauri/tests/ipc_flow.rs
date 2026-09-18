@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use automation_core::TaskState;
+use base64::Engine as _;
 use desktop_lib::runtime::{DemoScenario, RuntimeConfig, RuntimeMode};
 use desktop_lib::{AppState, TaskView, EVENT_TASK_UPDATED};
 use serde::de::DeserializeOwned;
@@ -87,15 +88,22 @@ impl Harness {
     /// 配置不是直接塞进内存，而是**先写成 `config.json` 再启动**，
     /// 这样顺带验证了配置的读取路径。
     fn new(tag: &str, scenario: DemoScenario) -> Self {
+        Self::with_config(
+            tag,
+            RuntimeConfig {
+                mode: RuntimeMode::DryRun,
+                demo_scenario: scenario,
+                // 确认窗口收紧到 5 秒，让"确认过期"这类用例不必真的等一分钟。
+                confirmation_ttl_secs: 5,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// 用任意配置装配应用实例，供需要真实模式的用例使用。
+    fn with_config(tag: &str, config: RuntimeConfig) -> Self {
         let dir = TempDir::new(tag);
         let evidence_root = dir.join("evidence");
-        let config = RuntimeConfig {
-            mode: RuntimeMode::DryRun,
-            demo_scenario: scenario,
-            // 确认窗口收紧到 5 秒，让"确认过期"这类用例不必真的等一分钟。
-            confirmation_ttl_secs: 5,
-            ..Default::default()
-        };
         std::fs::write(
             dir.join("config.json"),
             serde_json::to_string_pretty(&config).expect("序列化配置失败"),
@@ -482,3 +490,228 @@ fn commands_reject_unknown_or_malformed_task_ids() {
         "不该给一个不在等待确认的任务投票：{not_waiting}"
     );
 }
+
+// ── 区域标定的只读预览 ──────────────────────────────────────────────────
+
+/// 标定**不受运行模式限制**：演练模式下同样要能截目标窗口。
+///
+/// 这不是"顺便允许"，是刻意的：标定属于**配置**而不是执行——它只读地看一眼目标窗口，
+/// 不点击、不输入、不发送。而且实际顺序本来就是"先把窗口和四个区域标定好，
+/// 再决定用哪种模式跑"，卡在模式上只会让人没法做准备。
+#[test]
+fn preview_target_window_is_not_gated_by_mode() {
+    // `Harness::new` 就是演练模式。
+    let harness = Harness::new("preview-dry", DemoScenario::Happy);
+
+    let outcome = harness.call::<desktop_lib::WindowPreview>(
+        "preview_target_window",
+        json!({ "windowClass": "Progman", "wecomExe": null }),
+    );
+
+    if let Err(err) = outcome {
+        let message = err.as_str().unwrap_or_default();
+        // 没有交互式桌面（无头环境）可以跳过，不把环境问题当缺陷；
+        // 但**不能**再因为"模式不对"被拒。
+        assert!(!message.contains("模式"), "标定不该受运行模式限制：{message}");
+        eprintln!("跳过：当前会话没有可用的交互式桌面（{message}）");
+    }
+}
+
+/// 窗口类名为空：无从定位，必须明确报错而不是截一张空白图。
+///
+/// 类名由**调用方传入**（界面上的草稿值），不读已保存的配置——否则会出现
+/// "界面上明明写着新类名，截图却报找不到窗口"这种自相矛盾的报错。
+#[test]
+fn preview_target_window_is_refused_without_a_window_class() {
+    let harness = Harness::new("preview-noclass", DemoScenario::Happy);
+
+    let message = harness.err(
+        "preview_target_window",
+        json!({ "windowClass": "   ", "wecomExe": null }),
+    );
+    assert!(message.contains("窗口类名"), "应指出类名为空：{message}");
+}
+
+/// 对着一个确实存在的窗口走完整条链路。
+///
+/// 这一条验证的是**界面拿到的东西真的能用**：响应能反序列化成 `WindowPreview`、
+/// `image` 是合法的 PNG data URL、PNG 里的尺寸与 `width`/`height` 一致。
+/// 只断言"返回了 Ok"是不够的——编码或缩放一旦写错，返回的照样是 Ok。
+///
+/// 用 `Harness::new`（演练模式）是刻意的：顺带证明标定与运行模式无关。
+#[test]
+fn preview_target_window_returns_a_decodable_png_for_a_real_window() {
+    // `Progman` 是桌面窗口，任何交互式会话里都存在。
+    let harness = Harness::new("preview-png", DemoScenario::Happy);
+
+    let preview: desktop_lib::WindowPreview = match harness.call(
+        "preview_target_window",
+        json!({ "windowClass": "Progman", "wecomExe": null }),
+    ) {
+            Ok(value) => value,
+            // 没有交互式桌面（无头环境）就跳过，不把环境问题当缺陷。
+            Err(err) => {
+                eprintln!("跳过：当前会话没有可用的交互式桌面（{err}）");
+                return;
+            }
+        };
+
+    assert!(
+        !preview.window.is_degenerate(),
+        "窗口矩形不应退化：{:?}",
+        preview.window
+    );
+    assert_eq!(preview.fingerprint.len(), 64, "指纹应为 sha256 十六进制");
+
+    let encoded = preview
+        .image
+        .strip_prefix("data:image/png;base64,")
+        .expect("image 应是 PNG 的 data URL");
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("base64 应能解码");
+    assert_eq!(
+        &png[..8],
+        &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        "解出来的应当是 PNG"
+    );
+
+    // 直接读 IHDR，避免为了这个用例引入图像解码依赖。
+    let ihdr_width = u32::from_be_bytes(png[16..20].try_into().unwrap());
+    let ihdr_height = u32::from_be_bytes(png[20..24].try_into().unwrap());
+    assert_eq!(ihdr_width, preview.width, "PNG 宽度应与上报的 width 一致");
+    assert_eq!(ihdr_height, preview.height, "PNG 高度应与上报的 height 一致");
+    assert!(preview.width > 0 && preview.height > 0);
+
+    // 预览会被等比缩小，所以不可能比窗口本身更宽；
+    // 而 `window` 保留的是窗口真实尺寸，标定文案用的是它。
+    assert!(
+        preview.width <= preview.window.width as u32,
+        "预览图不应比窗口本身更宽"
+    );
+}
+
+// ── 指认目标窗口 ────────────────────────────────────────────────────────
+
+/// 「指认窗口」命令必须可调用，并且返回自洽的窗口特征。
+///
+/// 这个用例的主要价值在**命令注册**：它和 `preview_target_window` 一样靠
+/// `AppHandle<R>` 钉住运行时泛型，一旦漏进 `generate_handler!`，
+/// 前端点了按钮只会拿到 "command not found"，而编译期毫无提示。
+///
+/// 光标停在哪个窗口是不确定的，所以只断言"读到的自洽"，不断言具体是哪个窗口。
+#[test]
+fn pick_target_window_reports_a_consistent_window() {
+    let harness = Harness::new("pick-window", DemoScenario::Happy);
+
+    let picked: desktop_lib::PickedWindow = match harness.call("pick_target_window", json!({})) {
+        Ok(value) => value,
+        // 没有交互式桌面（无头环境）就跳过，不把环境问题当缺陷。
+        Err(err) => {
+            eprintln!("跳过：当前会话读不到光标位置（{err}）");
+            return;
+        }
+    };
+
+    assert!(
+        !picked.window.is_degenerate(),
+        "窗口矩形不应退化：{:?}",
+        picked.window
+    );
+    // `window_from_point` 会先上溯到根窗口，所以拿到的必然是顶层窗口，必然有类名。
+    assert!(
+        !picked.class_name.trim().is_empty(),
+        "顶层窗口都应该有类名，否则没法拿去配置"
+    );
+    if let Some(path) = &picked.exe_path {
+        assert!(
+            path.to_ascii_lowercase().ends_with(".exe"),
+            "所属程序应指向一个可执行文件：{path}"
+        );
+    }
+}
+
+// ── 手动动作：启动客户端 / 记录窗口尺寸 ─────────────────────────────────
+
+/// 「启动客户端」必须可调用，并且**在没有配置路径时明确报错**。
+///
+/// 这里只验"命令注册 + 参数校验"这一层，不去真的启动程序：
+/// 真启动会往用户桌面上拉起一个进程，那是操作者该做的动作，不是测试该做的。
+#[test]
+fn launch_client_refuses_without_a_configured_path() {
+    let harness = Harness::new("launch-nopath", DemoScenario::Happy);
+
+    let message = harness.err(
+        "launch_client",
+        json!({ "wecomExe": "  ", "wecomExeSha256": null }),
+    );
+    assert!(message.contains("可执行文件路径"), "应指出还没配路径：{message}");
+}
+
+/// 「记录窗口尺寸」必须可调用，并且返回自洽的几何。
+///
+/// 这个用例的主要价值在**命令注册**：它和 `preview_target_window` 一样靠
+/// `AppHandle<R>` 钉住运行时泛型，一旦漏进 `generate_handler!`，
+/// 前端点了按钮只会拿到 "command not found"，而编译期毫无提示。
+#[test]
+fn record_window_geometry_reports_a_consistent_geometry() {
+    // `Progman` 是桌面窗口，任何交互式会话里都存在。
+    let harness = Harness::new("record-geometry", DemoScenario::Happy);
+
+    let geometry: desktop_lib::runtime::WindowGeometry = match harness.call(
+        "record_window_geometry",
+        json!({ "windowClass": "Progman", "wecomExe": null }),
+    ) {
+        Ok(value) => value,
+        // 没有交互式桌面（无头环境）就跳过，不把环境问题当缺陷。
+        Err(err) => {
+            eprintln!("跳过：当前会话没有可用的交互式桌面（{err}）");
+            return;
+        }
+    };
+
+    assert!(geometry.width > 0 && geometry.height > 0, "窗口尺寸应有效：{geometry:?}");
+    assert!(geometry.scale_factor > 0.0, "缩放比例应有效：{geometry:?}");
+}
+
+/// 类名为空时无从定位，必须明确报错。
+#[test]
+fn record_window_geometry_is_refused_without_a_window_class() {
+    let harness = Harness::new("record-noclass", DemoScenario::Happy);
+
+    let message = harness.err(
+        "record_window_geometry",
+        json!({ "windowClass": "", "wecomExe": null }),
+    );
+    assert!(message.contains("窗口类名"), "应指出类名为空：{message}");
+}
+
+/// 真实模式还没有「标定尺寸」时，任务必须被拒绝装配。
+///
+/// 客户端由操作者手动启动，程序没法从窗口外面分辨"这是不是我标定过的那个窗口、
+/// 是不是那个尺寸"，只能靠这条记录。少了它，"按标定尺寸工作"就只是句口号。
+#[test]
+fn live_mode_without_a_calibrated_window_is_refused() {
+    let harness = Harness::with_config(
+        "live-nocalib",
+        RuntimeConfig { mode: RuntimeMode::Live, ..Default::default() },
+    );
+
+    let message = harness.err(
+        "start_task",
+        json!({ "request": { "external_contact_name": "张三", "text": "你好" } }),
+    );
+    assert!(
+        message.contains("记录窗口尺寸"),
+        "应提示先去记录窗口尺寸：{message}"
+    );
+
+    // 装配失败不该在任务列表里留下一个永远不会推进的草稿任务。
+    let tasks: Vec<TaskView> = harness.ok("list_tasks", json!({}));
+    assert!(
+        tasks.is_empty(),
+        "装配失败时不该登记任务，实际有 {} 条",
+        tasks.len()
+    );
+}
+

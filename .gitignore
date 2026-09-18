@@ -16,6 +16,10 @@ node_modules/
 dist/
 **/dist/
 dist-ssr/
+# `vite build --outDir dist-verify` 的产物：沙箱的批量删除保护会拦住 Vite
+# 清空 dist 的动作（见项目记忆第 8 条），所以验证打包时改用这个全新目录。
+dist-verify/
+**/dist-verify/
 .vite/
 *.tsbuildinfo
 *.local
@@ -25,7 +29,10 @@ yarn-error.log*
 pnpm-debug.log*
 
 # ---------- Tauri 自动生成的 ACL / schema 快照 ----------
-apps/desktop/src-tauri/gen/schemas/
+# 通配写法：每加一个 Tauri 应用就多一个 gen/schemas，逐个列举必然漏
+# （探针 apps/webview-probe 就是这么漏掉的）。
+**/src-tauri/gen/schemas/
+**/gen/schemas/
 
 # ---------- 运行期数据：审计库 / 证据截图 / 日志 ----------
 *.db

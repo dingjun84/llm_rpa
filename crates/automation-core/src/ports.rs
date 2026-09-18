@@ -136,10 +136,24 @@ impl AutomationError {
 /// 真实实现只可对用户可见、已解锁的交互式桌面执行操作。
 pub trait DesktopPlatform: Send + Sync {
     /// 启动已由用户配置且经验证的企业微信可执行文件；不得猜测路径或提权启动。
+    ///
+    /// **不属于任务流程**：客户端由操作者自己启动并登录，编排器不再调用它。
+    /// 保留这个端口是为了界面上的「启动客户端」按钮——那是一个显式的、人点的动作，
+    /// 与"任务跑到一半自己去拉一个程序起来"是两回事。
     fn launch_wecom(&self) -> Result<(), AutomationError>;
 
     /// 将已验证的企业微信窗口置于前台，并返回它在屏幕上的边界。
     fn focus_wecom(&self) -> Result<Rect, AutomationError>;
+
+    /// 系统是否认为目标窗口**正在响应**（界面线程有没有在取消息）。
+    ///
+    /// 用途是"动作之前先确认客户端没卡死"：往一个卡死的窗口里点击、粘贴、回车，
+    /// 什么都不会发生，而调用方从返回值上完全看不出区别——最坏的结果是
+    /// "以为发出去了，其实一个字都没进去"。
+    ///
+    /// 约定：`Ok(true)` = 正在响应，`Ok(false)` = 未响应，`Err` = 无法判定
+    /// （例如还没定位到窗口）。实现方不得为了让调用方"继续跑"而吞掉定位失败。
+    fn is_responsive(&self) -> Result<bool, AutomationError>;
 
     /// 读取当前显示器分辨率与缩放比例，供点击前的标定校验使用。
     fn screen_metrics(&self) -> Result<ScreenMetrics, AutomationError>;
@@ -149,6 +163,21 @@ pub trait DesktopPlatform: Send + Sync {
 
     /// 点击前验证当前前台窗口与预期窗口一致；不满足则拒绝输入。
     fn guarded_click(&self, target: Point, expected_window: Rect) -> Result<(), AutomationError>;
+
+    /// 在 `at` 处滚动鼠标滚轮，用于在联系人列表里向下翻找。
+    ///
+    /// `notches > 0` 表示**向下滚动内容**（看列表里更靠后的项），`< 0` 表示向上。
+    /// 实现方需要先把光标移到 `at`（滚轮事件只送给光标下的窗口），
+    /// 并和点击一样在动作前验证前台窗口与标定一致。
+    ///
+    /// 滚动不会误触收件人，但会改变界面内容，因此它**不是**只读操作：
+    /// 调用方必须在滚动后重新截图识别，不能复用滚动前的结果。
+    fn scroll(
+        &self,
+        at: Point,
+        notches: i32,
+        expected_window: Rect,
+    ) -> Result<(), AutomationError>;
 
     /// 将文本写入剪贴板并粘贴到当前已聚焦控件；完成后清除临时剪贴板内容。
     fn paste_text(&self, text: &str, expected_window: Rect) -> Result<(), AutomationError>;
@@ -169,6 +198,18 @@ pub trait ContactMatcher: Send + Sync {
         candidates: &[TextBox],
         min_confidence: f32,
     ) -> Result<TextBox, AutomationError>;
+
+    /// 单个候选是否**被本策略接受**为目标联系人。
+    ///
+    /// **为什么它必须由匹配器回答**：编排层在选定候选之后还要复检两次
+    /// （`execute` 的「核验候选人」与「核验聊天页标题」）。那两处如果自己写一套
+    /// 「文字是否等于目标名」，任何放宽/收紧都会被它们**静默挡回去**——
+    /// 现象是「匹配器明明放宽了，任务照样转人工」，而且失败文案看起来像是
+    /// 视觉识别不确定，排查时会一路往 OCR 上找，永远找不到。
+    ///
+    /// 判据只有一处权威：本方法。`find_unique_exact_match` 负责「在候选集里挑一个」，
+    /// 本方法负责「这一个行不行」，两者必须对同一个名字给出同样的答案。
+    fn accepts(&self, expected_name: &str, candidate: &TextBox) -> bool;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

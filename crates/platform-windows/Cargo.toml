@@ -12,6 +12,11 @@ sha2.workspace = true
 # 仅 `examples/screen_probe.rs` 使用：把捕获到的画面编码成 PNG 以便人工查看。
 # 生产代码不依赖 vision，避免平台层与视觉层互相耦合。
 vision = { path = "../vision" }
+# 同样只给探针用：在截图上画区域标注，让操作者肉眼确认标定对不对。
+# 版本与 vision 用的保持一致，否则 `RgbaImage` 会是两个不同的类型。
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -26,4 +31,7 @@ windows = { version = "0.62", features = [
   "Win32_System_ProcessStatus",
   "Win32_System_LibraryLoader",
   "Win32_Security",
+  # `PrintWindow` 被 windows-rs 归到了 `Win32::Storage::Xps` 下（历史包袱），
+  # 它本身是 user32 的函数。只给 `screen_probe printshot` 诊断用。
+  "Win32_Storage_Xps",
 ] }

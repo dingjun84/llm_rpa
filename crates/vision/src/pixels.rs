@@ -5,6 +5,7 @@
 use automation_core::{Rect, Screenshot};
 use image::{GrayImage, RgbaImage};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 use crate::{VisionError, VisionResult};
 
@@ -108,6 +109,28 @@ pub fn encode_png(image: &RgbaImage) -> VisionResult<Vec<u8>> {
     Ok(buffer.into_inner())
 }
 
+/// 按最大宽度等比缩小；宽度已在限制内时**原样借用**，不做任何复制。
+///
+/// 用途是压小经 IPC 送进界面的预览图：一张 4K 窗口截图编码成 PNG 再转 base64
+/// 会膨胀到几十 MB，webview 渲染起来又慢又占内存。
+///
+/// 缩小不影响标定精度——界面上的区域叠加层用的是**百分比**，
+/// 与图像的实际像素尺寸无关。
+pub fn downscale_to_max_width(image: &RgbaImage, max_width: u32) -> Cow<'_, RgbaImage> {
+    if max_width == 0 || image.width() <= max_width {
+        return Cow::Borrowed(image);
+    }
+    let scale = max_width as f32 / image.width() as f32;
+    // 至少留 1 像素高：极端细长的图不能缩成 0，否则后续编码会失败。
+    let height = ((image.height() as f32 * scale).round() as u32).max(1);
+    Cow::Owned(image::imageops::resize(
+        image,
+        max_width,
+        height,
+        image::imageops::FilterType::Triangle,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +225,50 @@ mod tests {
         let shot = sample(4, 4);
         let png = encode_png(&to_rgba(&shot).unwrap()).unwrap();
         assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    }
+
+    #[test]
+    fn downscale_keeps_the_aspect_ratio_and_the_width_limit() {
+        let image = to_rgba(&sample(800, 600)).unwrap();
+        let scaled = downscale_to_max_width(&image, 400);
+
+        assert_eq!(scaled.width(), 400);
+        assert_eq!(scaled.height(), 300, "高度应等比缩放");
+    }
+
+    #[test]
+    fn downscale_leaves_a_small_enough_image_untouched() {
+        let image = to_rgba(&sample(320, 200)).unwrap();
+        let scaled = downscale_to_max_width(&image, 1280);
+
+        assert_eq!(scaled.width(), 320);
+        assert_eq!(scaled.height(), 200);
+        // 没触发缩放时应是借用，不是复制。
+        assert!(
+            matches!(scaled, Cow::Borrowed(_)),
+            "宽度已在限制内时不应复制整张图"
+        );
+    }
+
+    #[test]
+    fn downscale_never_produces_a_zero_height() {
+        // 极端细长的图：宽 4000、高 1，缩到宽 2 时高度四舍五入会变成 0，
+        // 必须兜底到 1，否则后续 PNG 编码会失败。
+        let image = to_rgba(&sample(4000, 1)).unwrap();
+        let scaled = downscale_to_max_width(&image, 2);
+
+        assert_eq!(scaled.width(), 2);
+        assert_eq!(scaled.height(), 1);
+        assert!(encode_png(&scaled).is_ok(), "缩放结果必须仍可编码");
+    }
+
+    #[test]
+    fn downscale_is_a_noop_for_a_zero_limit() {
+        // `max_width = 0` 视为"未配置"，不能把图缩成 0 宽。
+        let image = to_rgba(&sample(64, 32)).unwrap();
+        let scaled = downscale_to_max_width(&image, 0);
+
+        assert_eq!(scaled.width(), 64);
+        assert_eq!(scaled.height(), 32);
     }
 }

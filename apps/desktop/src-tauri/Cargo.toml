@@ -8,6 +8,20 @@ license.workspace = true
 name = "desktop_lib"
 crate-type = ["lib"]
 
+[features]
+# Tauri 官方模板里自带这一项，注释原文是 "DO NOT REMOVE"。
+#
+# 它决定前端资源**是否嵌进二进制**：
+#   tauri/build.rs      →  dev = !has_feature("custom-protocol")
+#   tauri-codegen        →  if dev && devUrl.is_some() { 资源留空 }
+# 也就是说：**没有这个 feature 时，`cargo build` 出来的 exe 里一个前端文件都没有**，
+# 运行期只能去 `devUrl`（http://localhost:1420）取页面 ——
+# dev 服务器不在，窗口就是白的（WebView2 起了、导航失败、什么都没有）。
+#
+# 加上它之后 `cargo build -p desktop --features custom-protocol` 才能产出
+# 可独立双击运行的 exe。`tauri build` 走的就是这条路。
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }
 

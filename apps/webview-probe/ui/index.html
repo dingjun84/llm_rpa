@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WebView 渲染探针</title>
+<style>
+  :root {
+    --bg: #eef1f5;
+    --panel: #ffffff;
+    --border: #d8dee6;
+    --text: #1f2328;
+    --muted: #6b7280;
+    --ok: #0f7b53;
+    --bad: #c0392b;
+    --wait: #9aa3af;
+    --accent: #2563eb;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { height: 100%; }
+
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.55 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+
+  h1 { margin: 0 0 4px; font-size: 16px; }
+  h2 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 600; }
+
+  #static-marker {
+    margin: 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: #fff4e5;
+    border: 1px solid #f0c48a;
+    color: #8a5200;
+    font-size: 12.5px;
+  }
+
+  #verdict {
+    font-size: 15px;
+    font-weight: 700;
+    padding: 10px 12px;
+    border-radius: 6px;
+    background: #f3f4f6;
+    border: 1px solid var(--border);
+  }
+  #verdict.ok  { background: #e7f6ef; border-color: #a9dcc6; color: var(--ok); }
+  #verdict.bad { background: #fdecea; border-color: #f0b4ac; color: var(--bad); }
+
+  ol#steps {
+    list-style: none;
+    margin: 12px 0 0;
+    padding: 0;
+    display: grid;
+    gap: 4px;
+  }
+  ol#steps li {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 13px;
+  }
+  ol#steps .mark { width: 1.2em; flex: none; font-weight: 700; }
+  ol#steps .mark.wait { color: var(--wait); }
+  ol#steps .mark.ok   { color: var(--ok); }
+  ol#steps .mark.bad  { color: var(--bad); }
+  ol#steps .note { color: var(--muted); font-size: 12px; }
+
+  .actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+
+  button {
+    font: inherit;
+    font-weight: 600;
+    padding: 10px 28px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    cursor: pointer;
+  }
+  button:active { transform: translateY(1px); }
+
+  #btn-confirm { background: var(--accent); color: #fff; }
+  #btn-confirm:hover { background: #1d4ed8; }
+
+  #btn-cancel { background: #fff; color: var(--bad); border-color: #e6a9a1; }
+  #btn-cancel:hover { background: #fdf3f2; }
+
+  #last-action { color: var(--muted); font-size: 13px; }
+
+  dl#diag-list {
+    margin: 0;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 12px;
+    font-size: 12.5px;
+  }
+  dl#diag-list dt { color: var(--muted); }
+  dl#diag-list dd {
+    margin: 0;
+    font-family: var(--mono);
+    word-break: break-all;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+
+  <div class="panel">
+    <h1>WebView 渲染探针</h1>
+    <!--
+      这行字写在静态 HTML 里，脚本一跑起来就会把它换掉。
+      如果它还留在屏幕上，说明脚本根本没执行 —— 这是"页面能渲染但 JS 不跑"
+      与"WebView 完全没起来"之间的分界线。
+    -->
+    <p id="static-marker">
+      静态 HTML 已解析。这行提示本该在脚本执行后被替换掉 —— 你还看到它，
+      说明 JavaScript 没有执行。
+    </p>
+  </div>
+
+  <div class="panel">
+    <div id="verdict">正在检测…</div>
+    <ol id="steps">
+      <li><span class="mark wait" data-mark="html">?</span><span>静态 HTML 解析</span><span class="note" id="note-html"></span></li>
+      <li><span class="mark wait" data-mark="js">?</span><span>JavaScript 执行</span><span class="note" id="note-js"></span></li>
+      <li><span class="mark wait" data-mark="paint">?</span><span>首帧绘制（合成器在跑）</span><span class="note" id="note-paint"></span></li>
+      <li><span class="mark wait" data-mark="ipc">?</span><span>IPC 通道（前端 → Rust）</span><span class="note" id="note-ipc"></span></li>
+      <li><span class="mark wait" data-mark="loop">?</span><span>事件循环心跳</span><span class="note" id="note-loop"></span></li>
+    </ol>
+  </div>
+
+  <div class="panel actions">
+    <button id="btn-confirm" type="button">确认</button>
+    <button id="btn-cancel" type="button">取消</button>
+    <div id="last-action">尚未点击任何按钮</div>
+  </div>
+
+  <div class="panel">
+    <h2>诊断信息</h2>
+    <dl id="diag-list"></dl>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  var marks = {};
+  var notes = {};
+
+  function mark(step, state, note) {
+    var el = document.querySelector('[data-mark="' + step + '"]');
+    if (el) {
+      el.className = "mark " + state;
+      el.textContent = state === "ok" ? "OK" : state === "bad" ? "X" : "?";
+    }
+    var noteEl = document.getElementById("note-" + step);
+    if (noteEl && note !== undefined) { notes[step] = String(note); noteEl.textContent = String(note); }
+    marks[step] = state;
+  }
+
+  // ── 第 1 步：静态 HTML 解析 ─────────────────────────────────────────
+  // 能走到这里就说明 HTML 被解析了，把那行"你看到它说明 JS 没执行"的提示换掉。
+  var marker = document.getElementById("static-marker");
+  if (marker) {
+    marker.style.background = "#e7f6ef";
+    marker.style.borderColor = "#a9dcc6";
+    marker.style.color = "#0f7b53";
+    marker.textContent = "静态 HTML 已解析（这行字由脚本改写，看到绿色即说明脚本已接管）。";
+  }
+  mark("html", "ok", "已解析");
+
+  var log = [];
+  function record(text) {
+    log.push(text);
+  }
+
+  // ── IPC ────────────────────────────────────────────────────────────
+  // withGlobalTauri = true 时全局对象是 window.__TAURI__。
+  // 两种形状都兼容，免得因为 API 布局差异误判成"IPC 不通"。
+  function getInvoke() {
+    var t = window.__TAURI__;
+    if (!t) { return null; }
+    if (t.core && typeof t.core.invoke === "function") { return t.core.invoke; }
+    if (typeof t.invoke === "function") { return t.invoke; }
+    return null;
+  }
+
+  function report(event, detail) {
+    var invoke = getInvoke();
+    if (!invoke) { return Promise.reject(new Error("window.__TAURI__ 不可用")); }
+    return invoke("report", { event: event, detail: detail === undefined ? null : String(detail) });
+  }
+
+  // 任何脚本异常都要显示出来并写进日志，否则界面会安静地停在中途。
+  window.addEventListener("error", function (event) {
+    mark("loop", "bad", "脚本异常：" + event.message);
+    record("ERROR " + event.message + " @" + event.filename + ":" + event.lineno);
+    try { report("js_error", event.message); } catch (e) {}
+  });
+  window.addEventListener("unhandledrejection", function (event) {
+    var reason = event.reason && event.reason.message ? event.reason.message : String(event.reason);
+    mark("loop", "bad", "未处理的 Promise 拒绝：" + reason);
+    try { report("js_rejection", reason); } catch (e) {}
+  });
+
+  // ── 第 2 步：JS 执行 ───────────────────────────────────────────────
+  mark("js", "ok", "已执行到脚本主体");
+  record("js_boot");
+
+  // ── 第 5 步先起心跳：它只依赖定时器，不依赖 IPC ────────────────────
+  var beats = 0;
+  var startedAt = Date.now();
+  var loopMarked = false;
+  setInterval(function () {
+    beats += 1;
+    var seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+    mark("loop", "ok", "心跳 " + beats + " 次 / 已运行 " + seconds + " 秒");
+    if (!loopMarked && beats >= 2) {
+      loopMarked = true;
+      record("heartbeat_alive");
+      // 心跳确认后再报一次，此时能确认"定时器 + IPC"都在工作。
+      report("js_alive", "heartbeat=" + beats).catch(function () {});
+    }
+  }, 250);
+
+  // ── 第 3 步：首帧绘制 ─────────────────────────────────────────────
+  // 连续两帧 rAF 说明合成器真的在出帧；只排队不回调就是"窗口在、画面不动"。
+  var painted = false;
+  requestAnimationFrame(function () {
+    requestAnimationFrame(function () {
+      painted = true;
+      mark("paint", "ok", "已出两帧");
+      record("first_paint");
+      report("js_paint", "raf ok visibility=" + document.visibilityState).catch(function () {});
+    });
+  });
+
+  // rAF 一直不回调时必须**主动留下证据**：否则日志里会"什么都没发生"，
+  // 而"什么都没发生"跟"探针根本没跑起来"在日志里长得一模一样，没法区分。
+  //
+  // Chromium 对**不可见**的页面是刻意不出帧的，所以这里把可见性一起报上去 ——
+  // 「窗口在、JS 在跑、画面全白」最常见的原因就是它。
+  setTimeout(function () {
+    if (painted) { return; }
+    mark("paint", "bad", "2 秒内没有出帧（可见性 " + document.visibilityState + "）");
+    record("paint_timeout");
+    report("js_paint_timeout",
+      "visibility=" + document.visibilityState +
+      " hidden=" + document.hidden +
+      " hasFocus=" + document.hasFocus() +
+      " innerSize=" + window.innerWidth + "x" + window.innerHeight
+    ).catch(function () {});
+    settle();
+  }, 2000);
+
+  // 可见性一旦变化就报一次：从 hidden 变 visible 时如果画面才开始出，
+  // 那就说明之前是"窗口没被当成可见"，而不是渲染管线坏了。
+  document.addEventListener("visibilitychange", function () {
+    record("visibility=" + document.visibilityState);
+    report("visibility", document.visibilityState + " hasFocus=" + document.hasFocus()).catch(function () {});
+    refreshVisibilityDiag();
+  });
+  window.addEventListener("focus", function () { refreshVisibilityDiag(); });
+  window.addEventListener("blur", function () { refreshVisibilityDiag(); });
+
+  // ── 第 4 步：IPC + 环境信息 ────────────────────────────────────────
+  var diag = {};
+
+  function renderDiag() {
+    var list = document.getElementById("diag-list");
+    list.textContent = "";
+    Object.keys(diag).forEach(function (key) {
+      var dt = document.createElement("dt");
+      dt.textContent = key;
+      var dd = document.createElement("dd");
+      dd.textContent = diag[key];
+      list.appendChild(dt);
+      list.appendChild(dd);
+    });
+    var dt = document.createElement("dt");
+    dt.textContent = "脚本事件";
+    var dd = document.createElement("dd");
+    dd.textContent = log.join("\n");
+    list.appendChild(dt);
+    list.appendChild(dd);
+  }
+
+  diag["User-Agent"] = navigator.userAgent;
+  diag["视口"] = window.innerWidth + " x " + window.innerHeight +
+    "（screen " + screen.width + " x " + screen.height + "）";
+  diag["devicePixelRatio"] = String(window.devicePixelRatio);
+  diag["__TAURI__"] = window.__TAURI__ ? "存在（键：" + Object.keys(window.__TAURI__).join(", ") + "）" : "不存在";
+
+  // 可见性单列一项，因为它是"全白窗口"的头号嫌疑：Chromium 对不可见页面不出帧。
+  function refreshVisibilityDiag() {
+    // 这个函数会被 `visibilitychange` 触发，而它有可能早于下面 `diag` 的赋值，
+    // 所以先挡一道，别让"探针自己抛异常"污染诊断结论。
+    if (!diag) { return; }
+    diag["可见性"] = document.visibilityState +
+      "（hidden=" + document.hidden + "，hasFocus=" + document.hasFocus() + "）";
+    renderDiag();
+  }
+  refreshVisibilityDiag();
+
+  var invoke = getInvoke();
+  if (!invoke) {
+    mark("ipc", "bad", "window.__TAURI__ 不可用，按钮点了不会有反应");
+  } else {
+    report("js_boot", navigator.userAgent + " | visibility=" + document.visibilityState)
+      .catch(function () {});
+    invoke("env_info")
+      .then(function (info) {
+        mark("ipc", "ok", "env_info 返回正常");
+        record("ipc_ok");
+        diag["可执行文件"] = info.exe;
+        diag["工作目录"] = info.cwd;
+        diag["日志文件"] = info.log_path;
+        diag["tauri 版本"] = info.tauri_version;
+        diag["系统"] = info.os_version;
+        diag["WebView2 版本"] = (info.webview2_versions || []).join("  ") || "（没在标准目录找到）";
+        diag["WebView2 环境变量覆盖"] = info.webview2_env_override || "（无）";
+        diag["附加参数"] = info.browser_args || "（无，WebView2 默认）";
+        renderDiag();
+        settle();
+      })
+      .catch(function (err) {
+        mark("ipc", "bad", "env_info 调用失败：" + (err && err.message ? err.message : err));
+        record("ipc_failed " + err);
+        settle();
+      });
+  }
+
+  // ── 按钮 ───────────────────────────────────────────────────────────
+  function bindButton(id, label, event) {
+    var button = document.getElementById(id);
+    button.addEventListener("click", function () {
+      var text = "已点击：" + label + "（" + new Date().toLocaleTimeString() + "）";
+      document.getElementById("last-action").textContent = text;
+      record("click " + event);
+      renderDiag();
+      var invokeNow = getInvoke();
+      if (invokeNow) {
+        invokeNow("report", { event: "click", detail: event })
+          .then(function (path) {
+            document.getElementById("last-action").textContent = text + " · 已写入日志";
+            diag["日志文件"] = path;
+            renderDiag();
+          })
+          .catch(function (err) {
+            document.getElementById("last-action").textContent =
+              text + " · 写日志失败：" + (err && err.message ? err.message : err);
+          });
+      }
+    });
+  }
+  bindButton("btn-confirm", "确认", "confirm");
+  bindButton("btn-cancel", "取消", "cancel");
+
+  // ── 汇总结论 ───────────────────────────────────────────────────────
+  function settle() {
+    var verdict = document.getElementById("verdict");
+    var ok = marks.html === "ok" && marks.js === "ok" && marks.paint === "ok" && marks.ipc === "ok";
+    if (ok) {
+      verdict.className = "ok";
+      verdict.textContent = "WebView 正常：页面已渲染、IPC 已连通。请点一下两个按钮，看日志里有没有 click 记录。";
+    } else {
+      verdict.className = "bad";
+      verdict.textContent = "异常：见下方哪一步没有通过。";
+    }
+  }
+})();
+</script>
+</body>
+</html>

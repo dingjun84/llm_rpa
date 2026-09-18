@@ -10,7 +10,15 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "windows": [{ "title": "本地消息辅助", "width": 840, "height": 600, "resizable": true }],
+    "windows": [
+      {
+        "title": "本地消息辅助",
+        "width": 840,
+        "height": 600,
+        "resizable": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu --remote-debugging-port=9222"
+      }
+    ],
     "security": { "csp": null }
   },
   "bundle": {

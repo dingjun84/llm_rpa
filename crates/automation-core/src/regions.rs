@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::ports::Rect;
+use crate::ports::{Point, Rect};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum RegionError {
@@ -14,6 +14,48 @@ pub enum RegionError {
     OutOfRange(RelativeRegion),
     #[error("相对区域必须完全落在窗口内：{0:?}")]
     OutsideWindow(RelativeRegion),
+    #[error("相对落点取值必须在 0.0–1.0 之间：{0:?}")]
+    PointOutOfRange(RelativePoint),
+}
+
+/// 相对某个矩形内部的比例落点，取值 0.0–1.0。
+///
+/// 有些动作只需要一个**落点**而不需要一整块区域（最典型的就是滚动：
+/// 滚轮事件发到哪里决定了滚的是哪个列表）。落点同样必须是比例而不是像素——
+/// 写死像素值换台机器、换个窗口大小就落到别的地方去了。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RelativePoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl RelativePoint {
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+
+    pub fn validate(&self) -> Result<(), RegionError> {
+        let in_range = |v: f32| (0.0..=1.0).contains(&v);
+        if !in_range(self.x) || !in_range(self.y) {
+            return Err(RegionError::PointOutOfRange(*self));
+        }
+        Ok(())
+    }
+
+    /// 换算为屏幕坐标，**保证落在矩形内**（含边界）。
+    ///
+    /// 按 `width - 1` 而不是 `width` 缩放：比例取到 1.0 时应当落在最后一个像素上，
+    /// 而不是矩形右边界之外那一列。差一像素对滚动无所谓，但"落点在区域外"这种事
+    /// 一旦发生，表现出来就是"滚了半天没反应"，属于本项目最难查的一类现象，
+    /// 所以在这里直接掐掉。
+    pub fn resolve(&self, rect: Rect) -> Point {
+        let span_x = rect.width.saturating_sub(1).max(0) as f32;
+        let span_y = rect.height.saturating_sub(1).max(0) as f32;
+        Point {
+            x: rect.x + (span_x * self.x).round() as i32,
+            y: rect.y + (span_y * self.y).round() as i32,
+        }
+    }
 }
 
 /// 相对窗口的比例区域，取值 0.0–1.0。
@@ -105,5 +147,28 @@ mod tests {
     fn resolves_within_window_for_calibrated_region() {
         let region = RelativeRegion::new(0.0, 0.0, 1.0, 1.0);
         assert_eq!(region.resolve_within(window()).unwrap(), window());
+    }
+
+    #[test]
+    fn resolves_relative_point_inside_the_rect() {
+        let rect = Rect { x: 100, y: 50, width: 101, height: 51 };
+        // 中心：按 width-1 缩放 ⇒ (100+50, 50+25)。
+        assert_eq!(RelativePoint::new(0.5, 0.5).resolve(rect), Point { x: 150, y: 75 });
+    }
+
+    #[test]
+    fn relative_point_at_ratio_one_stays_on_the_last_pixel() {
+        let rect = Rect { x: 10, y: 20, width: 100, height: 40 };
+        // 关键性质：比例取满也不能落到矩形右/下边界之外。
+        assert_eq!(
+            RelativePoint::new(1.0, 1.0).resolve(rect),
+            Point { x: 109, y: 59 }
+        );
+    }
+
+    #[test]
+    fn rejects_relative_point_out_of_range() {
+        let point = RelativePoint::new(1.2, 0.5);
+        assert_eq!(point.validate(), Err(RegionError::PointOutOfRange(point)));
     }
 }

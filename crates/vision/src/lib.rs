@@ -51,4 +51,4 @@ impl From<VisionError> for AutomationError {
 
 pub use evidence::{redact, RedactionPlan};
 pub use ocr::{ExternalOcr, UnconfiguredOcr};
-pub use pixels::{binarize, crop, encode_png, to_grayscale, to_rgba};
+pub use pixels::{binarize, crop, downscale_to_max_width, encode_png, to_grayscale, to_rgba};

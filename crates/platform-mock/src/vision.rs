@@ -110,4 +110,13 @@ impl ContactMatcher for MockContactMatcher {
         }
         self.inner.find_unique_exact_match(expected_name, candidates, min_confidence)
     }
+
+    /// 委托内层策略 —— 替身不改变判据，只额外支持注入失败。
+    ///
+    /// `forced` 故障**刻意不在这里生效**：它的用途是「让这一次匹配失败」，
+    /// 而本方法回答的是「这个候选符不符合判据」。混在一起会让
+    /// 「强制失败」顺带把复检也弄失败，测试意图变得含混。
+    fn accepts(&self, expected_name: &str, candidate: &TextBox) -> bool {
+        self.inner.accepts(expected_name, candidate)
+    }
 }

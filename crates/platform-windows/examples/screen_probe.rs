@@ -25,7 +25,7 @@
 
 #![cfg(windows)]
 
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use automation_core::{DesktopPlatform, Point, Rect, Screenshot};
 use platform_windows::{winapi, WindowsDesktop, WindowsDesktopConfig};
@@ -39,9 +39,14 @@ fn main() {
 
     let result = match command {
         "list" => list_windows(),
+        "pick" => pick(&args),
+        "focus" => focus_window(&args),
+        "annotate" => annotate(&args),
         "capture" => capture_window(&args),
         "shot" => capture_region_of_window(&args),
+        "printshot" => print_shot(&args),
         "click" => click(&args),
+        "scroll" => scroll(&args),
         "paste" => paste(&args),
         "type" => type_into(&args),
         "clear" => clear_input(&args),
@@ -64,9 +69,15 @@ fn usage() {
 screen_probe —— 真机诊断工具（坐标均为窗口内相对坐标）
 
   list                                    列出所有可见窗口
+  pick [秒数]                             打印光标下的窗口（类名/标题/exe）；给秒数则持续采样
+  focus <窗口类名> [exe路径]                只做「接管窗口」：定位 + 带到前台，然后报结果
+  annotate <标题前缀> <输出.png> [标定.json]  截图上画出四个区域 + 10% 网格，供人工确认
   capture <标题前缀> <输出.png>            截取整个窗口
   shot <标题前缀> <输出.png> <x> <y> <w> <h>  截取窗口内的一个区域
+  printshot <标题前缀> <输出.png>          用 PrintWindow 抓窗口自身画面（能抓到 WebView2 内容）
   click <标题前缀> <x> <y>                 受保护地点击窗口内某点
+  scroll <标题前缀> <x> <y> <格数>         把光标移到某点后滚动滚轮（正数向下、负数向上）
+                                        并打印光标前后位置，用来确认「鼠标真的移过去了」
   paste <标题前缀> <文字>                  受保护地粘贴文字（不按回车）
   type <标题前缀> <x> <y> <文字>           聚焦到某点后粘贴文字（单进程完成，推荐）
   clear <标题前缀> <x> <y>                清空该点所在的输入控件（Ctrl+A + Delete）
@@ -111,6 +122,72 @@ fn list_windows() -> Result<(), String> {
     Ok(())
 }
 
+/// 描述光标下那个顶层窗口的完整身份。
+///
+/// 这是「让操作者用鼠标指认目标窗口」的只读版本：**不需要点击**，
+/// 把鼠标停在目标窗口上就够了。
+///
+/// 为什么刻意不要求点击：点击可能在目标程序里产生副作用
+/// （在会话列表上点一下就把会话打开了、在别处点一下就把草稿框丢了）。
+/// 悬停 + 读取没有任何副作用。
+fn describe_window_under_cursor() -> Option<String> {
+    let (x, y) = winapi::cursor_position().ok()?;
+    let hwnd = winapi::window_from_point(x, y)?;
+    let rect = winapi::window_rect(hwnd).ok()?;
+    let exe = winapi::window_process_path(hwnd)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|err| format!("<读取失败：{err}>"));
+    Some(format!(
+        "hwnd={:#x}\n    类名    {}\n    标题    {}\n    位置    ({},{}) {}x{}\n    所属 exe {}",
+        hwnd.0 as isize,
+        winapi::window_class_name(hwnd),
+        winapi::window_title(hwnd),
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        exe
+    ))
+}
+
+fn pick(args: &[String]) -> Result<(), String> {
+    let seconds: u64 = match args.get(1) {
+        Some(value) => value
+            .parse()
+            .map_err(|_| "秒数必须是整数".to_string())?,
+        None => 0,
+    };
+
+    if seconds == 0 {
+        return match describe_window_under_cursor() {
+            Some(described) => {
+                println!("{described}");
+                Ok(())
+            }
+            None => Err("光标下没有窗口（可能停在桌面本体上）".to_string()),
+        };
+    }
+
+    println!("采样 {seconds} 秒：把鼠标移到目标窗口上**停住**，不用点击。");
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut seen: Vec<String> = Vec::new();
+    while Instant::now() < deadline {
+        if let Some(described) = describe_window_under_cursor() {
+            if !seen.contains(&described) {
+                seen.push(described.clone());
+                println!("\n{described}");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    if seen.is_empty() {
+        println!("\n这 {seconds} 秒内没有采到任何窗口。");
+    } else {
+        println!("\n共采到 {} 个不同的窗口。", seen.len());
+    }
+    Ok(())
+}
+
 fn capture_window(args: &[String]) -> Result<(), String> {
     let prefix = arg(args, 1, "标题前缀")?;
     let out = arg(args, 2, "输出 PNG 路径")?;
@@ -132,8 +209,269 @@ fn capture_region_of_window(args: &[String]) -> Result<(), String> {
 }
 
 /// 捕获并落盘为 PNG。
+// ── 区域标注：让操作者肉眼确认标定 ──────────────────────────────────────
+
+/// 四个区域的标注颜色，与 [`REGION_NAMES`] 一一对应。
+///
+/// 刻意挑在浅色和深色界面上都看得清的饱和色。顺序固定，方便对着控制台读图。
+/// **与界面 `RegionCalibration.tsx::REGIONS` 的 `color` 保持一致**。
+const REGION_COLORS: [[u8; 3]; 4] = [
+    [226, 75, 74],
+    [55, 138, 221],
+    [99, 153, 34],
+    [239, 159, 39],
+];
+
+/// 四个区域的名称，与 [`REGION_COLORS`] 一一对应。
+///
+/// **必须与界面 `RegionCalibration.tsx::REGIONS` 的编号和名称一致**：
+/// 两边都会把编号画出来，操作者用「把 1 的左边界挪到 32%」这种话沟通。
+const REGION_NAMES: [&str; 4] = ["联系人候选区", "聊天页标题区", "聊天正文区", "消息输入框区"];
+
+/// 与 `RuntimeConfig::default().regions` 保持一致。
+///
+/// 现在**直接从 `automation_core::DEFAULT_REGIONS` 展开**，不再手抄一份：
+/// 探针与产品路径共用同一组常量，画出来的框必然就是任务真正会裁的框。
+/// 此前这里是手抄的字面量，两边不一致时探针会把人引到错的方向
+/// （「框明明画对了，任务却说识别不到」）。
+const DEFAULT_REGIONS: [[f32; 4]; 4] = [
+    flatten(automation_core::DEFAULT_REGIONS[0]),
+    flatten(automation_core::DEFAULT_REGIONS[1]),
+    flatten(automation_core::DEFAULT_REGIONS[2]),
+    flatten(automation_core::DEFAULT_REGIONS[3]),
+];
+
+/// 把 `RelativeRegion` 摊平成探针内部用的 `[x, y, w, h]`。
+///
+/// 写成 `const fn` 而不是闭包：`const` 初始化式里不允许调用闭包。
+const fn flatten(region: automation_core::RelativeRegion) -> [f32; 4] {
+    [region.x, region.y, region.width, region.height]
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct RegionsFile {
+    regions: Option<RegionsBlock>,
+}
+
+/// 每个字段都可选：手写的标定文件往往只想改其中一两个区域。
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct RegionsBlock {
+    contact_panel: Option<[f32; 4]>,
+    chat_header: Option<[f32; 4]>,
+    chat_body: Option<[f32; 4]>,
+    composer: Option<[f32; 4]>,
+}
+
+type Canvas = image::RgbaImage;
+
+/// 5x7 点阵数字，低位在右（`bit 4` 是最左那一列）。
+///
+/// 自带点阵而不是引字体文件：探针要能随手拷到别的机器上跑，
+/// 不该依赖外部字体资源。
+const DIGITS: [[u8; 7]; 10] = [
+    [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+    [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+    [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+    [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
+    [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+    [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+    [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+    [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+    [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+    [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+];
+
+/// 按 alpha 把颜色混进某个像素。越界坐标静默忽略 —— 标注框经常贴边。
+fn blend(canvas: &mut Canvas, x: i32, y: i32, color: [u8; 3], alpha: f32) {
+    if x < 0 || y < 0 || x as u32 >= canvas.width() || y as u32 >= canvas.height() {
+        return;
+    }
+    let pixel = canvas.get_pixel_mut(x as u32, y as u32);
+    let weight = alpha.clamp(0.0, 1.0);
+    for channel in 0..3 {
+        let base = pixel.0[channel] as f32;
+        pixel.0[channel] = (base * (1.0 - weight) + color[channel] as f32 * weight).round() as u8;
+    }
+}
+
+fn fill_rect(canvas: &mut Canvas, x: i32, y: i32, w: i32, h: i32, color: [u8; 3], alpha: f32) {
+    for py in y..y + h {
+        for px in x..x + w {
+            blend(canvas, px, py, color, alpha);
+        }
+    }
+}
+
+fn stroke_rect(
+    canvas: &mut Canvas,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    thickness: i32,
+    color: [u8; 3],
+    alpha: f32,
+) {
+    for offset in 0..thickness {
+        for px in x..x + w {
+            blend(canvas, px, y + offset, color, alpha);
+            blend(canvas, px, y + h - 1 - offset, color, alpha);
+        }
+        for py in y..y + h {
+            blend(canvas, x + offset, py, color, alpha);
+            blend(canvas, x + w - 1 - offset, py, color, alpha);
+        }
+    }
+}
+
+fn draw_digit(canvas: &mut Canvas, digit: usize, x: i32, y: i32, scale: i32, color: [u8; 3]) {
+    for (row, bits) in DIGITS[digit % 10].iter().enumerate() {
+        for col in 0..5 {
+            if bits & (1 << (4 - col)) != 0 {
+                fill_rect(
+                    canvas,
+                    x + col * scale,
+                    y + row as i32 * scale,
+                    scale,
+                    scale,
+                    color,
+                    1.0,
+                );
+            }
+        }
+    }
+}
+
+/// 每 10% 画一条细线，每 50% 画一条粗一点的。
+///
+/// 目的是让操作者能用**百分比**回话（"左边界再往右挪到 30%"），
+/// 而不是"再往右一点点"这种没法直接执行的描述。
+fn draw_percent_grid(canvas: &mut Canvas) {
+    let width = canvas.width() as i32;
+    let height = canvas.height() as i32;
+    for step in 1..10 {
+        let major = step % 5 == 0;
+        let alpha = if major { 0.5 } else { 0.22 };
+        let thickness = if major { 2 } else { 1 };
+        fill_rect(canvas, width * step / 10, 0, thickness, height, [128, 128, 128], alpha);
+        fill_rect(canvas, 0, height * step / 10, width, thickness, [128, 128, 128], alpha);
+    }
+}
+
+fn regions_from_file(path: &str) -> Result<[[f32; 4]; 4], String> {
+    let raw = std::fs::read_to_string(path).map_err(|err| format!("读不到标定文件 {path}：{err}"))?;
+    let parsed: RegionsFile =
+        serde_json::from_str(&raw).map_err(|err| format!("标定文件 {path} 解析失败：{err}"))?;
+    let block = parsed.regions.unwrap_or_default();
+    Ok([
+        block.contact_panel.unwrap_or(DEFAULT_REGIONS[0]),
+        block.chat_header.unwrap_or(DEFAULT_REGIONS[1]),
+        block.chat_body.unwrap_or(DEFAULT_REGIONS[2]),
+        block.composer.unwrap_or(DEFAULT_REGIONS[3]),
+    ])
+}
+
+fn annotate(args: &[String]) -> Result<(), String> {
+    let prefix = arg(args, 1, "标题前缀")?;
+    let out = arg(args, 2, "输出 PNG 路径")?;
+    let regions = match args.get(3) {
+        Some(path) => regions_from_file(path)?,
+        None => DEFAULT_REGIONS,
+    };
+
+    let rect = locate(&prefix)?;
+    let frame = winapi::capture_region(rect)?;
+    let width = frame.width;
+    let height = frame.height;
+    let shot = Screenshot {
+        pixels: frame.pixels,
+        width,
+        height,
+        captured_at: SystemTime::now(),
+        fingerprint: frame.fingerprint,
+    };
+    let mut canvas = vision::to_rgba(&shot).map_err(|err| err.to_string())?;
+
+    draw_percent_grid(&mut canvas);
+
+    // 线宽与角标大小随图像尺寸缩放，而不是写死像素值：
+    // 在 4K 屏上固定 3px 边框会细得看不见，在 1024 宽的窗口上固定 30px 角标又会盖住内容。
+    let thickness = (width / 700).clamp(2, 6) as i32;
+    let scale = (width / 350).clamp(3, 8) as i32;
+
+    let pixels_of = |region: &[f32; 4]| -> (i32, i32, i32, i32) {
+        (
+            (region[0] * width as f32).round() as i32,
+            (region[1] * height as f32).round() as i32,
+            (region[2] * width as f32).round() as i32,
+            (region[3] * height as f32).round() as i32,
+        )
+    };
+
+    for (index, region) in regions.iter().enumerate() {
+        let color = REGION_COLORS[index];
+        let (x, y, w, h) = pixels_of(region);
+        fill_rect(&mut canvas, x, y, w, h, color, 0.12);
+        stroke_rect(&mut canvas, x, y, w, h, thickness, color, 0.95);
+        // 数字角标贴在区域左上角内侧；先垫一块深色底，保证在任何底色上都读得出来。
+        let (bx, by) = (x + 2 * thickness, y + 2 * thickness);
+        let pad = thickness;
+        fill_rect(
+            &mut canvas,
+            bx - pad,
+            by - pad,
+            5 * scale + 2 * pad,
+            7 * scale + 2 * pad,
+            [0, 0, 0],
+            0.6,
+        );
+        draw_digit(&mut canvas, index + 1, bx, by, scale, [255, 255, 255]);
+    }
+
+    let png = vision::encode_png(&canvas).map_err(|err| err.to_string())?;
+    std::fs::write(&out, &png).map_err(|err| format!("写入 {out} 失败：{err}"))?;
+
+    println!("已保存 {out}（{width}x{height}，{} 字节）", png.len());
+    println!(
+        "窗口「{prefix}」@ ({},{}) {}x{}",
+        rect.x, rect.y, rect.width, rect.height
+    );
+    println!("\n图上框角数字 → 区域（比例是相对窗口的）：");
+    for (index, region) in regions.iter().enumerate() {
+        let (x, y, w, h) = pixels_of(region);
+        println!(
+            "  {}  {:<6} x={:.2} y={:.2} w={:.2} h={:.2}   → 像素 ({x},{y}) {w}x{h}",
+            index + 1,
+            REGION_NAMES[index],
+            region[0],
+            region[1],
+            region[2],
+            region[3],
+        );
+    }
+    println!("\n请核对这四个框是否都框对了；要挪就按百分比说，例如「1 的左边界挪到 0.32」。");
+    Ok(())
+}
+
 fn save(region: Rect, out: &str) -> Result<(), String> {
-    let frame = winapi::capture_region(region)?;
+    save_frame(winapi::capture_region(region)?, out)
+}
+
+/// 用 `PrintWindow` 抓整个窗口，而不是屏幕 DC 的 `BitBlt`。
+///
+/// 用途单一但关键：**验证 WebView2 / Chromium 这类窗口到底画了什么**。
+/// `capture` / `shot` 走 BitBlt，对这类用 GPU 合成的内容常常只能拿到一片白或一片黑，
+/// 那会让人误判成「页面没渲染」。`printshot` 直接向窗口要画面，能分清两者。
+fn print_shot(args: &[String]) -> Result<(), String> {
+    let prefix = arg(args, 1, "标题前缀")?;
+    let out = arg(args, 2, "输出 PNG 路径")?;
+    let hwnd = winapi::find_window_by_title_prefix(&prefix)?;
+    save_frame(winapi::print_window(hwnd)?, &out)
+}
+
+fn save_frame(frame: winapi::CapturedFrame, out: &str) -> Result<(), String> {
     let shot = Screenshot {
         pixels: frame.pixels,
         width: frame.width,
@@ -171,6 +509,80 @@ fn click(args: &[String]) -> Result<(), String> {
         target.y - window.y,
         target.x,
         target.y
+    );
+    Ok(())
+}
+
+/// 把光标移到窗口内某点后滚动滚轮。
+///
+/// 滚轮事件只会送给**光标下**的窗口，所以必须先移动光标；
+/// 与 `click` 一样会先确认目标窗口在前台，避免把别的界面滚走。
+fn scroll(args: &[String]) -> Result<(), String> {
+    let prefix = arg(args, 1, "标题前缀")?;
+    let x = number(args, 2, "x")?;
+    let y = number(args, 3, "y")?;
+    let notches = number(args, 4, "滚动格数")?;
+    if notches == 0 {
+        return Err("滚动格数不能为 0".to_string());
+    }
+
+    // 先记下光标**原本**在哪：这是回答「鼠标到底有没有被挪到滚动区域」的关键。
+    // 只打印结果的话，操作者只能凭肉眼盯着屏幕，而 `SetCursorPos` 是一帧内瞬移，
+    // 很容易看漏；两个坐标一对比，动没动就是白纸黑字。
+    let before = winapi::cursor_position().ok();
+    match before {
+        Some((bx, by)) => println!("光标起点：屏幕 ({bx}, {by})"),
+        None => println!("光标起点：（读不到，后面无法对比）"),
+    }
+
+    let desktop = WindowsDesktop::new(WindowsDesktopConfig::for_title_prefix(prefix.clone()));
+    let window = desktop.focus_wecom().map_err(|err| err.to_string())?;
+    let at = Point { x: window.x + x, y: window.y + y };
+    // 不提前 `?`：光标核对要**在失败时也打印**——移不过去正是最需要看到坐标的时候。
+    let result = desktop.scroll(at, notches, window);
+    match winapi::cursor_position() {
+        Ok((ax, ay)) => println!("光标现在：屏幕 ({ax}, {ay})   要求落在 ({}, {})", at.x, at.y),
+        Err(_) => println!("光标现在：（读不到）"),
+    }
+    result.map_err(|err| err.to_string())?;
+
+    println!(
+        "已在窗口内 ({x}, {y}) 向{}滚动 {} 格",
+        if notches > 0 { "下" } else { "上" },
+        notches.abs()
+    );
+    Ok(())
+}
+
+/// 只做「接管窗口」这一步：定位 + 带到前台，然后打印结果。
+///
+/// **不点击、不输入、不发送**，只改变前台窗口——与任务开始时做的事情完全一致。
+/// 任务里接管失败时用这条命令单独验证，就不用去猜到底是
+/// 「窗口没找到」还是「找到了但置前被拒」。
+fn focus_window(args: &[String]) -> Result<(), String> {
+    let class = arg(args, 1, "窗口类名")?;
+    let exe = args
+        .get(2)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty());
+
+    let mut config = WindowsDesktopConfig {
+        window_matcher: platform_windows::WindowMatcher::ClassName(class.clone()),
+        ..WindowsDesktopConfig::default()
+    };
+    if let Some(exe) = exe {
+        config.wecom_exe = Some(std::path::PathBuf::from(exe));
+    }
+
+    let desktop = WindowsDesktop::new(config);
+    let window = desktop.focus_wecom().map_err(|err| err.to_string())?;
+    let scale = desktop
+        .screen_metrics()
+        .map(|metrics| metrics.scale_factor)
+        .unwrap_or(0.0);
+    println!(
+        "接管成功：类名「{class}」{}x{} @({}, {})，缩放 {scale}",
+        window.width, window.height, window.x, window.y
     );
     Ok(())
 }
@@ -249,7 +661,8 @@ fn clear_input(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn arg(args: &[String], index: usize, name: &str) -> Result<String, String> {    args.get(index)
+fn arg(args: &[String], index: usize, name: &str) -> Result<String, String> {
+    args.get(index)
         .cloned()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("缺少参数：{name}"))

@@ -10,6 +10,16 @@
 //! 任何第三方模型**。语言优先级为「命令行第一个参数 → `zh-Hans-CN` →
 //! 用户配置语言」。
 //!
+//! # 命令行
+//!
+//! ```text
+//! winocr [语言标签] [--upscale <倍数>]
+//! ```
+//!
+//! - 语言标签可选，缺省按「`zh-Hans-CN` → 用户配置语言」找引擎。
+//! - `--upscale` 是识别前的放大倍数，默认 `DEFAULT_UPSCALE`（见下），传 `1` 关掉。
+//!   见下面「已知限制 3」。
+//!
 //! # 已知限制（务必知悉，不要当成缺陷掩盖过去）
 //!
 //! 1. **`Windows.Media.Ocr` 不提供逐词置信度。** 本工具因此统一输出
@@ -19,8 +29,11 @@
 //! 2. **按「行」输出文字框**（行内各词外接矩形的并集）。送达核验要求
 //!    某个文字框的文本**包含**整条消息，所以过长的消息一旦在界面上折行，
 //!    就可能无法被判定为同一框。
-//! 3. 图片超过 `OcrEngine.MaxImageDimension` 时会等比缩小后再识别，
-//!    此时输出的坐标是**缩小后图像**的坐标，与原始截图不再一致。
+//! 3. **小字号识别很差，必须先放大。** 实测微信 4.x 联系人列表里名字只有
+//!    11~13px 高，引擎在这个尺寸下输出基本是乱码（「顺邦科技物流-Yuri」
+//!    被读成「顺物流一 Yuri」，一整行里错一半）。所以默认先放大
+//!    `DEFAULT_UPSCALE` 倍再识别。**输出的坐标始终换算回原始截图的坐标系**，
+//!    调用方不需要知道这里做过缩放。
 
 #[cfg(windows)]
 mod imp {
@@ -42,6 +55,69 @@ mod imp {
         w: i32,
         h: i32,
         confidence: f32,
+    }
+
+    /// 识别前的默认放大倍数。
+    ///
+    /// **依据**（2026-09-17 实测）：微信 4.x 会话列表里联系人名只有 11~13px 高，
+    /// `Windows.Media.Ocr` 在这个尺寸下输出基本是乱码——实测「顺邦科技物流-Yuri」
+    /// 被读成「顺物流一 Yuri」，一整行错一半，逐字精确匹配根本没戏。
+    /// 放大 2 倍 ⇒ 22~26px，落在这个引擎表现正常的区间。
+    ///
+    /// **为什么是「倍数」而不是写死像素**：需要放大的是**字号相对引擎能力**的差距，
+    /// 跟屏幕分辨率、DPI、窗口大小都无关——换台机器这个倍数依然成立。
+    /// 代价是像素数 ×4、单次识别耗时上升（联系人区一轮要识别十几次），
+    /// 所以不是越大越好；确有必要可用 `--upscale` 覆盖，传 `1` 关掉。
+    pub const DEFAULT_UPSCALE: f32 = 2.0;
+
+    /// 放大倍数的上限。
+    ///
+    /// 挡的是「手滑写成 100」这类输入：100 倍会把 269x485 变成 26900x48500，
+    /// 光分配缓冲就能把机器拖垮。引擎自己的 `MaxImageDimension` 是最后一道闸，
+    /// 但那是"缩小"，发生在已经分配完之后——这里提前失败并说清原因。
+    pub const MAX_UPSCALE: f32 = 8.0;
+
+    /// 解析命令行：`[语言标签] [--upscale <倍数>]`，两者顺序不限。
+    fn parse_args(args: &[String]) -> Result<(Option<String>, f32), String> {
+        let mut language: Option<String> = None;
+        let mut upscale = DEFAULT_UPSCALE;
+
+        let mut index = 0;
+        while index < args.len() {
+            let arg = args[index].as_str();
+            if let Some(value) = arg.strip_prefix("--upscale=") {
+                upscale = parse_upscale(value)?;
+            } else if arg == "--upscale" {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "`--upscale` 后面要跟一个倍数，例如 `--upscale 2`".to_string()
+                })?;
+                upscale = parse_upscale(value)?;
+                index += 1;
+            } else if arg.starts_with("--") {
+                // 不认识的开关直接报错，而不是当语言标签收下：
+                // 拼错的参数静默失效，排查起来比报错难得多。
+                return Err(format!("不认识的参数：{arg}"));
+            } else if language.is_none() {
+                language = Some(arg.to_string());
+            } else {
+                return Err(format!("多余的参数：{arg}（语言标签只能给一个）"));
+            }
+            index += 1;
+        }
+
+        Ok((language, upscale))
+    }
+
+    fn parse_upscale(raw: &str) -> Result<f32, String> {
+        let value: f32 = raw
+            .parse()
+            .map_err(|_| format!("放大倍数不是数字：{raw:?}"))?;
+        if !value.is_finite() || !(1.0..=MAX_UPSCALE).contains(&value) {
+            return Err(format!(
+                "放大倍数必须在 1.0–{MAX_UPSCALE} 之间（传 1 表示不放大），收到 {raw:?}"
+            ));
+        }
+        Ok(value)
     }
 
     /// 判断是否属于中日韩文字或全角标点。
@@ -132,7 +208,8 @@ mod imp {
     }
 
     pub fn run() -> Result<(), String> {
-        let preferred: Option<String> = std::env::args().nth(1);
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let (preferred, upscale) = parse_args(&args)?;
 
         // ── 读入 PNG ────────────────────────────────────────────────
         let mut png = Vec::new();
@@ -149,19 +226,32 @@ mod imp {
             .map_err(|err| format!("PNG 解码失败：{err}"))?
             .to_rgba8();
 
-        // ── 超过引擎上限则等比缩小 ──────────────────────────────────
+        // ── 缩放：先按倍数放大，再保证不超过引擎上限 ────────────────
+        //
+        // 两个方向合并成**一次**重采样，所以全程只有一个 `scale` 要记住，
+        // 最后把输出坐标除以它就回到了原始截图的坐标系。
+        // （放大是为了救小字号，见文件头「已知限制 3」；缩小是引擎的硬上限。）
         let max_dim = OcrEngine::MaxImageDimension().unwrap_or(0);
         let (mut width, mut height) = (decoded.width(), decoded.height());
         let mut image = decoded;
-        if max_dim > 0 && (width > max_dim || height > max_dim) {
-            let ratio = (max_dim as f32 / width.max(height) as f32).min(1.0);
-            let new_w = ((width as f32 * ratio).floor() as u32).max(1);
-            let new_h = ((height as f32 * ratio).floor() as u32).max(1);
+        let mut scale = upscale;
+        if max_dim > 0 {
+            let longest = width.max(height) as f32 * scale;
+            if longest > max_dim as f32 {
+                // 放大后仍超限 ⇒ 退回到上限。此时 scale 可能小于 1（等于缩小）。
+                scale *= max_dim as f32 / longest;
+            }
+        }
+        if (scale - 1.0).abs() > f32::EPSILON {
+            let new_w = ((width as f32 * scale).round() as u32).max(1);
+            let new_h = ((height as f32 * scale).round() as u32).max(1);
+            // Lanczos3：放大时比 Triangle 更能保住笔画边缘，而小字号识别
+            // 恰恰全押在笔画边缘上。
             image = image::imageops::resize(
                 &image,
                 new_w,
                 new_h,
-                image::imageops::FilterType::Triangle,
+                image::imageops::FilterType::Lanczos3,
             );
             width = new_w;
             height = new_h;
@@ -237,12 +327,14 @@ mod imp {
                 continue;
             }
 
+            // 坐标换算回**原始截图**的坐标系——识别是在缩放后的图上做的。
+            // 少了这一步，图一大所有坐标就整体偏移，而偏移的后果是点到别的地方去。
             boxes.push(OutBox {
                 text,
-                x: min_x.round() as i32,
-                y: min_y.round() as i32,
-                w: (max_x - min_x).round() as i32,
-                h: (max_y - min_y).round() as i32,
+                x: (min_x / scale).round() as i32,
+                y: (min_y / scale).round() as i32,
+                w: ((max_x - min_x) / scale).round() as i32,
+                h: ((max_y - min_y) / scale).round() as i32,
                 // 见文件头「已知限制 1」：本引擎不提供置信度。
                 confidence: 1.0,
             });
@@ -264,6 +356,51 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn args(list: &[&str]) -> Vec<String> {
+            list.iter().map(|item| item.to_string()).collect()
+        }
+
+        #[test]
+        fn defaults_to_upscaling_with_no_language() {
+            let (language, upscale) = parse_args(&[]).unwrap();
+            assert_eq!(language, None);
+            assert_eq!(upscale, DEFAULT_UPSCALE);
+        }
+
+        #[test]
+        fn takes_a_language_tag_and_the_upscale_flag_in_either_order() {
+            let first = parse_args(&args(&["en-US", "--upscale", "3"])).unwrap();
+            assert_eq!(first.0.as_deref(), Some("en-US"));
+            assert_eq!(first.1, 3.0);
+
+            let second = parse_args(&args(&["--upscale=3", "en-US"])).unwrap();
+            assert_eq!(second.0.as_deref(), Some("en-US"));
+            assert_eq!(second.1, 3.0);
+        }
+
+        /// 传 1 是「关掉放大」的合法写法，不能被当成非法值挡掉。
+        #[test]
+        fn upscale_one_means_off() {
+            let (_, upscale) = parse_args(&args(&["--upscale", "1"])).unwrap();
+            assert_eq!(upscale, 1.0);
+        }
+
+        /// 非法倍数必须报错，而不是默默退回默认值——
+        /// 「参数没生效」这种失败比直接报错难查得多。
+        #[test]
+        fn rejects_bad_upscale_values() {
+            assert!(parse_args(&args(&["--upscale", "0.5"])).is_err());
+            assert!(parse_args(&args(&["--upscale", "100"])).is_err());
+            assert!(parse_args(&args(&["--upscale", "两倍"])).is_err());
+            assert!(parse_args(&args(&["--upscale"])).is_err());
+        }
+
+        #[test]
+        fn rejects_unknown_flags_and_extra_arguments() {
+            assert!(parse_args(&args(&["--upscal", "2"])).is_err());
+            assert!(parse_args(&args(&["zh-Hans-CN", "en-US"])).is_err());
+        }
 
         #[test]
         fn cjk_ranges_are_recognised() {
