@@ -3,6 +3,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
   ConfirmationRequest,
+  IconClickResult,
+  IconEntry,
+  NavIconProbe,
   PickedWindow,
   RuntimeConfig,
   RuntimeInfo,
@@ -98,6 +101,106 @@ export function recordWindowGeometry(
   wecomExe: string | null,
 ): Promise<WindowGeometry> {
   return invoke<WindowGeometry>("record_window_geometry", { windowClass, wecomExe });
+}
+
+/**
+ * 在当前画面上试一次图标模板匹配，报出**分数和位置**。
+ *
+ * 给「先点击导航图标跳转」做标定用：模板截得对不对、阈值该定多少，
+ * 都只能对着真实画面量一次。纯只读——只截屏，不点击、不聚焦、不产生任何输入。
+ *
+ * 参数一律取**草稿**：用户刚填好路径还没点保存时，按草稿量出来的结果
+ * 才是他此刻看到的那份配置。模板的载入走的是与任务装配**同一个函数**，
+ * 所以这里报出来的分数和任务里真正会用的那张图一致。
+ */
+export function probeNavIcon(
+  windowClass: string,
+  wecomExe: string | null,
+  navStrip: [number, number, number, number],
+  templates: string[],
+  minScore: number,
+): Promise<NavIconProbe> {
+  return invoke<NavIconProbe>("probe_nav_icon", {
+    windowClass,
+    wecomExe,
+    navStrip,
+    templates,
+    minScore,
+  });
+}
+
+/** 列出图标库里的全部图标（名字、尺寸、缩略图）。纯文件读取，不碰屏幕。 */
+export function listIcons(): Promise<IconEntry[]> {
+  return invoke<IconEntry[]>("list_icons");
+}
+
+/**
+ * 把预览图上框出来的一块存成图标模板。
+ *
+ * `rect` 是**预览图坐标系**里的框 `[x, y, w, h]`，`preview` 是那张预览图的像素尺寸
+ * （`WindowPreview.width/height`）。两个都要传：光有框没法换算回窗口坐标。
+ *
+ * 后端**不会**从预览图上裁——预览是缩放过的，裁出来的模板边缘会带上插值杂色，
+ * 拿去匹配原始分辨率的画面自然对不准。它会按框重新截一张原始分辨率的窗口画面。
+ * 因此如果窗口在「预览」与「保存」之间改了尺寸，它会直接拒绝并要求重新截图。
+ *
+ * 纯只读：只截屏，不点击、不聚焦、不产生任何输入。
+ */
+export function saveIconFromCrop(
+  name: string,
+  windowClass: string,
+  wecomExe: string | null,
+  rect: [number, number, number, number],
+  preview: [number, number],
+): Promise<IconEntry> {
+  return invoke<IconEntry>("save_icon_from_crop", {
+    name,
+    windowClass,
+    wecomExe,
+    rect,
+    preview,
+  });
+}
+
+/** 删除一张图标。 */
+export function deleteIcon(name: string): Promise<void> {
+  return invoke<void>("delete_icon", { name });
+}
+
+/**
+ * 定位一个图标并**真的点它一下**。
+ *
+ * ⚠️ 这个命令**会产生真实的鼠标点击**——它是界面上那个「定位并点击」按钮，
+ * 由人明确按下，不属于任务流程（任务走的是编排器里的 `NavigatingToView`）。
+ *
+ * 判据与任务里那一步**刻意不同**：任务里点击后画面没变只记警告、继续往下走
+ * （"界面本来就停在这个视图上"是最常见的场景）；这里则如实回报 `changed`，
+ * 因为按按钮的人要的就是"这一下到底有没有生效"。
+ *
+ * 分数不够时它会**直接报错并且不点击**：这个按钮问的是"这张模板能不能用"，
+ * "分数不够但先点了"正好是最不能接受的结果。
+ *
+ * `contactPanel` 是拿来做「画面变了没有」的参照物的区域；
+ * `settleMs` 复用「滚动停稳等待」那个值——等待的是同一个物理现象（界面动画）。
+ */
+export function clickIcon(
+  windowClass: string,
+  wecomExe: string | null,
+  navStrip: [number, number, number, number],
+  contactPanel: [number, number, number, number],
+  templates: string[],
+  minScore: number,
+  settleMs: number,
+): Promise<IconClickResult> {
+  return invoke<IconClickResult>("click_icon", {
+    windowClass,
+    wecomExe,
+    navStrip,
+    contactPanel,
+    templates,
+    minScore,
+    settleMs,
+  });
 }
 
 /**

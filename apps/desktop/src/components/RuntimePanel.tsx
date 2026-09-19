@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import { launchClient, recordWindowGeometry } from "../api";
 import {
@@ -9,12 +9,26 @@ import {
   type RuntimeInfo,
   type RuntimeMode,
 } from "../types";
-import { RegionCalibration, regionsAreValid } from "./RegionCalibration";
+import { RegionCalibration } from "./RegionCalibration";
 import { WindowPicker } from "./WindowPicker";
 
 interface Props {
   info: RuntimeInfo;
-  onSave: (config: RuntimeConfig) => void;
+  /**
+   * 配置**草稿**。
+   *
+   * 它由 `App` 持有，而不是这一块自己 `useState`：配置里有一组字段
+   * （导航图标）是在「图标库」页里改的，草稿放在子组件里就没法共享——
+   * 而两页各自持有一份草稿的话，保存时会有一份被另一份覆盖掉。
+   */
+  draft: RuntimeConfig;
+  /** 改草稿。不落盘——要用户点「保存配置」。 */
+  onPatch: (patch: Partial<RuntimeConfig>) => void;
+  onSave: () => void;
+  /** 草稿与已保存的配置是否不一致。 */
+  dirty: boolean;
+  /** 草稿是否满足保存条件（区域标定合法）。 */
+  canSave: boolean;
   busy: boolean;
 }
 
@@ -39,9 +53,7 @@ const ratioFromInput = (raw: string, fallback: number) => {
   return Math.min(1, Math.max(0, value));
 };
 
-export function RuntimePanel({ info, onSave, busy }: Props) {
-  const [draft, setDraft] = useState<RuntimeConfig>(info.config);
-  const [saved, setSaved] = useState(false);
+export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, busy }: Props) {
   /** 「启动客户端」的结果提示（成功或失败）。 */
   const [launchNotice, setLaunchNotice] = useState<string | null>(null);
   const [launching, setLaunching] = useState(false);
@@ -49,13 +61,8 @@ export function RuntimePanel({ info, onSave, busy }: Props) {
   const [measureNotice, setMeasureNotice] = useState<string | null>(null);
   const [measuring, setMeasuring] = useState(false);
 
-  useEffect(() => {
-    setDraft(info.config);
-  }, [info.config]);
-
   const update = <K extends keyof RuntimeConfig>(key: K, value: RuntimeConfig[K]) => {
-    setDraft((current) => ({ ...current, [key]: value }));
-    setSaved(false);
+    onPatch({ [key]: value } as Partial<RuntimeConfig>);
   };
 
   /**
@@ -65,12 +72,10 @@ export function RuntimePanel({ info, onSave, busy }: Props) {
    * 有些窗口（权限受限的系统进程）读不出路径，直接写 null 会把已有配置抹掉。
    */
   const applyPickedWindow = (picked: PickedWindow) => {
-    setDraft((current) => ({
-      ...current,
+    onPatch({
       window_class: picked.class_name,
-      wecom_exe: picked.exe_path ?? current.wecom_exe,
-    }));
-    setSaved(false);
+      wecom_exe: picked.exe_path ?? draft.wecom_exe,
+    });
   };
 
   const startClient = async () => {
@@ -94,8 +99,7 @@ export function RuntimePanel({ info, onSave, busy }: Props) {
     setMeasureNotice(null);
     try {
       const geometry = await recordWindowGeometry(draft.window_class, draft.wecom_exe);
-      setDraft((current) => ({ ...current, calibrated_window: geometry }));
-      setSaved(false);
+      onPatch({ calibrated_window: geometry });
       setMeasureNotice(
         `已记录 ${geometry.width}×${geometry.height} @(${geometry.x}, ${geometry.y})，` +
           `缩放 ${geometry.scale_factor}。还要点最下面的「保存配置」才会生效。`,
@@ -109,7 +113,7 @@ export function RuntimePanel({ info, onSave, busy }: Props) {
 
   // 演练模式不碰真实窗口，标定值用不上；真实模式则必须保证四个区域都合法，
   // 否则后端 `RelativeRegion::validate` 会在执行时才报错，白白浪费一次任务。
-  const canSave = draft.mode === "dry_run" || regionsAreValid(draft.regions);
+  // 这个判断由 `App` 做（它同时还要给「图标库」页用），这里只读结果。
 
   // 界面上显示的是 `draft`（草稿），而 `start_task` 读的是**已保存的** `state.config`
   // （见 `lib.rs::start_task`）。两者不一致时，光看界面会以为改动已经生效——
@@ -297,6 +301,10 @@ export function RuntimePanel({ info, onSave, busy }: Props) {
         windowClass={draft.window_class}
         wecomExe={draft.wecom_exe}
       />
+
+      {/* 导航图标那一组（开关 / 模板 / 阈值 / 搜索区）在「图标库」页。
+          它的操作方式是"截一张图、在图上框一个图标、起名字"，和这里
+          "填个数字、看一眼框"是两回事，混在一起两边都别扭。 */}
 
       <div className="field">
         <span className="field-label">超时（毫秒 / 秒）</span>
@@ -554,16 +562,14 @@ export function RuntimePanel({ info, onSave, busy }: Props) {
         />
       </label>
 
-      <button
-        className="primary"
-        disabled={busy || !canSave}
-        onClick={() => {
-          onSave(draft);
-          setSaved(true);
-        }}
-      >
-        {!canSave ? "标定不合法，无法保存" : saved ? "已保存" : "保存配置"}
+      <button className="primary" disabled={busy || !canSave} onClick={onSave}>
+        {!canSave ? "标定不合法，无法保存" : dirty ? "保存配置" : "已保存"}
       </button>
+      {dirty && (
+        <span className="field-hint">
+          ⚠️ 有改动还没保存。任务用的是<strong>已保存</strong>的配置，不是这一页上的草稿。
+        </span>
+      )}
 
       <dl className="meta-list">
         <dt>数据目录</dt>

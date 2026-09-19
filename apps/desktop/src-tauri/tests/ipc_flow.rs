@@ -255,6 +255,14 @@ fn a_dry_run_task_travels_the_full_happy_path_through_ipc() {
     assert_eq!(done.state, TaskState::Completed);
     assert!(done.failure.is_none(), "主路径不应有失败信息");
     assert!(!done.awaiting_confirmation, "终态不应再处于等待确认");
+
+    // 证据清单是**第二次推送**才补齐的：终态本身在状态迁移时就推过一次，
+    // 那一次还没有落盘后的证据（见 `lib.rs` 结尾的「终态补推」）。
+    // 所以不能拿"刚变成终态"那一瞬间的快照去断言证据——并发跑测试时
+    // 这个窗口会被拉大，于是偶发地报「没有证据」，而它其实马上就到。
+    let done = harness.wait_until(&id, "终态的证据补齐", |view| {
+        view.state.is_terminal() && !view.evidence.is_empty()
+    });
     assert!(!done.evidence.is_empty(), "主路径应留下截图指纹作为证据");
 
     let path: Vec<TaskState> = done.history.iter().map(|change| change.to).collect();
@@ -715,3 +723,473 @@ fn live_mode_without_a_calibrated_window_is_refused() {
     );
 }
 
+// ── 图标匹配标定（只读） ────────────────────────────────────────────────
+//
+// 「先点导航图标切视图」这一步的成败全靠**模板截得对不对、阈值定得准不准**，
+// 而这两件事只能对着真实画面量。这组用例盯住三件事：
+//
+// 1. 命令注册（靠 `AppHandle<R>` 钉运行时泛型，漏进 `generate_handler!`
+//    的话前端只会拿到 "command not found"，编译期毫无提示）；
+// 2. 参数校验在**任何输入动作之前**发生；
+// 3. 真的对着一个存在的窗口跑时，报出来的东西自洽（搜索区在窗口内、
+//    命中位置在搜索区内、预览图能解码）。
+
+/// 造一张真的 PNG 当图标模板。
+///
+/// 刻意不引 `image` 依赖：`vision::pixels` 已经能把 BGRA 缓冲编码成 PNG。
+fn write_icon_png(dir: &std::path::Path, name: &str, width: u32, height: u32) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            // 有纹理的图案，避免"纯色模板"被当成无效输入而提前返回。
+            pixels.extend_from_slice(&[
+                (x * 13) as u8,
+                (y * 29) as u8,
+                ((x * 7 + y * 3) % 251) as u8,
+                255,
+            ]);
+        }
+    }
+    let shot = automation_core::Screenshot {
+        pixels,
+        width,
+        height,
+        captured_at: std::time::SystemTime::now(),
+        fingerprint: String::new(),
+    };
+    let rgba = vision::pixels::to_rgba(&shot).unwrap();
+    std::fs::write(&path, vision::pixels::encode_png(&rgba).unwrap()).unwrap();
+    path.display().to_string()
+}
+
+/// 参数校验必须发生在**截屏与点击之前**。
+///
+/// 这条不只是"报错友好"：如果校验写在动作之后，用户填错一个比例就会
+/// 先截一张图（把当前屏幕内容读进内存）再报错，而这是个纯只读标定动作，
+/// 不该有这种副作用。**用例的判据是错误文案**，不是内部调用顺序——
+/// 文案能证明它走到了哪个分支。
+#[test]
+fn probe_nav_icon_validates_its_arguments_before_touching_the_screen() {
+    let harness = Harness::new("probe-icon-args", DemoScenario::Happy);
+
+    // 类名为空：无从定位窗口。
+    let message = harness.err(
+        "probe_nav_icon",
+        json!({
+            "windowClass": "   ",
+            "wecomExe": null,
+            "navStrip": [0.0, 0.0, 0.08, 1.0],
+            "templates": [],
+            "minScore": 0.8,
+        }),
+    );
+    assert!(message.contains("窗口类名"), "应指出类名为空：{message}");
+
+    // 比例越界：必须在读模板之前就拦下。
+    let message = harness.err(
+        "probe_nav_icon",
+        json!({
+            "windowClass": "Progman",
+            "wecomExe": null,
+            "navStrip": [0.0, 0.0, 1.5, 1.0],
+            "templates": ["Z:/definitely/missing.png"],
+            "minScore": 0.8,
+        }),
+    );
+    assert!(
+        message.contains("导航图标搜索区"),
+        "比例越界应先于模板载入被拦下：{message}"
+    );
+
+    // 阈值越界。
+    let message = harness.err(
+        "probe_nav_icon",
+        json!({
+            "windowClass": "Progman",
+            "wecomExe": null,
+            "navStrip": [0.0, 0.0, 0.08, 1.0],
+            "templates": ["Z:/definitely/missing.png"],
+            "minScore": 1.4,
+        }),
+    );
+    assert!(message.contains("0–1"), "应指出阈值越界：{message}");
+}
+
+/// 一张模板都没配时，必须明确报错而不是返回"没找到图标"。
+///
+/// 这两者的区别很关键：`hit: null` 意味着"模板都对不上"，
+/// 而"一张模板都没配"是**配置缺失**——界面要提示用户去截一张图，
+/// 不是让他去调阈值。
+#[test]
+fn probe_nav_icon_refuses_an_empty_template_list() {
+    let harness = Harness::new("probe-icon-notpl", DemoScenario::Happy);
+
+    let message = harness.err(
+        "probe_nav_icon",
+        json!({
+            "windowClass": "Progman",
+            "wecomExe": null,
+            "navStrip": [0.0, 0.0, 0.08, 1.0],
+            "templates": ["  ", ""],
+            "minScore": 0.8,
+        }),
+    );
+    assert!(
+        message.contains("没有配置任何图标模板"),
+        "空模板列表要报配置缺失：{message}"
+    );
+}
+
+/// 模板文件不存在 / 尺寸不可用：在装配期就报错，不留到"分数很低"。
+#[test]
+fn probe_nav_icon_reports_an_unusable_template_immediately() {
+    let harness = Harness::new("probe-icon-badtpl", DemoScenario::Happy);
+
+    let message = harness.err(
+        "probe_nav_icon",
+        json!({
+            "windowClass": "Progman",
+            "wecomExe": null,
+            "navStrip": [0.0, 0.0, 0.08, 1.0],
+            "templates": [std::env::temp_dir().join("rpa-llm-no-such-icon.png").display().to_string()],
+            "minScore": 0.8,
+        }),
+    );
+    assert!(
+        !message.is_empty(),
+        "模板读不出来时必须给出原因，而不是继续往下走"
+    );
+
+    // 过大的模板同样当场拒绝。
+    let dir = std::env::temp_dir().join("rpa-llm-probe-icon-big");
+    let big = write_icon_png(&dir, "big.png", 300, 40);
+    let message = harness.err(
+        "probe_nav_icon",
+        json!({
+            "windowClass": "Progman",
+            "wecomExe": null,
+            "navStrip": [0.0, 0.0, 0.08, 1.0],
+            "templates": [big],
+            "minScore": 0.8,
+        }),
+    );
+    assert!(message.contains("太大"), "报错要说清是尺寸问题：{message}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 对着一个确实存在的窗口走完整条链路，检查报出来的东西**自洽**。
+///
+/// 只断言"返回了 Ok"是不够的：坐标换算一旦写错（比如忘了减窗口原点），
+/// 返回的照样是 Ok，只是框画在屏幕另一个角落。所以这里逐条核对：
+///
+/// - 搜索区落在窗口图像范围内；
+/// - 命中框落在搜索区之内（这正是"用搜索区缩小范围"的意义）；
+/// - 预览图能解码，且尺寸与上报一致。
+///
+/// 匹配分数**不断言**：模板是随机纹理，真实桌面上不该命中，分数必然很低。
+/// 这条用例测的是链路与坐标，不是匹配质量——那要靠操作者对着真图标量。
+#[test]
+fn probe_nav_icon_returns_self_consistent_geometry_for_a_real_window() {
+    let harness = Harness::new("probe-icon-real", DemoScenario::Happy);
+    let dir = std::env::temp_dir().join("rpa-llm-probe-icon-real");
+    let template = write_icon_png(&dir, "icon.png", 20, 20);
+
+    let probe: desktop_lib::NavIconProbe = match harness.call(
+        "probe_nav_icon",
+        json!({
+            "windowClass": "Progman",
+            "wecomExe": null,
+            "navStrip": [0.0, 0.0, 0.08, 1.0],
+            "templates": [template],
+            "minScore": 0.8,
+        }),
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            // 没有交互式桌面（无头环境）就跳过，不把环境问题当缺陷。
+            eprintln!("跳过：当前会话没有可用的交互式桌面（{err}）");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    };
+
+    assert!(!probe.window.is_degenerate(), "窗口矩形不应退化：{:?}", probe.window);
+    assert!(probe.width > 0 && probe.height > 0);
+
+    // 预览图必须是能解码的 PNG，且尺寸与上报一致。
+    let encoded = probe
+        .image
+        .strip_prefix("data:image/png;base64,")
+        .expect("image 应是 PNG 的 data URL");
+    let png = base64::engine::general_purpose::STANDARD.decode(encoded).expect("base64 应能解码");
+    assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), probe.width);
+    assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), probe.height);
+
+    // 搜索区必须落在**窗口图像**之内——坐标换算错了这里就会挂。
+    assert!(
+        probe.strip.x >= 0
+            && probe.strip.y >= 0
+            && probe.strip.x + probe.strip.width <= probe.window.width
+            && probe.strip.y + probe.strip.height <= probe.window.height,
+        "搜索区 {:?} 越出了窗口 {:?}",
+        probe.strip,
+        probe.window
+    );
+    // 宽度应当约等于窗口宽的 8%（比例写错会在这里露出来）。
+    let expected = (probe.window.width as f32 * 0.08).round() as i32;
+    assert!(
+        (probe.strip.width - expected).abs() <= 2,
+        "搜索区宽度 {} 与窗口宽 {} 的 8%（{expected}）不符",
+        probe.strip.width,
+        probe.window.width
+    );
+
+    if let Some(hit) = &probe.hit {
+        // 命中框必须落在搜索区里：这就是"先缩范围再匹配"的全部意义。
+        assert!(
+            hit.x >= probe.strip.x
+                && hit.y >= probe.strip.y
+                && hit.x + hit.width <= probe.strip.x + probe.strip.width
+                && hit.y + hit.height <= probe.strip.y + probe.strip.height,
+            "命中框 ({}, {}) {}x{} 越出了搜索区 {:?}",
+            hit.x,
+            hit.y,
+            hit.width,
+            hit.height,
+            probe.strip
+        );
+        assert_eq!((hit.width, hit.height), (20, 20), "命中框尺寸就是模板尺寸");
+        assert!(!hit.template.trim().is_empty(), "要能看出是哪一张模板命中的");
+        assert!(
+            (-1.0..=1.0).contains(&hit.score),
+            "归一化相关系数必须落在 [-1, 1]，实际 {}",
+            hit.score
+        );
+        // `accepted` 必须与阈值判定一致，不能自说自话。
+        assert_eq!(hit.accepted, hit.score >= 0.8, "accepted 与分数/阈值不一致");
+    }
+    assert!(!probe.notice.trim().is_empty(), "必须给操作者一句话结论");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── 图标库（模板从哪来） ────────────────────────────────────────────────
+//
+// 图标库是「先点击导航图标跳转」那一步的**前提**：导航图标上没有文字，
+// OCR 读不到，只能靠模板匹配；而模板只能由人从真实画面上框出来。
+//
+// 这组用例盯住四件事：
+//
+// 1. 命令真的注册上了（靠 `AppHandle<R>` 钉运行时泛型——漏进 `generate_handler!`
+//    的话前端只会拿到 "command not found"，编译期毫无提示）；
+// 2. 目录位置与尺寸上下限由后端下发，前端不另写一份；
+// 3. 坏文件**留在列表里**并带上原因，而不是让整个列表打不开；
+// 4. 参数校验发生在**任何截屏动作之前**。
+//
+// ⚠️ `click_icon` 的**成功路径刻意不在这里测**：它会真的点一下鼠标。
+// 那种验证只能由人对着客户端做，测试里跑就等于对着测试机乱点。
+
+/// 读出后端的运行信息（顺带验证新字段确实下发了）。
+fn runtime_info(harness: &Harness) -> desktop_lib::RuntimeInfo {
+    harness.ok("runtime_info", json!({}))
+}
+
+/// 往图标库目录里放一张**真的能用**的 PNG（20×20，有纹理）。
+///
+/// 自己 `create_dir_all`：图标库目录只有在**保存过图标之后**才存在
+/// （`list` 把"目录不存在"当成空库而不是错误），所以测试不能假定它在。
+fn put_icon(icons_dir: &str, name: &str) -> String {
+    std::fs::create_dir_all(icons_dir).expect("创建图标库目录失败");
+    let path = std::path::Path::new(icons_dir).join(format!("{name}.png"));
+    let mut pixels = Vec::new();
+    for y in 0..20u32 {
+        for x in 0..20u32 {
+            pixels.extend_from_slice(&[(x * 13) as u8, (y * 29) as u8, ((x + y) * 7) as u8, 255]);
+        }
+    }
+    let shot = automation_core::Screenshot {
+        pixels,
+        width: 20,
+        height: 20,
+        captured_at: std::time::SystemTime::now(),
+        fingerprint: String::new(),
+    };
+    let rgba = vision::pixels::to_rgba(&shot).unwrap();
+    std::fs::write(&path, vision::pixels::encode_png(&rgba).unwrap()).unwrap();
+    path.display().to_string()
+}
+
+/// 尺寸上下限必须由后端下发，而且与 `vision` 的常量一致。
+///
+/// 界面上「框得太小 / 太大」的即时提示用的就是这两个值。前端另写一份的话，
+/// 迟早会出现「界面说没问题、点保存却被拒」——那是最让人不知所措的组合。
+#[test]
+fn runtime_info_carries_the_icon_library_location_and_template_limits() {
+    let harness = Harness::new("icon-info", DemoScenario::Happy);
+    let info = runtime_info(&harness);
+
+    assert!(
+        info.icons_dir.ends_with("icons"),
+        "图标库目录应当是数据目录下的 icons/：{}",
+        info.icons_dir
+    );
+    assert!(info.icons_dir.starts_with(&info.data_dir), "图标库在数据目录之下");
+    assert_eq!(info.template_min_side, vision::MIN_TEMPLATE_SIDE);
+    assert_eq!(info.template_max_side, vision::MAX_TEMPLATE_SIDE);
+}
+
+/// 还没存过任何图标时：列表是**空的**，不是错误。
+///
+/// 把"还没开始用"报成失败，会让界面第一次打开就挂一个红条——
+/// 而那时用户什么都还没做。
+#[test]
+fn the_icon_library_starts_empty_and_deleting_a_missing_icon_says_so() {
+    let harness = Harness::new("icon-empty", DemoScenario::Happy);
+
+    let listed: Vec<desktop_lib::icon_library::IconEntry> =
+        harness.ok("list_icons", json!({}));
+    assert!(listed.is_empty(), "全新安装时图标库应当是空的");
+
+    let message = harness.err("delete_icon", json!({ "name": "并不存在" }));
+    assert!(message.contains("没有"), "删一个不存在的图标要说清楚：{message}");
+}
+
+/// 列表要能读出文件、量出尺寸，并且**坏文件带原因留下来**。
+///
+/// 图标库目录是给人看也给人手工放的（有人会用画图另存一遍）。
+/// 坏文件从列表里藏起来，只会让人以为「我明明存过」；显示出来，
+/// 顺手就把「任务装配时才发现模板不可用」提前到了列表里。
+#[test]
+fn the_icon_library_lists_files_and_flags_the_broken_ones() {
+    let harness = Harness::new("icon-list", DemoScenario::Happy);
+    let icons_dir = runtime_info(&harness).icons_dir;
+
+    put_icon(&icons_dir, "通讯录");
+    std::fs::write(
+        std::path::Path::new(&icons_dir).join("坏的.png"),
+        b"this is not a png",
+    )
+    .unwrap();
+    // 非 PNG 要跳过：图标库目录里混进别的文件不该让整个列表打不开。
+    std::fs::write(std::path::Path::new(&icons_dir).join("说明.txt"), b"x").unwrap();
+
+    let listed: Vec<desktop_lib::icon_library::IconEntry> =
+        harness.ok("list_icons", json!({}));
+    assert_eq!(listed.len(), 2, "应当只认 PNG：{listed:?}");
+
+    let good = listed.iter().find(|item| item.name == "通讯录").expect("应当有「通讯录」");
+    assert_eq!((good.width, good.height), (20, 20));
+    assert!(good.problem.is_none());
+    assert!(
+        good.image.starts_with("data:image/png;base64,"),
+        "缩略图要以 data URL 形式带回来，界面一次调用就能画完列表"
+    );
+
+    let broken = listed.iter().find(|item| item.name == "坏的").expect("坏文件要留在列表里");
+    assert!(broken.problem.is_some(), "坏文件必须带上原因，而不是静默消失");
+    assert_eq!((broken.width, broken.height), (0, 0));
+
+    // 删除之后列表要跟着变，而且删除是按名字精确指的。
+    harness.ok::<()>("delete_icon", json!({ "name": "通讯录" }));
+    let listed: Vec<desktop_lib::icon_library::IconEntry> =
+        harness.ok("list_icons", json!({}));
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "坏的");
+}
+
+/// 参数校验必须发生在**任何截屏动作之前**。
+///
+/// 判据是错误文案，不是内部调用顺序——文案能证明它走到了哪个分支。
+/// 顺序本身有实际意义：这是个只读标定动作，参数填错时不该先去读一遍屏幕。
+#[test]
+fn save_icon_from_crop_validates_its_arguments_before_touching_the_screen() {
+    let harness = Harness::new("icon-save-args", DemoScenario::Happy);
+    let base = json!({
+        "name": "通讯录",
+        "windowClass": "Progman",
+        "wecomExe": null,
+        "rect": [10, 10, 20, 20],
+        "preview": [100, 80],
+    });
+
+    // 类名为空：无从定位窗口。
+    let mut body = base.clone();
+    body["windowClass"] = json!("   ");
+    let message = harness.err("save_icon_from_crop", body);
+    assert!(message.contains("窗口类名"), "{message}");
+
+    // 宽高为 0：还没框就点了保存。
+    let mut body = base.clone();
+    body["rect"] = json!([10, 10, 0, 20]);
+    let message = harness.err("save_icon_from_crop", body);
+    assert!(message.contains("大于 0"), "{message}");
+
+    // 名字能当路径用 ⇒ 拒绝，而且**在截屏之前**就拒绝
+    // （这条分支不需要真的有一个窗口，正好证明它没走到截屏那一步）。
+    for bad in ["../逃逸", "a/b", "", "CON", "末尾的点."] {
+        let mut body = base.clone();
+        body["name"] = json!(bad);
+        let message = harness.err("save_icon_from_crop", body);
+        assert!(
+            !message.contains("未能截取目标窗口"),
+            "「{bad}」应当在截屏之前就被名字校验拦下，实际报的是：{message}"
+        );
+    }
+}
+
+/// `click_icon` 的校验路径。
+///
+/// 这个命令**会产生真实的鼠标点击**，所以它的校验比别处更要紧：
+/// 参数不对时必须**一次点击都不发**。下面每条都在参数层面就返回了错误，
+/// 因此不会碰到鼠标——成功路径只能由人对着客户端点。
+#[test]
+fn click_icon_refuses_bad_arguments_without_clicking_anything() {
+    let harness = Harness::new("icon-click-args", DemoScenario::Happy);
+    let dir = std::env::temp_dir().join("rpa-llm-click-args");
+    let icon = put_icon(&dir.display().to_string(), "通讯录");
+
+    let base = json!({
+        "windowClass": "Progman",
+        "wecomExe": null,
+        "navStrip": [0.0, 0.0, 0.08, 1.0],
+        "contactPanel": [0.14, 0.2, 0.32, 0.6],
+        "templates": [icon.clone()],
+        "minScore": 0.8,
+        "settleMs": 200,
+    });
+
+    let mut body = base.clone();
+    body["windowClass"] = json!("");
+    assert!(harness.err("click_icon", body).contains("窗口类名"));
+
+    let mut body = base.clone();
+    body["navStrip"] = json!([0.0, 0.0, 1.5, 1.0]);
+    assert!(harness.err("click_icon", body).contains("导航图标搜索区"));
+
+    let mut body = base.clone();
+    body["contactPanel"] = json!([0.14, 0.2, 0.32, 3.0]);
+    assert!(harness.err("click_icon", body).contains("联系人候选区"));
+
+    let mut body = base.clone();
+    body["minScore"] = json!(1.4);
+    assert!(harness.err("click_icon", body).contains("0–1"));
+
+    // 一张模板都没配：这是**配置缺失**，不是"没找到图标"。
+    let mut body = base.clone();
+    body["templates"] = json!(["  ", ""]);
+    let message = harness.err("click_icon", body);
+    assert!(
+        message.contains("没有配置任何图标模板"),
+        "空模板列表要报配置缺失：{message}"
+    );
+
+    // 模板文件不存在：同样在装配期报错，不留到"分数很低"。
+    let mut body = base.clone();
+    body["templates"] = json!([dir.join("根本没有.png").display().to_string()]);
+    assert!(!harness.err("click_icon", body).is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

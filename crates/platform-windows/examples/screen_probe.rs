@@ -45,6 +45,8 @@ fn main() {
         "capture" => capture_window(&args),
         "shot" => capture_region_of_window(&args),
         "printshot" => print_shot(&args),
+        "template" => cut_icon_template(&args),
+        "findicon" => find_icon(&args),
         "click" => click(&args),
         "scroll" => scroll(&args),
         "paste" => paste(&args),
@@ -75,6 +77,13 @@ screen_probe —— 真机诊断工具（坐标均为窗口内相对坐标）
   capture <标题前缀> <输出.png>            截取整个窗口
   shot <标题前缀> <输出.png> <x> <y> <w> <h>  截取窗口内的一个区域
   printshot <标题前缀> <输出.png>          用 PrintWindow 抓窗口自身画面（能抓到 WebView2 内容）
+  template <标题前缀> <输出.png> <x> <y> <w> <h>
+                                        从窗口里裁出一块**图标模板**存成 PNG（供「先点击导航图标跳转」用）
+                                        并打印可直接粘进配置的路径
+  findicon <标题前缀> <模板.png> [最低分] [x y w h]
+                                        在当前画面上按模板匹配找图标，报出**分数与位置**
+                                        搜索区默认用 core 的 DEFAULT_NAV_STRIP；给 x y w h 可临时改
+                                        这是标定「模板对不对、阈值定多少」的唯一手段
   click <标题前缀> <x> <y>                 受保护地点击窗口内某点
   scroll <标题前缀> <x> <y> <格数>         把光标移到某点后滚动滚轮（正数向下、负数向上）
                                         并打印光标前后位置，用来确认「鼠标真的移过去了」
@@ -489,6 +498,222 @@ fn save_frame(frame: winapi::CapturedFrame, out: &str) -> Result<(), String> {
         png.len(),
         &shot.fingerprint[..16]
     );
+    Ok(())
+}
+
+// ── 图标模板：裁一张、再在当前画面上试匹配 ──────────────────────────────
+
+/// 从窗口里裁出一块**图标模板**存成 PNG。
+///
+/// ## 为什么要有这个子命令
+///
+/// 「先点导航图标切视图」这一步靠模板匹配，而**模板必须由人来截**：
+/// 程序自动裁一块"看起来像图标"的区域，会把"点错了地方"变成一次看起来
+/// 完全正常的运行——匹配分数照样很高，因为它匹配的就是它自己刚裁的那块。
+/// 人截的话，"我圈的是哪个图标"这件事在截图那一刻就被确认了。
+///
+/// 尺寸在这里就卡住（[`vision::MIN_TEMPLATE_SIDE`]–[`vision::MAX_TEMPLATE_SIDE`]）：
+/// 太小多半是手抖截歪了，太大说明圈进了整块界面。留到任务里才发作的话，
+/// 症状是"分数很低"，而人只会去怀疑阈值。
+fn cut_icon_template(args: &[String]) -> Result<(), String> {
+    let prefix = arg(args, 1, "标题前缀")?;
+    let out = arg(args, 2, "输出 PNG 路径")?;
+    let window = locate(&prefix)?;
+    let region = Rect {
+        x: number(args, 3, "x")?,
+        y: number(args, 4, "y")?,
+        width: number(args, 5, "宽度")?,
+        height: number(args, 6, "高度")?,
+    };
+
+    if region.width < vision::MIN_TEMPLATE_SIDE as i32
+        || region.height < vision::MIN_TEMPLATE_SIDE as i32
+    {
+        return Err(format!(
+            "圈得太小（{}x{}）：模板每边至少要 {} 像素，太小多半是截歪了",
+            region.width,
+            region.height,
+            vision::MIN_TEMPLATE_SIDE
+        ));
+    }
+    if region.width > vision::MAX_TEMPLATE_SIDE as i32
+        || region.height > vision::MAX_TEMPLATE_SIDE as i32
+    {
+        return Err(format!(
+            "圈得太大（{}x{}）：模板每边最多 {} 像素，再大就不是图标而是整块界面了",
+            region.width,
+            region.height,
+            vision::MAX_TEMPLATE_SIDE
+        ));
+    }
+
+    let frame = winapi::capture_region(Rect {
+        x: window.x + region.x,
+        y: window.y + region.y,
+        width: region.width,
+        height: region.height,
+    })?;
+    let shot = Screenshot {
+        pixels: frame.pixels,
+        width: frame.width,
+        height: frame.height,
+        captured_at: SystemTime::now(),
+        fingerprint: frame.fingerprint,
+    };
+    // 用 `crop_template` 走一遍：这样存下来的像素与任务里裁出来的表示完全一致
+    // （BGRA 顺序、行优先），不会出现"探针看着对、任务里偏色"这种事。
+    let template = vision::crop_template(&shot, Rect { x: 0, y: 0, width: region.width, height: region.height }, "探针")
+        .map_err(|err| err.to_string())?;
+    let rgba = vision::to_rgba(&Screenshot {
+        pixels: template.pixels,
+        width: template.width,
+        height: template.height,
+        captured_at: SystemTime::now(),
+        fingerprint: String::new(),
+    })
+    .map_err(|err| err.to_string())?;
+    let png = vision::encode_png(&rgba).map_err(|err| err.to_string())?;
+    std::fs::write(&out, &png).map_err(|err| format!("写入 {out} 失败：{err}"))?;
+
+    println!(
+        "已保存模板 {out}（{}x{}，{} 字节）",
+        template.width,
+        template.height,
+        png.len()
+    );
+    println!();
+    println!("下一步：把它填进配置，或直接用 findicon 量一次分数——");
+    println!("  screen_probe findicon \"{prefix}\" \"{out}\"");
+    println!();
+    println!("⚠️ 一个图标在**选中 / 未选中**两种状态下长得不一样。");
+    println!("   如果点完停在这个页面上，下次可能就匹配不上了——");
+    println!("   建议把两种状态各截一张，都填进配置。");
+    Ok(())
+}
+
+/// 在当前画面上按模板匹配找图标，报出**分数与位置**。
+///
+/// 这是标定「模板截得对不对、阈值该定多少」的唯一手段：
+/// 分数是量出来的，不是猜出来的。模板可以给多张（逗号分隔），
+/// 会逐张报分数——这正是分辨"该用哪张"的办法。
+///
+/// **纯只读**：只截屏，不点击、不聚焦、不产生任何输入。
+/// 位置换算成窗口内相对坐标报出来，与配置里那套语义一致。
+fn find_icon(args: &[String]) -> Result<(), String> {
+    let prefix = arg(args, 1, "标题前缀")?;
+    let templates_arg = arg(args, 2, "模板 PNG 路径（可逗号分隔多张）")?;
+    let window = locate(&prefix)?;
+
+    // 搜索区：默认用 core 的默认值，这样探针量到的范围就是任务真正会找的范围。
+    let strip = match args.len() {
+        3 | 4 => automation_core::DEFAULT_NAV_STRIP,
+        _ => automation_core::RelativeRegion::new(
+            number(args, 4, "搜索区 x")? as f32,
+            number(args, 5, "搜索区 y")? as f32,
+            number(args, 6, "搜索区 宽度")? as f32,
+            number(args, 7, "搜索区 高度")? as f32,
+        ),
+    };
+    let min_score: f32 = match args.get(3) {
+        Some(raw) => raw.parse().map_err(|_| "最低分必须是数字（0–1）".to_string())?,
+        None => automation_core::DEFAULT_NAV_ICON_MIN_SCORE,
+    };
+    if !(0.0..=1.0).contains(&min_score) {
+        return Err(format!("最低分必须在 0–1 之间（当前 {min_score}）"));
+    }
+
+    let strip_screen = strip
+        .resolve_within(window)
+        .map_err(|err| format!("搜索区比例不合法或越出窗口：{err}"))?;
+    let strip_in_window = Rect {
+        x: strip_screen.x - window.x,
+        y: strip_screen.y - window.y,
+        width: strip_screen.width,
+        height: strip_screen.height,
+    };
+
+    let paths: Vec<&str> = templates_arg
+        .split(',')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .collect();
+    if paths.is_empty() {
+        return Err("至少要给一张模板 PNG".into());
+    }
+
+    let shot = winapi::capture_region(strip_screen)?;
+    let frame = Screenshot {
+        pixels: shot.pixels,
+        width: shot.width,
+        height: shot.height,
+        captured_at: SystemTime::now(),
+        fingerprint: shot.fingerprint,
+    };
+
+    println!(
+        "窗口「{prefix}」 {}x{} @ ({}, {})",
+        window.width, window.height, window.x, window.y
+    );
+    println!(
+        "搜索区（窗口内相对）：({}, {}) {}x{}    最低分 {min_score:.3}",
+        strip_in_window.x, strip_in_window.y, strip_in_window.width, strip_in_window.height
+    );
+    println!("画面：{}x{}", frame.width, frame.height);
+    println!();
+
+    let mut best: Option<(f32, Rect, String)> = None;
+    for path in &paths {
+        let template = match vision::load_icon_template(std::path::Path::new(path), *path) {
+            Ok(template) => template,
+            Err(err) => {
+                println!("  {path}");
+                println!("    无法载入：{err}");
+                continue;
+            }
+        };
+        match vision::match_template(&frame, &template) {
+            Ok(Some((bounds, score))) => {
+                let accepted = if score >= min_score { "通过" } else { "不足" };
+                println!("  {path}  ({}x{})", template.width, template.height);
+                println!(
+                    "    最高分 {score:.4}  [{accepted}]    \
+                     搜索区内 ({}, {})    窗口内 ({}, {})    点击点 窗口内 ({}, {})",
+                    bounds.x,
+                    bounds.y,
+                    strip_in_window.x + bounds.x,
+                    strip_in_window.y + bounds.y,
+                    strip_in_window.x + bounds.x + bounds.width / 2,
+                    strip_in_window.y + bounds.y + bounds.height / 2
+                );
+                if best.as_ref().map(|(current, _, _)| score > *current).unwrap_or(true) {
+                    best = Some((score, bounds, (*path).to_string()));
+                }
+            }
+            Ok(None) => {
+                println!("  {path}");
+                println!("    没有结果：模板放不进搜索区，或者模板是纯色的（没有图案可匹配）");
+            }
+            Err(err) => {
+                println!("  {path}");
+                println!("    匹配失败：{err}");
+            }
+        }
+    }
+
+    println!();
+    match best {
+        Some((score, _, path)) if score >= min_score => {
+            println!("结论：模板「{path}」最高 {score:.3}，达到最低分 {min_score:.3}。");
+            println!("     可以用它跑任务了。");
+        }
+        Some((score, _, path)) => {
+            println!("结论：最高只有 {score:.3}（模板「{path}」），低于最低分 {min_score:.3}。");
+            println!("     先看上面的位置对不对——那是它认为最像的地方。");
+            println!("     位置不对 ⇒ 模板截错了，或搜索区没盖住图标；");
+            println!("     位置对但分数低 ⇒ 图标有缩放/主题差异，换个状态再截一张。");
+        }
+        None => println!("结论：所有模板都没能给出结果，先检查模板文件与搜索区。"),
+    }
     Ok(())
 }
 

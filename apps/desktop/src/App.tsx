@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import * as api from "./api";
 import { ConfirmationDialog } from "./components/ConfirmationDialog";
+import { IconLibraryPanel } from "./components/IconLibraryPanel";
+import { regionsAreValid } from "./components/RegionCalibration";
 import { RuntimePanel } from "./components/RuntimePanel";
 import { StateTimeline } from "./components/StateTimeline";
 import { TaskForm } from "./components/TaskForm";
@@ -15,12 +17,26 @@ import {
   type TaskView,
 } from "./types";
 
+type Tab = "tasks" | "icons";
+
 export function App() {
   const [tasks, setTasks] = useState<TaskView[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
   const [info, setInfo] = useState<RuntimeInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>("tasks");
+
+  /**
+   * 配置**草稿**。
+   *
+   * 由这里持有、而不是交给某个子面板：配置里有一组字段（导航图标）是在
+   * 「图标库」页改的，另一组（窗口、区域、超时）在「任务」页改的。
+   * 两页各持一份草稿的话，保存时总有一份被覆盖掉——而且被覆盖的那一份
+   * 看起来"刚才明明改过"。
+   */
+  const [draft, setDraft] = useState<RuntimeConfig | null>(null);
+  const [dirty, setDirty] = useState(false);
 
   const upsert = useCallback((task: TaskView) => {
     setTasks((current) => {
@@ -74,6 +90,15 @@ export function App() {
     };
   }, [upsert]);
 
+  // 每次从后端拿到配置（首次加载、以及保存之后）都以它为准重置草稿。
+  // 保存后 `setInfo(await runtimeInfo())` 会走到这里，于是"已保存"与
+  // "草稿"重新对齐——这正是那个 `dirty` 标记能自动清掉的原因。
+  useEffect(() => {
+    if (!info) return;
+    setDraft(info.config);
+    setDirty(false);
+  }, [info]);
+
   const activeTask = useMemo(
     () => tasks.find((task) => task.id === activeId) ?? null,
     [tasks, activeId],
@@ -83,6 +108,11 @@ export function App() {
     () => tasks.some((task) => !TERMINAL_STATES.includes(task.state)),
     [tasks],
   );
+
+  const patch = useCallback((next: Partial<RuntimeConfig>) => {
+    setDraft((current) => (current ? { ...current, ...next } : current));
+    setDirty(true);
+  }, []);
 
   const handleStart = async (request: StartTaskRequest) => {
     setError(null);
@@ -114,14 +144,21 @@ export function App() {
     }
   };
 
-  const handleSaveConfig = async (config: RuntimeConfig) => {
+  const handleSaveConfig = async () => {
+    if (!draft) return;
+    setError(null);
     try {
-      await api.setRuntimeConfig(config);
+      await api.setRuntimeConfig(draft);
       setInfo(await api.runtimeInfo());
     } catch (err) {
       setError(String(err));
     }
   };
+
+  // 演练模式不碰真实窗口，标定值用不上；真实模式则必须保证四个区域都合法，
+  // 否则后端 `RelativeRegion::validate` 会在执行时才报错，白白浪费一次任务。
+  // 两个页面共用这一个判断——保存按钮在两边都有，判据只能有一处。
+  const canSave = draft ? draft.mode === "dry_run" || regionsAreValid(draft.regions) : false;
 
   return (
     <div className="app">
@@ -139,76 +176,129 @@ export function App() {
         )}
       </header>
 
-      <main className="app-grid">
-        <div className="column">
-          <TaskForm disabled={running} onStart={handleStart} error={error} />
-          {info && <RuntimePanel info={info} onSave={handleSaveConfig} busy={running} />}
-        </div>
+      <nav className="tabs">
+        <button
+          type="button"
+          className={tab === "tasks" ? "tab is-active" : "tab"}
+          onClick={() => setTab("tasks")}
+        >
+          任务
+        </button>
+        <button
+          type="button"
+          className={tab === "icons" ? "tab is-active" : "tab"}
+          onClick={() => setTab("icons")}
+        >
+          图标库
+        </button>
+        {dirty && <span className="tab-dirty">有未保存的改动</span>}
+      </nav>
 
-        <div className="column">
-          {activeTask ? (
-            <>
+      {tab === "tasks" && (
+        <main className="app-grid">
+          <div className="column">
+            <TaskForm disabled={running} onStart={handleStart} error={error} />
+            {info && draft && (
+              <RuntimePanel
+                info={info}
+                draft={draft}
+                onPatch={patch}
+                onSave={handleSaveConfig}
+                dirty={dirty}
+                canSave={canSave}
+                busy={running}
+              />
+            )}
+          </div>
+
+          <div className="column">
+            {activeTask ? (
+              <>
+                <section className="panel">
+                  <h2>当前任务</h2>
+                  <dl className="meta-list">
+                    <dt>收件人</dt>
+                    <dd className="strong">{activeTask.external_contact_name}</dd>
+                    <dt>消息</dt>
+                    <dd className="message-preview">{activeTask.text}</dd>
+                    <dt>状态</dt>
+                    <dd>{activeTask.state_label}</dd>
+                  </dl>
+                  {!TERMINAL_STATES.includes(activeTask.state) && (
+                    <button className="ghost" onClick={handleCancel}>
+                      取消任务
+                    </button>
+                  )}
+                </section>
+
+                <StateTimeline
+                  state={activeTask.state}
+                  detail={activeTask.detail}
+                  history={activeTask.history}
+                />
+
+                {activeTask.failure && (
+                  <section className="panel panel-danger">
+                    <h2>停止原因</h2>
+                    <p className="failure-code">{activeTask.failure.code}</p>
+                    <p>{activeTask.failure.reason}</p>
+                  </section>
+                )}
+
+                {activeTask.evidence.length > 0 && (
+                  <section className="panel">
+                    <h2>证据引用</h2>
+                    <ul className="evidence-list">
+                      {activeTask.evidence.map((item) => (
+                        <li key={item} className="mono">
+                          {item}
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="field-hint">
+                      这里只保存截图指纹，不含画面、姓名或消息正文。
+                    </p>
+                  </section>
+                )}
+              </>
+            ) : (
               <section className="panel">
                 <h2>当前任务</h2>
-                <dl className="meta-list">
-                  <dt>收件人</dt>
-                  <dd className="strong">{activeTask.external_contact_name}</dd>
-                  <dt>消息</dt>
-                  <dd className="message-preview">{activeTask.text}</dd>
-                  <dt>状态</dt>
-                  <dd>{activeTask.state_label}</dd>
-                </dl>
-                {!TERMINAL_STATES.includes(activeTask.state) && (
-                  <button className="ghost" onClick={handleCancel}>
-                    取消任务
-                  </button>
-                )}
+                <p className="muted-line">
+                  左侧新建一个任务后，这里会实时显示 11 步状态流转。
+                </p>
               </section>
+            )}
+          </div>
 
-              <StateTimeline
-                state={activeTask.state}
-                detail={activeTask.detail}
-                history={activeTask.history}
+          <div className="column">
+            <TaskHistory tasks={tasks} activeId={activeId} onSelect={setActiveId} />
+          </div>
+        </main>
+      )}
+
+      {tab === "icons" && (
+        <main className="app-grid is-single">
+          <div className="column">
+            {info && draft ? (
+              <IconLibraryPanel
+                info={info}
+                draft={draft}
+                onPatch={patch}
+                onSave={handleSaveConfig}
+                dirty={dirty}
+                canSave={canSave}
+                busy={running}
               />
-
-              {activeTask.failure && (
-                <section className="panel panel-danger">
-                  <h2>停止原因</h2>
-                  <p className="failure-code">{activeTask.failure.code}</p>
-                  <p>{activeTask.failure.reason}</p>
-                </section>
-              )}
-
-              {activeTask.evidence.length > 0 && (
-                <section className="panel">
-                  <h2>证据引用</h2>
-                  <ul className="evidence-list">
-                    {activeTask.evidence.map((item) => (
-                      <li key={item} className="mono">
-                        {item}
-                      </li>
-                    ))}
-                  </ul>
-                  <p className="field-hint">
-                    这里只保存截图指纹，不含画面、姓名或消息正文。
-                  </p>
-                </section>
-              )}
-            </>
-          ) : (
-            <section className="panel">
-              <h2>当前任务</h2>
-              <p className="muted-line">
-                左侧新建一个任务后，这里会实时显示 11 步状态流转。
-              </p>
-            </section>
-          )}
-        </div>
-
-        <div className="column">
-          <TaskHistory tasks={tasks} activeId={activeId} onSelect={setActiveId} />
-        </div>
-      </main>
+            ) : (
+              <section className="panel">
+                <h2>图标库</h2>
+                <p className="muted-line">正在读取运行配置…</p>
+              </section>
+            )}
+          </div>
+        </main>
+      )}
 
       {confirmation && (
         <ConfirmationDialog request={confirmation} onDecide={handleDecision} />

@@ -727,3 +727,227 @@ button.ghost {
 .field-check .field-label {
   margin-bottom: 2px;
 }
+
+/* ── 页签 ──────────────────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 28px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.tab.is-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab-dirty {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--warn);
+}
+
+/* 单列布局：三列那套宽度是给「任务」页的。 */
+.app-grid.is-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* ── 截图与叠加层 ──────────────────────────────────────────────────── */
+
+/* 容器尺寸由图片决定，叠加层才能跟着图片一起缩放。 */
+.shot-wrap {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+  margin: 6px 0 8px;
+}
+
+.shot-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* 叠加层用 SVG + viewBox：坐标直接用**图像坐标系**，缩放交给浏览器，
+   界面怎么缩都不会算错位置。所以它必须严丝合缝地盖住图片。 */
+.shot-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/* 搜索区：蓝虚线 = "在哪儿找"。 */
+.shot-strip {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+}
+
+/* 命中：实线。绿 = 过了阈值，红 = 没过。
+   没过阈值也要画——"它认为最像的地方在哪儿"正是判断模板对不对的唯一线索。 */
+.shot-hit {
+  fill: none;
+  stroke: var(--ok);
+  stroke-width: 2;
+}
+
+.shot-hit.is-low {
+  stroke: var(--bad);
+}
+
+/* 实际点击落点。 */
+.shot-click {
+  fill: rgba(124, 58, 237, 0.25);
+  stroke: #7c3aed;
+  stroke-width: 2;
+}
+
+/* 框选：琥珀色，和搜索区（蓝）、命中（绿/红）都区分得开。 */
+.shot-selection {
+  fill: rgba(245, 158, 11, 0.16);
+  stroke: #f59e0b;
+  stroke-width: 2;
+  stroke-dasharray: 5 3;
+}
+
+/* 拖框的那张图：十字光标 + 禁止触摸手势抢走拖动。 */
+.shot-crop {
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.crop-save {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.crop-zoom-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* 放大镜：用背景图从原画面上"抠"出框住的那一块。
+   为什么不用 <img> 再裁一张：那要重新编码一次图，而这里只想让人看清
+   "框住的到底是不是那个图标"。`pixelated` 是必须的——插值放大会把
+   边缘糊掉，而看这个图的全部意义就是看清边缘。 */
+.crop-zoom {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  image-rendering: pixelated;
+  background-repeat: no-repeat;
+}
+
+/* ── 图标库列表 ────────────────────────────────────────────────────── */
+
+.icon-list {
+  list-style: none;
+  margin: 10px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.icon-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+/* 文件坏了（尺寸越界、编码损坏）要一眼看得出来：它会让任务在装配期直接失败。 */
+.icon-row.is-broken {
+  border-color: #f3c2c0;
+  background: #fef7f7;
+}
+
+.icon-thumb {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  object-fit: contain;
+  image-rendering: pixelated;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fafafa;
+}
+
+.icon-thumb-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 18px;
+}
+
+.icon-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.icon-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.icon-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.icon-actions button {
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
+/* 列表里的「用于导航」：紧凑一点，别把整块说明的样式带过来。 */
+.icon-use {
+  padding: 4px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* 「定位并点击」上了膛：这一下按下去会真的产生鼠标点击，必须一眼看出来。 */
+button.danger {
+  background: var(--bad);
+  color: #fff;
+}

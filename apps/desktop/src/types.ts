@@ -2,6 +2,7 @@ export type TaskState =
   | "draft"
   | "launching_client"
   | "waiting_for_client"
+  | "navigating_to_view"
   | "searching_contact"
   | "verifying_candidate"
   | "verifying_chat_header"
@@ -19,6 +20,10 @@ export const HAPPY_PATH: TaskState[] = [
   "draft",
   "launching_client",
   "waiting_for_client",
+  // 可选的一步：用模板匹配点左侧导航图标把视图切过去。
+  // 它**不是**必经状态（开关关着时会直接跳到 searching_contact），
+  // 放在这里只是为了让主路径时间线能完整展示它。
+  "navigating_to_view",
   "searching_contact",
   "verifying_candidate",
   "verifying_chat_header",
@@ -35,6 +40,7 @@ export const STATE_LABELS: Record<TaskState, string> = {
   // 标识仍是 `launching_client`（审计记录按它落库，改了就读不回来），只是文案改了。
   launching_client: "接入客户端",
   waiting_for_client: "客户端已就绪",
+  navigating_to_view: "切换视图",
   searching_contact: "查找联系人",
   verifying_candidate: "核验联系人",
   verifying_chat_header: "核验聊天页标题",
@@ -198,6 +204,100 @@ export interface RuntimeConfig {
    * 只影响真实模式。
    */
   relaxed_name_match: boolean;
+  /**
+   * 是否在查找联系人之前，用**模板匹配**找到左侧导航图标并点它一下，
+   * 把视图切到「能查到联系人」的那个页面。
+   *
+   * 图标上没有文字，OCR 读不到它，所以这一步只能靠模板匹配。
+   * 打开后状态轨迹里会多出一个 `navigating_to_view`。
+   *
+   * **打开时必须配模板**（`nav_icon_templates` 非空），否则任务在装配期就被拒绝。
+   */
+  navigate_before_search: boolean;
+  /**
+   * 参与匹配的图标模板：**图标库里的文件路径**。
+   *
+   * 界面上不直接编辑这一项——「图标库」页里每个图标旁边有「用于导航」开关，
+   * 打开就等于把它的路径加进来。手抄路径是抄不错才怪的东西。
+   */
+  nav_icon_templates: string[];
+  /** 图标匹配的最低分数（0–1），低于它转人工。 */
+  nav_icon_min_score: number;
+  /** 导航图标搜索区，相对窗口比例 `[x, y, w, h]`。 */
+  nav_strip: [number, number, number, number];
+}
+
+/** 图标库里的一张图标模板。 */
+export interface IconEntry {
+  /** 名字（不含扩展名）。配置引用它对应的文件路径。 */
+  name: string;
+  /** PNG 的完整路径。 */
+  file: string;
+  /** 模板尺寸（窗口像素）。读不出来时是 0。 */
+  width: number;
+  height: number;
+  bytes: number;
+  /** `data:image/png;base64,...`；文件读不出来时是空串。 */
+  image: string;
+  /**
+   * 这张图**现在不能当模板用**的原因（尺寸越界、文件损坏）。
+   *
+   * 不为 `null` 时列表里要显眼地标出来：它会在任务装配时让任务直接失败，
+   * 提前看到总比那时候才发现好。
+   */
+  problem: string | null;
+}
+
+/** 「定位并点击」的结果。 */
+export interface IconClickResult {
+  window: Rect;
+  /** 预览图的像素尺寸（点击之后重截的那一张）。 */
+  width: number;
+  height: number;
+  image: string;
+  /** 搜索区，窗口内相对坐标。 */
+  strip: Rect;
+  hit: NavIconHit;
+  /** 实际点击的**屏幕**坐标。 */
+  clicked: { x: number; y: number };
+  /**
+   * 点击后联系人候选区的画面有没有变化。
+   *
+   * `false` 有两种可能，界面上必须两种都说：界面本来就停在这个视图上（正常），
+   * 或者这次点击真的没生效。
+   */
+  changed: boolean;
+  notice: string;
+}
+
+/** 一次图标命中的位置与分数（坐标均为**窗口内相对坐标**）。 */
+export interface NavIconHit {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** 归一化互相关系数，1.0 表示完全一致。 */
+  score: number;
+  /** 命中的是哪一张模板（文件名）。 */
+  template: string;
+  /** 是否达到了最低分数。没过阈值也会给出位置——那才是判断模板对不对的依据。 */
+  accepted: boolean;
+}
+
+/** 「测试图标匹配」的结果。 */
+export interface NavIconProbe {
+  window: Rect;
+  /** 预览图的像素尺寸（窗口过宽时会等比缩小）。 */
+  width: number;
+  height: number;
+  /** `data:image/png;base64,...`，可直接作为 `<img src>`。 */
+  image: string;
+  /** 搜索区，窗口内相对坐标。 */
+  strip: Rect;
+  /** 最佳命中；`null` 表示所有模板都放不进搜索区。 */
+  hit: NavIconHit | null;
+  /** 面向操作者的一句话结论（含分数与是否过阈值）。 */
+  notice: string;
 }
 
 /** 标定时记录的窗口几何（屏幕坐标 + 显示器缩放）。 */
@@ -212,6 +312,11 @@ export interface WindowGeometry {
 export interface RuntimeInfo {
   config: RuntimeConfig;
   data_dir: string;
+  /** 图标库目录。模板是**文件**，用户有权知道它们存在哪。 */
+  icons_dir: string;
+  /** 图标模板的边长下限 / 上限（像素），由后端下发，前端不另写一份。 */
+  template_min_side: number;
+  template_max_side: number;
   audit_entry_count: number;
   is_windows: boolean;
   notice: string;

@@ -18,7 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::audit::{AuditEntry, AuditSink, MemorySendLedger, MessageDigest, NoopAudit, SendLedger};
 use crate::ports::{
     AutomationError, ContactMatcher, DesktopPlatform, EvidenceRecorder, HumanConfirmation,
-    LocalOcr, Point, Rect, ScreenMetrics, Screenshot, SendTask, TaskId, TextBox,
+    IconLocator, IconTemplate, LocalOcr, Point, Rect, ScreenMetrics, Screenshot, SendTask, TaskId,
+    TextBox,
 };
 use crate::regions::{RelativePoint, RelativeRegion};
 use crate::state::{TaskMachine, TaskState};
@@ -155,6 +156,27 @@ pub const DEFAULT_REGIONS: [RelativeRegion; 4] = [
     DEFAULT_COMPOSER,
 ];
 
+/// 图标模板匹配的默认最低分数。
+///
+/// ⚠️ 这是**推断值，尚未在真实图标上量过**。给出 0.80 的依据是归一化互相关的
+/// 量级：同一台机器、同一个 DPI、同一个图标状态下的正确命中通常在 0.95 以上；
+/// 而把另一个图标拿来比，分数一般落在 0.6 以下。0.80 落在这段空隙里。
+///
+/// 真实阈值要用界面的「测试图标匹配」按当前靶标量出来，不要照抄这个数——
+/// 阈值定低了会点错图标，定高了会频繁转人工，两种代价都不小。
+pub const DEFAULT_NAV_ICON_MIN_SCORE: f32 = 0.80;
+
+/// 导航图标搜索区的出厂默认值（相对窗口比例）：**最左侧那条竖带、整高**。
+///
+/// 宽度的依据来自 2026-09-17 的实测（见 [`DEFAULT_CONTACT_PANEL`] 的表格）：
+/// 微信 4.x 的左侧导航图标栏是 0–57px（固定像素宽），头像列从 78px 起。
+/// 取 0.075 在 974 宽的窗口上是 73px——**让开了头像列，又给图标留了余量**。
+///
+/// 高度取满：图标在竖带里的纵向位置随版本变化，猜一个高度范围省下的那点时间
+/// 换不来"猜错了就找不到图标"的风险。真要提速，把这一项调小即可——
+/// 匹配开销与搜索面积成正比，高度减半就快一倍。
+pub const DEFAULT_NAV_STRIP: RelativeRegion = RelativeRegion::new(0.0, 0.0, 0.075, 1.0);
+
 /// 运行参数。
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
@@ -245,6 +267,32 @@ pub struct RunnerConfig {
     /// 这里没有引入新类别的数据；而且只写任务日志与界面，**不进审计库**。
     /// 不想要就把这一项关掉。
     pub log_ocr_candidates: bool,
+    /// 是否在查找联系人之前，先用模板匹配点一下左侧导航图标把视图切过去。
+    ///
+    /// ## 为什么需要这一步
+    ///
+    /// 靠 OCR 认字找入口有个结构性弱点：**图标上没有文字**。左侧导航栏那排图标
+    /// 在 OCR 眼里是空白的，于是"先切到联系人视图"这件事没法用文字表达。
+    /// 模板匹配补的正是这一段——图标是固定的像素图案，比一比就知道它在哪。
+    ///
+    /// 打开之后，`WaitingForClient` 后面会多出一个 `NavigatingToView` 状态。
+    /// 关掉就是原来的行为（直接进 `SearchingContact`）。
+    ///
+    /// ## 打开时必须配模板
+    ///
+    /// 为 `true` 而 `nav_icon_templates` 为空，是**配置错误**：
+    /// 装配层（`apps/desktop` 的 `build_runner`）会在任务登记之前就拒绝，
+    /// 不让它变成一条"跑到一半才发现没模板"的失败记录。
+    pub navigate_before_search: bool,
+    /// 导航图标模板。**可以多张**——同一个图标在选中 / 未选中两种状态下长得不一样。
+    ///
+    /// 只留一张模板，就会出现"上一次运行点完停在这个页面上，这一次再也匹配不上"。
+    /// 多张模板是这里唯一诚实的解法，而不是把阈值调低到"两个状态都能过"。
+    pub nav_icon_templates: Vec<IconTemplate>,
+    /// 图标模板匹配的最低分数，低于它转人工。见 [`DEFAULT_NAV_ICON_MIN_SCORE`]。
+    pub nav_icon_min_score: f32,
+    /// 在窗口的哪个区域里找导航图标。见 [`DEFAULT_NAV_STRIP`]。
+    pub nav_strip: RelativeRegion,
 }
 
 impl Default for RunnerConfig {
@@ -273,6 +321,12 @@ impl Default for RunnerConfig {
             // 而这是**上限**不是等待时长——画面一稳就立刻继续，正常只多花一帧。
             scroll_settle_timeout: Duration::from_millis(600),
             log_ocr_candidates: true,
+            // 默认**关**：这一步要先用模板匹配认图标，而模板必须由操作者自己截、
+            // 自己确认。默认打开等于让每个没配模板的人都撞上一次配置错误。
+            navigate_before_search: false,
+            nav_icon_templates: Vec::new(),
+            nav_icon_min_score: DEFAULT_NAV_ICON_MIN_SCORE,
+            nav_strip: DEFAULT_NAV_STRIP,
         }
     }
 }
@@ -285,6 +339,16 @@ const SETTLE_POLL_DIVISOR: u32 = 8;
 
 /// 轮询间隔的下限：比这更密没有意义，一次截图本身就要几十毫秒。
 const MIN_SETTLE_POLL: Duration = Duration::from_millis(20);
+
+/// 由「等停稳」的超时推出**轮询间隔**。
+///
+/// 单独做成公开函数，是因为「等界面动画停下来」这件事不止编排器要做——
+/// 界面上的「定位并点击」标定按钮同样要（点完得等重绘画完，才能回答"画面变了没有"）。
+/// 两处各写一遍比例的话，改了一处另一处就悄悄不一致了：症状是标定按钮报"没变化"，
+/// 而真实任务里同样的点击判定为"变化了"。
+pub fn settle_poll_interval(timeout: Duration) -> Duration {
+    (timeout / SETTLE_POLL_DIVISOR).max(MIN_SETTLE_POLL)
+}
 
 /// 一帧最多记多少个文字块、总共多少个字符（见 [`describe_candidates`]）。
 ///
@@ -332,6 +396,10 @@ pub struct RunnerPorts {
     pub platform: Arc<dyn DesktopPlatform>,
     pub ocr: Arc<dyn LocalOcr>,
     pub matcher: Arc<dyn ContactMatcher>,
+    /// 图标定位（模板匹配）。只有 `navigate_before_search` 打开时才会被调用，
+    /// 但**端口本身必须始终在场**：让它变成 `Option` 的话，"忘了装配"就会
+    /// 在运行期变成一个 `unwrap` 或一次静默跳过，而不是装配期的报错。
+    pub icons: Arc<dyn IconLocator>,
     pub confirmation: Arc<dyn HumanConfirmation>,
 }
 
@@ -599,6 +667,108 @@ impl<'a> Run<'a> {
         Ok(expected)
     }
 
+    /// 用模板匹配找到左侧导航图标，点它一下，把视图切到"能查到联系人"的那个页面。
+    ///
+    /// ## 这一步和"点击联系人"是同一类动作
+    ///
+    /// 它**不是只读的**：点下去之后界面会重绘。所以和点击联系人一样，
+    /// 动作前要确认客户端还活着、前台窗口与标定一致；动作后要确认画面真的变了。
+    ///
+    /// ## 为什么"点完必须看到画面变化"
+    ///
+    /// 因为"点到了图标"和"点击生效了"是两件事。图标可能被别的窗口挡住、
+    /// 客户端可能正好卡了一下、坐标可能因为某种原因落在图标边缘的空白上——
+    /// 这些情况下 `guarded_click` 会正常返回（鼠标确实点下去了），
+    /// 而视图**根本没切**。不校验的话，后面整条查找流程都作用在一个
+    /// 没切换成功的界面上，失败原因会表现为"找不到联系人"——那是错的方向。
+    fn navigate_to_view(&mut self) -> Result<(), AutomationError> {
+        let (strip, min_score, panel) = {
+            let cfg = self.cfg();
+            (
+                self.resolve(cfg.nav_strip, "导航图标搜索区")?,
+                cfg.nav_icon_min_score,
+                self.resolve(cfg.contact_panel, "联系人候选区")?,
+            )
+        };
+
+        // 用**联系人候选区**当"视图变了没有"的参照物：切换成功的话，
+        // 这一块的内容必然整体换掉。用它而不是整窗，是因为整窗里有闪烁的光标、
+        // 未读红点之类会自己变的东西，"变了"就不再是"切换成功了"的证据。
+        let before = self.capture_frame(panel, "切换视图前")?.fingerprint;
+
+        let frame = self.capture_frame(strip, "导航图标搜索区")?;
+        self.evidence.push(format!(
+            "nav_strip#{}   搜索区 屏幕 ({}, {}) {}x{}",
+            frame.fingerprint, strip.x, strip.y, strip.width, strip.height
+        ));
+
+        // 只借用 `self.runner`（它是一个共享引用），不碰 `self` 的可变部分——
+        // 否则下面 `self.evidence.push` 会和这次调用打架。
+        let runner = self.runner;
+        let found = runner
+            .ports
+            .icons
+            .locate(&frame, &runner.config().nav_icon_templates, min_score)?;
+
+        let hit_screen = found.bounds.to_screen(Point { x: strip.x, y: strip.y });
+        let target = hit_screen.center();
+        // 记下"点的是哪儿、分数多少"。图标匹配不像文字识别那样有天然的可读结果，
+        // 这一行是事后唯一能回答"它到底认成了什么"的地方。
+        self.evidence.push(format!(
+            "导航图标 : 模板「{}」分数 {:.3}   命中框 屏幕 ({}, {}) {}x{}   点击 屏幕 ({}, {})",
+            found.template_label,
+            found.score,
+            hit_screen.x,
+            hit_screen.y,
+            hit_screen.width,
+            hit_screen.height,
+            target.x,
+            target.y
+        ));
+
+        self.ensure_not_frozen("已取消切换视图")?;
+        let expected_window = self.ensure_calibrated()?;
+        self.runner
+            .ports
+            .platform
+            .guarded_click(target, expected_window)?;
+        self.check_deadline("点击导航图标")?;
+
+        // 视图切换是重绘，同样要等停稳再比指纹——否则会截到动画中间帧，
+        // 与"切换前"偶然相同，于是把一次成功的切换误判成"没生效"。
+        self.wait_for_settle(panel)?;
+        let after = self.capture_frame(panel, "切换视图后")?.fingerprint;
+        if after == before {
+            // ── 为什么这里只记警告，**不**转人工 ──────────────────────────
+            //
+            // "点下去画面没变"有两种成因，而它们在画面上**无法区分**：
+            //
+            // 1. 界面本来就已经停在这个视图上（上一次运行点完就留在这里了）
+            //    ⇒ 点击无效是**正确**行为，一切正常；
+            // 2. 客户端卡死 / 图标被别的窗口挡住 / 匹配到了一个不响应点击的位置
+            //    ⇒ 点击真的没生效。
+            //
+            // 如果在这里直接转人工，第 1 种情况就会变成"第二次跑必然失败"——
+            // 一个正常操作被判成故障，而且报错文案（"点击可能没有生效"）
+            // 会把人引向排查客户端，方向完全错了。
+            //
+            // 那为什么不等一等再判、或者重试一次？因为"点击没生效"不是**时机**问题，
+            // 重试与等待都解决不了（见 `REFERENCE.md` §15 的同型教训）。
+            //
+            // 于是把判定交给**下一步**：`locate_contact` 是纯只读的，
+            // 视图不对它就在候选区里找不到目标，照样转人工。判据落在能真正
+            // 决断的地方，而不是在这里猜。这一行警告的作用是——真出问题时，
+            // 日志里已经写明了"视图可能根本没切过去"，不必再从"找不到联系人"倒推。
+            self.evidence.push(format!(
+                "⚠️ 点击导航图标后联系人候选区画面未变化（模板「{}」分数 {:.3}，点击 屏幕 ({}, {})）。\
+                 若界面本来就停在这个视图上，这属于正常；否则说明这次点击没有生效，\
+                 后面若报「找不到联系人」，先从这里查。",
+                found.template_label, found.score, target.x, target.y
+            ));
+        }
+        Ok(())
+    }
+
     /// 在联系人候选区里找到目标。
     ///
     /// ## 为什么是"回顶 + 多轮扫描"
@@ -801,7 +971,7 @@ impl<'a> Run<'a> {
         if timeout.is_zero() {
             return Ok(());
         }
-        let interval = (timeout / SETTLE_POLL_DIVISOR).max(MIN_SETTLE_POLL);
+        let interval = settle_poll_interval(timeout);
         let deadline = Instant::now() + timeout;
         let mut previous = self.capture_frame(panel, "联系人列表")?.fingerprint;
         while Instant::now() < deadline {
@@ -1002,6 +1172,15 @@ impl<'a> Run<'a> {
                 window.width, window.height, window.x, window.y, metrics.scale_factor
             )),
         )?;
+
+        // ── 切换视图（可选）────────────────────────────────────────
+        //
+        // 图标上没有文字，OCR 读不到它，所以"先切到联系人视图"这一步只能靠
+        // 模板匹配。它必须在查找之前——查找假定"现在看的就是目标视图"。
+        if self.cfg().navigate_before_search {
+            self.advance(TaskState::NavigatingToView, None)?;
+            self.navigate_to_view()?;
+        }
 
         // ── 查找联系人 ──────────────────────────────────────────────
         self.advance(TaskState::SearchingContact, None)?;

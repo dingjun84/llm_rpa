@@ -7,12 +7,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use automation_core::{
-    AuditEntry, CalibratedWindow, CancelToken, MemoryAudit, MemorySendLedger, ProgressSink,
-    RunOutcome, RunnerConfig, RunnerPorts, SendTask, StateChange, TaskState, WorkflowRunner,
+    AuditEntry, CalibratedWindow, CancelToken, IconLocator, IconTemplate, MemoryAudit,
+    MemorySendLedger, ProgressSink, RunOutcome, RunnerConfig, RunnerPorts, SendTask, StateChange,
+    TaskState, WorkflowRunner, DEFAULT_NAV_STRIP,
 };
 use platform_mock::{
-    tb, ConfirmationOutcome, Fault, MockDesktop, MockHumanConfirmation, MockOcr, MockScenario,
-    ScriptedCall, DEFAULT_WINDOW,
+    tb, ConfirmationOutcome, Fault, MockDesktop, MockHumanConfirmation, MockIconLocator, MockOcr,
+    MockScenario, ScriptedCall, DEFAULT_WINDOW,
 };
 
 const CONTACT: &str = "外部测试联系人";
@@ -97,6 +98,21 @@ impl Fixture {
         script: Vec<ScriptedCall>,
         matcher: Arc<dyn automation_core::ContactMatcher>,
     ) -> Self {
+        Self::build_full(desktop, confirmation, config, script, matcher, Arc::new(MockIconLocator::new()))
+    }
+
+    /// 最完整的一层：端口逐个指定。
+    ///
+    /// 图标定位端口默认给 `MockIconLocator::new()`（正中命中），
+    /// 需要测"图标找不到"这类路径时才换掉它。
+    fn build_full(
+        desktop: MockDesktop,
+        confirmation: MockHumanConfirmation,
+        config: RunnerConfig,
+        script: Vec<ScriptedCall>,
+        matcher: Arc<dyn automation_core::ContactMatcher>,
+        icons: Arc<dyn IconLocator>,
+    ) -> Self {
         let desktop = Arc::new(desktop);
         let ocr = Arc::new(MockOcr::new(script));
         let confirmation = Arc::new(confirmation);
@@ -108,6 +124,7 @@ impl Fixture {
                 platform: desktop.clone(),
                 ocr: ocr.clone(),
                 matcher,
+                icons,
                 confirmation: confirmation.clone(),
             },
             config,
@@ -501,6 +518,7 @@ fn the_same_task_cannot_be_sent_twice() {
             platform: desktop.clone(),
             ocr: Arc::new(MockOcr::new(script)),
             matcher: Arc::new(platform_mock::MockContactMatcher::new()),
+            icons: Arc::new(MockIconLocator::new()),
             confirmation: Arc::new(MockHumanConfirmation::default()),
         },
         RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
@@ -1422,4 +1440,231 @@ fn stop_before_send_works_together_with_scrolling() {
     assert_eq!(fixture.desktop.scroll_count(), 1);
     assert_eq!(fixture.desktop.pasted_texts(), vec![MESSAGE.to_string()]);
     assert_eq!(fixture.desktop.send_count(), 0);
+}
+
+// ── 切换视图：用模板匹配点左侧导航图标 ──────────────────────────────────
+//
+// 图标上没有文字，OCR 读不到它，所以"先切到联系人视图"这一步只能靠模板匹配。
+// 这三条用例覆盖：命中并跳转、认不出图标、点击没生效。
+
+/// 造一张"图标模板"。内容不重要——编排层只把它转交给图标定位端口。
+fn nav_template() -> IconTemplate {
+    IconTemplate {
+        label: "通讯录图标".into(),
+        pixels: vec![200; 24 * 24 * 4],
+        width: 24,
+        height: 24,
+    }
+}
+
+fn navigation_config() -> RunnerConfig {
+    RunnerConfig {
+        platform_label: "test".into(),
+        retry_backoff: Duration::ZERO,
+        navigate_before_search: true,
+        nav_icon_templates: vec![nav_template()],
+        ..Default::default()
+    }
+}
+
+fn navigation_fixture(desktop: MockDesktop, icons: Arc<dyn IconLocator>) -> Fixture {
+    let scenario = MockScenario::happy(CONTACT, MESSAGE);
+    Fixture::build_full(
+        desktop,
+        MockHumanConfirmation::default(),
+        navigation_config(),
+        scenario.script(),
+        Arc::new(platform_mock::MockContactMatcher::new()),
+        icons,
+    )
+}
+
+#[test]
+fn the_navigation_step_switches_the_view_before_searching() {
+    let icons = Arc::new(MockIconLocator::new());
+    let fixture = navigation_fixture(MockDesktop::new(), icons.clone());
+    let task = fixture.task();
+
+    let outcome = fixture.run(&task);
+
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
+    assert_eq!(icons.call_count(), 1, "切换视图这一步应当恰好找一次图标");
+
+    // 状态序列里必须出现 NavigatingToView，而且**在**查找之前。
+    let states = fixture.progress.states();
+    let navigating = states
+        .iter()
+        .position(|state| *state == TaskState::NavigatingToView)
+        .expect("应当经过「切换视图」");
+    let searching = states
+        .iter()
+        .position(|state| *state == TaskState::SearchingContact)
+        .expect("应当经过「查找联系人」");
+    assert!(navigating < searching, "切换视图必须发生在查找之前：{states:?}");
+
+    // 搜索区必须**只有**导航条那么大，而不是整个窗口——
+    // 传整窗的话，"图标在哪"这件事就没有任何约束了。
+    let strip = DEFAULT_NAV_STRIP.resolve(DEFAULT_WINDOW);
+    assert_eq!(
+        icons.regions.lock().unwrap().as_slice(),
+        &[(strip.width as u32, strip.height as u32)]
+    );
+
+    // 点击必须落在搜索区之内（命中位置 → 换算到屏幕 → 取中心）。
+    // 第一次点击是导航图标，第二次才是联系人——顺序本身也是约定。
+    let clicks = fixture.desktop.clicks.lock().unwrap().clone();
+    let nav_click = clicks.first().expect("应当点过一次导航图标");
+    assert!(
+        (strip.x..strip.x + strip.width).contains(&nav_click.x)
+            && (strip.y..strip.y + strip.height).contains(&nav_click.y),
+        "导航点击 ({}, {}) 落在搜索区 {strip:?} 之外",
+        nav_click.x,
+        nav_click.y
+    );
+    assert_eq!(fixture.desktop.send_count(), 1);
+}
+
+#[test]
+fn an_icon_that_cannot_be_found_stops_before_any_search() {
+    let fixture = navigation_fixture(MockDesktop::new(), Arc::new(MockIconLocator::never()));
+    let task = fixture.task();
+
+    let outcome = fixture.run(&task);
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    assert_eq!(
+        outcome.failure.as_ref().map(|failure| failure.code.as_str()),
+        Some("AMBIGUOUS_VISION"),
+        "认不出图标属于「识别不确定」，不是平台故障"
+    );
+    // 认不出图标就**不该**去点任何东西，也不该开始找联系人——
+    // 否则后面每一步都建立在一个"没切换成功"的界面上。
+    assert!(
+        fixture.desktop.clicks.lock().unwrap().is_empty(),
+        "认不出图标时不该点任何地方"
+    );
+    assert_eq!(fixture.desktop.send_count(), 0);
+    assert!(
+        !fixture.progress.states().contains(&TaskState::SearchingContact),
+        "这一步失败就不该再往下走"
+    );
+}
+
+/// 「点下去画面没变」**不**在这一步失败，但必须在证据里留痕。
+///
+/// ## 为什么不是转人工
+///
+/// 这个现象有两种成因，而在画面上**分不出来**：
+///
+/// 1. 界面本来就已经停在这个视图上（上一次运行点完就留在这里了）
+///    ⇒ 点击无效是**正确**行为；
+/// 2. 客户端卡死 / 图标被挡住 / 匹配到了不响应点击的位置
+///    ⇒ 点击真的没生效。
+///
+/// 在这一步直接转人工，第 1 种就会变成"第二次跑必然失败"——
+/// 报错文案还会把人引向排查客户端，方向完全错了。
+/// 所以判定交给下一步：`locate_contact` 是只读的，视图不对就在候选区里找不到目标。
+#[test]
+fn a_navigation_click_that_changes_nothing_is_recorded_and_left_to_the_next_step() {
+    let desktop = MockDesktop::new();
+    desktop.script_clicks_without_effect();
+    let fixture = navigation_fixture(desktop, Arc::new(MockIconLocator::new()));
+    let task = fixture.task();
+
+    let outcome = fixture.run(&task);
+
+    // 本例的候选区（`MockScenario::happy`）里**有**目标联系人，
+    // 对应"其实已经停在这个视图上"那种情况 ⇒ 应当正常跑完。
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
+    assert_eq!(fixture.desktop.send_count(), 1);
+
+    // 留痕是这一条用例的重点：真出问题时，日志要能直接回答
+    // "是不是视图根本没切过去"，而不是从"找不到联系人"倒推。
+    let warned = outcome.evidence.iter().any(|line| line.contains("未变化"));
+    assert!(
+        warned,
+        "画面没变必须在证据里留痕，实际证据：{:#?}",
+        outcome.evidence
+    );
+}
+
+/// 视图没切过去时，由**下一步**兜住：候选区里找不到目标 ⇒ 转人工。
+///
+/// 这条与上一条合起来才是完整的故事：本步骤不武断失败，但也没有放弃判定——
+/// 只是把判定挪到了能真正决断的地方。
+#[test]
+fn a_view_that_never_switched_is_caught_when_the_contact_is_not_found() {
+    let desktop = MockDesktop::new();
+    desktop.script_clicks_without_effect();
+    // 候选区里没有目标联系人（相当于界面停在了别的视图上）。
+    let scenario = MockScenario::login_prompt(CONTACT, MESSAGE);
+    let fixture = Fixture::build_full(
+        desktop,
+        MockHumanConfirmation::default(),
+        navigation_config(),
+        scenario.script(),
+        Arc::new(platform_mock::MockContactMatcher::new()),
+        Arc::new(MockIconLocator::new()),
+    );
+    let task = fixture.task();
+
+    let outcome = fixture.run(&task);
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    assert_eq!(fixture.desktop.send_count(), 0);
+    // 证据里应当同时有"画面没变"的警告——它是这次失败的第一现场。
+    assert!(
+        outcome.evidence.iter().any(|line| line.contains("未变化")),
+        "证据里应当留有「视图可能没切过去」的线索：{:#?}",
+        outcome.evidence
+    );
+}
+
+#[test]
+fn navigation_is_off_unless_it_is_configured() {
+    let icons = Arc::new(MockIconLocator::new());
+    let scenario = MockScenario::happy(CONTACT, MESSAGE);
+    let fixture = Fixture::build_full(
+        MockDesktop::new(),
+        MockHumanConfirmation::default(),
+        RunnerConfig {
+            platform_label: "test".into(),
+            retry_backoff: Duration::ZERO,
+            ..Default::default()
+        },
+        scenario.script(),
+        Arc::new(platform_mock::MockContactMatcher::new()),
+        icons.clone(),
+    );
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
+    // 默认关：既不找图标，也不走那个状态。
+    assert_eq!(icons.call_count(), 0);
+    assert!(!fixture.progress.states().contains(&TaskState::NavigatingToView));
+}
+
+#[test]
+fn the_navigation_defaults_are_off_and_the_strip_clears_the_avatar_column() {
+    let config = RunnerConfig::default();
+    // 默认必须是**关**的：模板要操作者先自己截、自己确认，
+    // 默认打开等于让每个没配模板的人都撞上一次配置错误。
+    assert!(!config.navigate_before_search);
+    assert!(config.nav_icon_templates.is_empty());
+    assert!(config.nav_strip.validate().is_ok());
+    assert!((0.0..=1.0).contains(&config.nav_icon_min_score));
+
+    // 宽度要落在"实测的两条线之间"：导航图标栏 0–57px、头像列从 78px 起
+    // （2026-09-17 在 974 宽的窗口上量的）。窄了会切掉图标，宽了会把头像
+    // 和未读红点一起圈进搜索区。
+    let width_at_974 = (974.0f32 * config.nav_strip.width).round() as i32;
+    assert!(
+        width_at_974 > 57,
+        "导航条宽 {width_at_974}px 比图标栏本身还窄，会把图标切掉"
+    );
+    assert!(
+        width_at_974 < 78,
+        "导航条宽 {width_at_974}px 已经盖住头像列（从 78px 起）"
+    );
 }

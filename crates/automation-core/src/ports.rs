@@ -69,6 +69,38 @@ pub struct TextBox {
     pub confidence: f32,
 }
 
+/// 一张用于**模板匹配**的小图。
+///
+/// 像素表示与 [`Screenshot`] 完全一致：BGRA、自上而下、32 位。
+///
+/// ## 为什么模板必须由人给
+///
+/// 模板决定了"程序会去点哪儿"。如果让程序自己"顺手从画面上裁一块"当模板，
+/// 那么裁错位置、裁到了空白，都会变成一次**静默的、看起来一切正常的**运行——
+/// 匹配分数照样很高（因为它匹配的是它自己刚裁的那块），点击照样发出去，
+/// 只是点到了别的地方。所以模板只能来自操作者确认过的那张图。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IconTemplate {
+    /// 人类可读名称（一般就是文件名），只用于日志与失败信息。
+    pub label: String,
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 一次模板匹配的命中结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IconMatch {
+    /// 命中位置，位于**传入截图的图像坐标系**（与 [`TextBox::bounds`] 同一套语义），
+    /// 由调用方加上区域原点换算成屏幕坐标。
+    pub bounds: Rect,
+    /// 归一化相关系数，`-1.0 ~ 1.0`。1.0 = 完全一致。
+    pub score: f32,
+    /// 命中的是第几个模板（对应传入的 `templates` 下标）。
+    pub template_index: usize,
+    pub template_label: String,
+}
+
 /// 当前显示器的分辨率与缩放比例，用于点击前的标定一致性校验。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ScreenMetrics {
@@ -189,6 +221,40 @@ pub trait DesktopPlatform: Send + Sync {
 /// OCR 实现必须仅使用本地模型和本机内存中的图像。
 pub trait LocalOcr: Send + Sync {
     fn recognize(&self, image: &Screenshot) -> Result<Vec<TextBox>, AutomationError>;
+}
+
+/// 图标定位端口：在一帧**局部截图**里用模板匹配找出一个小图的位置。
+///
+/// 与 [`LocalOcr`] 的分工很清楚——OCR 回答"这一片文字写的是什么"，
+/// 本端口回答"这个图标在哪儿"。两者都是本地的、都只吃局部截图、都不联网。
+///
+/// ## 为什么要有它
+///
+/// 靠 OCR 认字来找入口有个结构性弱点：图标**根本没有文字**。
+/// 左侧导航栏那排图标在 OCR 眼里是空白的，于是"先切到通讯录再找联系人"
+/// 这件事无从表达。模板匹配补的正是这一段：图标是固定的像素图案，
+/// 拿它跟画面比一比就知道在哪。
+///
+/// ## 约定
+///
+/// - `templates` 为空 ⇒ 实现方**必须报错**，不得当成"没找到"静默通过；
+/// - 最高分低于 `min_score` ⇒ 返回 [`AutomationError::AmbiguousVision`]
+///   （识别不确定 ⇒ 转人工），**不得**返回一个"分数不高但先用了"的结果。
+///   本项目不接受"凑合着点"：点错图标的代价是后面整条流程都作用在错误的界面上；
+/// - 返回的 `bounds` 是图像坐标系，由调用方换算成屏幕坐标。
+///
+/// ## 为什么是"一组模板取最高分"
+///
+/// 同一个图标在**选中 / 未选中**两种状态下长得不一样（选中态通常有高亮底色）。
+/// 只留一张模板，就会出现"上一次运行点完停在这个页面上，这一次就再也匹配不上"。
+/// 多张模板是这里唯一诚实的解法——而不是把阈值调低到"两个状态都能过"。
+pub trait IconLocator: Send + Sync {
+    fn locate(
+        &self,
+        frame: &Screenshot,
+        templates: &[IconTemplate],
+        min_score: f32,
+    ) -> Result<IconMatch, AutomationError>;
 }
 
 pub trait ContactMatcher: Send + Sync {

@@ -11,11 +11,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use automation_core::{
-    AuditSink, CalibratedWindow, ContainsNameMatcher, HumanConfirmation, LocalOcr, RelativePoint,
-    RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask, StrictContactMatcher,
-    WorkflowRunner, DEFAULT_MIN_CONFIDENCE, DEFAULT_REGIONS,
+    AuditSink, CalibratedWindow, ContainsNameMatcher, HumanConfirmation, IconTemplate, LocalOcr,
+    RelativePoint, RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask,
+    StrictContactMatcher, WorkflowRunner, DEFAULT_MIN_CONFIDENCE, DEFAULT_NAV_ICON_MIN_SCORE,
+    DEFAULT_NAV_STRIP, DEFAULT_REGIONS,
 };
-use platform_mock::{MockContactMatcher, MockDesktop, MockHumanConfirmation, MockOcr, MockScenario};
+use platform_mock::{
+    MockContactMatcher, MockDesktop, MockHumanConfirmation, MockIconLocator, MockOcr, MockScenario,
+};
 use serde::{Deserialize, Serialize};
 
 /// 单步超时相对 OCR 超时的余量（秒）。
@@ -197,6 +200,38 @@ pub struct RuntimeConfig {
     /// 只影响**真实模式**：演练模式的匹配器由场景脚本驱动（`MockContactMatcher`），
     /// 开着它也不会改变那几条失败路径的演示行为。
     pub relaxed_name_match: bool,
+    /// 是否在查找联系人之前，先用**模板匹配**找到左侧导航图标并点它一下，
+    /// 把视图切到"能查到联系人"的那个页面。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 图标上没有文字，OCR 读不到它。靠文字找入口的流程因此完全无法表达
+    /// "先切到联系人视图"这件事——而界面停在哪个视图，决定了后面那一次
+    /// 联系人列表识别到底在看什么。模板匹配补的正是这一段。
+    ///
+    /// 打开之后状态轨迹里会多出一个 `NavigatingToView`；关掉就是原来的行为。
+    ///
+    /// **打开时必须配模板**（`nav_icon_templates` 非空），否则装配期直接拒绝：
+    /// 宁可"任务还没登记就报错"，也不要留一条跑到一半才发现没模板的失败记录。
+    /// 演练模式同样要求配模板——两个模式的校验规则必须一致，
+    /// 否则"演练通过、真实报错"这种事迟早会发生。
+    pub navigate_before_search: bool,
+    /// 导航图标模板的 **PNG 路径**，可以多张（每行一个）。
+    ///
+    /// 为什么要多张：同一个图标在**选中 / 未选中**两种状态下长得不一样。
+    /// 只留一张，就会出现"上一次运行点完停在这个页面上，这一次再也匹配不上"。
+    ///
+    /// 模板要**自己截**（用 `screen_probe template`，或系统的截图工具），
+    /// 不要指望程序自动裁一个：程序猜出来的模板会把"点错了地方"变成一次
+    /// 看起来完全正常的运行——匹配分数照样很高，因为它匹配的是它自己刚裁的那块。
+    pub nav_icon_templates: Vec<String>,
+    /// 图标模板匹配的最低分数（0–1），低于它转人工。
+    ///
+    /// 界面上那个「测试图标匹配」按钮就是用来量这个值的：它会报出当前画面上
+    /// 的最高分。**不要照抄默认值**——阈值定低了会点错图标，定高了会频繁转人工。
+    pub nav_icon_min_score: f32,
+    /// 导航图标搜索区（相对窗口比例 `[x, y, w, h]`）。
+    pub nav_strip: [f32; 4],
 }
 
 impl Default for RuntimeConfig {
@@ -234,8 +269,19 @@ impl Default for RuntimeConfig {
             // 默认**开**：这是操作者当下要的"先把链路跑通"。
             // 关掉它就回到架构要求的逐字精确匹配。
             relaxed_name_match: true,
+            // 默认**关**：这一步要先有操作者自己截的图标模板，
+            // 默认打开等于让每个还没准备模板的人都撞上一次装配错误。
+            navigate_before_search: false,
+            nav_icon_templates: Vec::new(),
+            nav_icon_min_score: DEFAULT_NAV_ICON_MIN_SCORE,
+            nav_strip: flatten(DEFAULT_NAV_STRIP),
         }
     }
+}
+
+/// 把 [`RelativeRegion`] 摊平成配置里用的 `[x, y, w, h]`。
+fn flatten(region: RelativeRegion) -> [f32; 4] {
+    [region.x, region.y, region.width, region.height]
 }
 
 impl RuntimeConfig {
@@ -279,6 +325,18 @@ impl RuntimeConfig {
             // 真正的自适应来自 runner 里的"连续两帧一致就继续"，不是靠这个数。
             scroll_settle_timeout: Duration::from_millis(self.scroll_settle_ms),
             log_ocr_candidates: self.log_ocr_candidates,
+            navigate_before_search: self.navigate_before_search,
+            // 模板**不在这里填**：载入 PNG 会失败，而本方法没有 `Result`。
+            // 由 `build_runner` 在装配期调用 `load_nav_icon_templates` 填进去，
+            // 失败就在任务登记之前报出来。这里留空是刻意的，不是漏了。
+            nav_icon_templates: Vec::new(),
+            nav_icon_min_score: self.nav_icon_min_score.clamp(0.0, 1.0),
+            nav_strip: RelativeRegion::new(
+                self.nav_strip[0],
+                self.nav_strip[1],
+                self.nav_strip[2],
+                self.nav_strip[3],
+            ),
         }
     }
 
@@ -329,6 +387,8 @@ fn dry_run_ports(
         platform: Arc::new(desktop),
         ocr: Arc::new(MockOcr::new(scenario.script())),
         matcher: Arc::new(MockContactMatcher::new()),
+        // 演练模式的图标定位：正中命中。真去读模板反而会让演示依赖一张真图片。
+        icons: Arc::new(MockIconLocator::new()),
         confirmation: Arc::new(MockHumanConfirmation::default()),
     }
 }
@@ -376,6 +436,9 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
             // 真实模式的姓名匹配器在这里选型。
             // 放宽层是**临时**的，理由与风险见 `ContainsNameMatcher` 与 `docs/todo.md`。
             matcher: build_matcher(config.relaxed_name_match),
+            // 纯 Rust 的模板匹配。为什么不挂 OpenCV 见 `vision::template` 的模块文档
+            // 与 `docs/todo.md` T9——端口在这里，换实现不用动调用方。
+            icons: Arc::new(vision::TemplateLocator),
             confirmation: Arc::new(MockHumanConfirmation::default()),
         })
     }
@@ -384,6 +447,46 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
         let _ = config;
         Err("真实模式目前只支持 Windows".to_string())
     }
+}
+
+/// 载入导航图标模板。
+///
+/// **必须在任务登记之前调用**：模板文件不存在、尺寸不像图标，都要在
+/// "任务还没进列表"的时候就报出来。否则列表里会留下一条注定失败的记录，
+/// 看起来像是真的跑过——而它连第一步都没走完。
+///
+/// 校验规则对两个模式**完全一致**。演练模式本来可以放宽（替身不读图片），
+/// 但那样就会出现"演练一路通过、切到真实模式立刻报错"，而报错的那一刻
+/// 任务已经登记了。宁可在演练模式也要求配一张真图片。
+pub(crate) fn load_nav_icon_templates(paths: &[String]) -> Result<Vec<IconTemplate>, String> {
+    let paths: Vec<&str> = paths
+        .iter()
+        .map(|path| path.trim())
+        .filter(|path| !path.is_empty())
+        .collect();
+    if paths.is_empty() {
+        return Err(
+            "「先点击导航图标跳转」已经打开，但没有配置任何图标模板。\
+             请先用 screen_probe 的 template 子命令从目标窗口截一张图标 PNG，\
+             再把路径填进「导航图标模板」。"
+                .to_string(),
+        );
+    }
+
+    let mut templates = Vec::with_capacity(paths.len());
+    for path in paths {
+        let path = std::path::PathBuf::from(path);
+        // label 取文件名：失败信息里要能一眼看出是**哪一张**模板出的问题。
+        // 用完整路径会让一行日志变得很长，而文件名在同一个目录下是唯一的。
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let template =
+            vision::load_icon_template(&path, label).map_err(|err| format!("图标模板不可用：{err}"))?;
+        templates.push(template);
+    }
+    Ok(templates)
 }
 
 /// 组装一个可运行的 [`WorkflowRunner`]。
@@ -429,7 +532,33 @@ pub fn build_runner(
     // 确认端口始终来自界面，保证真实模式下也必须人工确认。
     ports.confirmation = confirmation;
 
-    Ok(WorkflowRunner::new(ports, config.to_runner_config())
+    let mut runner_config = config.to_runner_config();
+
+    // 「先点导航图标切视图」这一组的校验与模板载入。
+    //
+    // 和上面两条同一个道理：**全部放在装配期**。区域比例非法、模板文件读不出来、
+    // 该配模板却没配——这些都会让任务注定失败，而装配失败**不会在任务列表里
+    // 留下记录**，装配成功才会登记。所以能提前判的一律提前判。
+    if config.navigate_before_search {
+        let strip = runner_config.nav_strip;
+        if let Err(err) = strip.validate() {
+            return Err(format!(
+                "导航图标搜索区的比例不合法（{:.3}, {:.3}, {:.3}, {:.3}）：{err}。\
+                 它是相对窗口的比例，四项都要落在 0–1 之间且不能越出窗口。",
+                strip.x, strip.y, strip.width, strip.height
+            ));
+        }
+        if !(0.0..=1.0).contains(&config.nav_icon_min_score) {
+            return Err(format!(
+                "图标匹配最低分数必须在 0–1 之间（当前 {}）：\
+                 它是归一化互相关系数，1.0 表示完全一致。",
+                config.nav_icon_min_score
+            ));
+        }
+        runner_config.nav_icon_templates = load_nav_icon_templates(&config.nav_icon_templates)?;
+    }
+
+    Ok(WorkflowRunner::new(ports, runner_config)
         .with_audit(audit)
         .with_ledger(ledger))
 }
@@ -437,6 +566,54 @@ pub fn build_runner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use automation_core::{MemoryAudit, MemorySendLedger};
+
+    /// 造一张真的 PNG 当模板。
+    ///
+    /// 刻意**不引 `image` 这个依赖**：`vision::pixels` 已经能把 BGRA 缓冲编码成
+    /// PNG，而构造 BGRA 缓冲只需要一个 `Vec<u8>`。少一个依赖就少一处版本漂移
+    /// （`RgbaImage` 在两个 crate 里是两个不同的类型，版本不一致时很难看出原因）。
+    fn write_template_png(name: &str, width: u32, height: u32) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("rpa-llm-nav-template");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.extend_from_slice(&[(x * 7) as u8, (y * 11) as u8, ((x + y) * 5) as u8, 255]);
+            }
+        }
+        let shot = automation_core::Screenshot {
+            pixels,
+            width,
+            height,
+            captured_at: std::time::SystemTime::now(),
+            fingerprint: String::new(),
+        };
+        let rgba = vision::pixels::to_rgba(&shot).unwrap();
+        std::fs::write(&path, vision::pixels::encode_png(&rgba).unwrap()).unwrap();
+        path
+    }
+
+    fn sample_task() -> SendTask {
+        SendTask {
+            id: uuid::Uuid::new_v4(),
+            external_contact_name: "外部测试联系人".into(),
+            text: "测试正文".into(),
+            created_by: "测试操作者".into(),
+        }
+    }
+
+    /// 走一遍真实的装配路径，只关心它成不成功、以及装配出来的运行器里有什么。
+    fn assemble(config: &RuntimeConfig) -> Result<WorkflowRunner, String> {
+        build_runner(
+            config,
+            &sample_task(),
+            Arc::new(MemoryAudit::new()),
+            Arc::new(MemorySendLedger::new()),
+            Arc::new(MockHumanConfirmation::default()),
+        )
+    }
 
     /// 单步超时不能小于 OCR 超时，否则把 OCR 超时调大是白调的。
     ///
@@ -634,5 +811,124 @@ mod tests {
     #[test]
     fn relaxed_name_matching_is_on_by_default_for_now() {
         assert!(RuntimeConfig::default().relaxed_name_match);
+    }
+
+    /// 导航图标这一组的默认值必须与核心层的常量逐字段一致，并且**默认关**。
+    ///
+    /// 默认关的理由要钉住：这一步需要操作者自己截一张图标模板，
+    /// 默认打开等于让每个还没准备模板的人都在点「开始任务」时撞上一次装配错误。
+    #[test]
+    fn navigation_defaults_come_from_the_core_constants_and_are_off() {
+        let config = RuntimeConfig::default();
+        assert!(!config.navigate_before_search);
+        assert!(config.nav_icon_templates.is_empty());
+        assert_eq!(config.nav_icon_min_score, DEFAULT_NAV_ICON_MIN_SCORE);
+        assert_eq!(config.nav_strip, flatten(DEFAULT_NAV_STRIP));
+
+        let runner = config.to_runner_config();
+        assert_eq!(runner.nav_strip, DEFAULT_NAV_STRIP);
+        assert_eq!(runner.nav_icon_min_score, DEFAULT_NAV_ICON_MIN_SCORE);
+        assert!(runner.nav_icon_templates.is_empty(), "模板由装配期载入，不在这个转换里");
+        assert!(!runner.navigate_before_search);
+    }
+
+    /// 打开开关却没配模板 ⇒ **装配期**就拒绝，而不是留一条跑到一半才失败的记录。
+    #[test]
+    fn turning_on_navigation_without_a_template_is_refused() {
+        let config = RuntimeConfig {
+            navigate_before_search: true,
+            ..RuntimeConfig::default()
+        };
+        let err = assemble(&config).err().expect("没有模板时必须拒绝装配");
+        assert!(err.contains("没有配置任何图标模板"), "{err}");
+
+        // 只填空白也算没配——不然会变成"文件名叫空字符串"这种更难查的错。
+        let config = RuntimeConfig {
+            navigate_before_search: true,
+            nav_icon_templates: vec!["   ".into(), String::new()],
+            ..RuntimeConfig::default()
+        };
+        assert!(assemble(&config).is_err());
+    }
+
+    /// 模板在装配期载入，并且真的被带进了运行器。
+    #[test]
+    fn templates_are_loaded_at_assembly_time() {
+        let path = write_template_png("nav-icon.png", 20, 18);
+        let config = RuntimeConfig {
+            navigate_before_search: true,
+            nav_icon_templates: vec![path.display().to_string(), "   ".into()],
+            ..RuntimeConfig::default()
+        };
+
+        let runner = assemble(&config).expect("应当装配成功");
+        let templates = &runner.config().nav_icon_templates;
+        assert_eq!(templates.len(), 1, "空白行要忽略，不然会变成一个空路径");
+        assert_eq!(
+            templates[0].label, "nav-icon.png",
+            "label 取文件名：失败信息里要能一眼看出是哪一张模板出的问题"
+        );
+        assert_eq!((templates[0].width, templates[0].height), (20, 18));
+    }
+
+    /// 模板本身不可用时也要在装配期报错。
+    ///
+    /// 关键在"什么时候报"：留到运行期的话，症状是"匹配分数很低"，
+    /// 而人只会去怀疑阈值，不会想到"这张图根本不是图标"。
+    #[test]
+    fn an_unusable_template_is_refused_at_assembly_time() {
+        let too_big = write_template_png("too-big.png", 300, 40);
+        let config = RuntimeConfig {
+            navigate_before_search: true,
+            nav_icon_templates: vec![too_big.display().to_string()],
+            ..RuntimeConfig::default()
+        };
+        let err = assemble(&config).err().expect("过大的模板必须被拒绝");
+        assert!(err.contains("太大"), "报错要说清是尺寸问题：{err}");
+
+        let missing = std::env::temp_dir().join("rpa-llm-nav-template/definitely-missing.png");
+        let config = RuntimeConfig {
+            navigate_before_search: true,
+            nav_icon_templates: vec![missing.display().to_string()],
+            ..RuntimeConfig::default()
+        };
+        assert!(assemble(&config).is_err(), "文件不存在也必须被拒绝");
+    }
+
+    /// 搜索区比例非法 / 阈值越界，同样在装配期拦下。
+    #[test]
+    fn an_illegal_nav_strip_or_threshold_is_refused() {
+        let path = write_template_png("nav-icon.png", 20, 18);
+
+        let config = RuntimeConfig {
+            navigate_before_search: true,
+            nav_icon_templates: vec![path.display().to_string()],
+            nav_strip: [0.0, 0.0, 1.5, 1.0],
+            ..RuntimeConfig::default()
+        };
+        let err = assemble(&config).err().expect("比例越界必须被拒绝");
+        assert!(err.contains("导航图标搜索区"), "{err}");
+
+        let config = RuntimeConfig {
+            navigate_before_search: true,
+            nav_icon_templates: vec![path.display().to_string()],
+            nav_icon_min_score: 1.4,
+            ..RuntimeConfig::default()
+        };
+        let err = assemble(&config).err().expect("阈值越界必须被拒绝");
+        assert!(err.contains("0–1"), "{err}");
+    }
+
+    /// 关着的时候不该去读模板：路径写错了也不该拦住任务。
+    #[test]
+    fn templates_are_not_touched_while_navigation_is_off() {
+        let config = RuntimeConfig {
+            navigate_before_search: false,
+            nav_icon_templates: vec!["Z:/definitely/missing.png".into()],
+            nav_strip: [0.0, 0.0, 9.0, 9.0],
+            ..RuntimeConfig::default()
+        };
+        let runner = assemble(&config).expect("关着的时候这些配置项都不该被读");
+        assert!(runner.config().nav_icon_templates.is_empty());
     }
 }
