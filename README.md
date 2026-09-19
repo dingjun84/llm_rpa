@@ -29,7 +29,8 @@ crates/platform-mock/      替身端口，供全流程测试与故障注入
 crates/platform-windows/   真实 Win32：窗口定位、GDI 截屏、SendInput、剪贴板
 crates/vision/             局部裁切、预处理、离线 OCR 适配器
 crates/storage/            SQLite 审计与证据清理
-tools/winocr/              本地 OCR 可执行文件（Windows 内置离线引擎）
+tools/winocr/              本地 OCR 子进程（包住 Windows 自带的 Windows.Media.Ocr）
+                           ★ 系统自带的是引擎，这个 exe 要自己建：cargo build -p winocr
 docs/                      架构与接口说明
 ```
 
@@ -38,7 +39,7 @@ docs/                      架构与接口说明
 | 模式 | 行为 |
 | --- | --- |
 | **演练模式**（默认） | 全部使用替身端口。不启动企业微信、不产生任何真实输入，可注入故障场景观察收敛结果。 |
-| **真实模式** | 操作本机真实窗口。发送期间请勿切换窗口或操作鼠标键盘，也**不要移动或缩放目标窗口**（尺寸变了会被校验拦下）。 |
+| **真实模式** | 操作本机真实窗口。发送期间请勿切换窗口或操作鼠标键盘。**挪动**目标窗口没关系（位置不校验），但**缩放**会被自动调回标定尺寸；调不动（客户端有最小尺寸限制）就转人工。 |
 
 真实模式需要显式配置：企业微信可执行文件路径（可选 SHA-256 校验）、窗口类名、
 本地 OCR 程序路径、**四个区域的标定**，以及**标定窗口尺寸**。
@@ -59,11 +60,19 @@ docs/                      架构与接口说明
 
 点一次「记录窗口尺寸」，把当时的窗口宽高与显示器缩放记下来。之后：
 
-- 任务开始时**只按这个尺寸**运行，尺寸或 DPI 对不上**直接转人工**，绝不按错的尺寸去点；
+- 任务开始时**只按这个尺寸**运行：尺寸对不上会**先自动把窗口调回这个尺寸**，
+  客户端的最小尺寸不允许时**才**转人工，绝不按错的尺寸去点；
+- **DPI 对不上不尝试调整**——缩放是显示器属性、不是窗口属性，调物理像素解决不了，
+  直接转人工；
 - **位置不校验**——区域是相对窗口的比例，运行之间把窗口挪到哪儿都无所谓；
 - 真实模式**没有标定尺寸就不让开始**（在登记任务之前就拦下，不留半截任务记录）。
 
 容差是 1 像素与 1% 缩放：DPI 换算会有 ±1 的取整差异，卡到 0 会让正常环境随机失败。
+
+> 调整窗口用的是 `SetWindowPos` + `SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE`：
+> 只改尺寸，不挪位置、不改层级、不抢前台。判据是**调完重新量出来的**尺寸——
+> 客户端会用自己的最小尺寸把请求值夹住，而 `SetWindowPos` 照样报成功。
+> 想**换一个**窗口尺寸，就得重标区域 + 重记尺寸，见 `docs/todo.md` T2。
 
 ### 卡死检测
 
@@ -120,18 +129,34 @@ docs/                      架构与接口说明
 
 ## 区域标定
 
-真实模式依赖四个相对窗口的区域（比例值，窗口移动或缩放后无需重标）：
-联系人候选区、聊天页标题区、聊天正文区、消息输入框区。
+真实模式依赖若干**相对窗口的比例区域**（窗口挪动、换分辨率都不必重标）：
+会话列表区、聊天页标题与正文、消息输入框，以及搜索式工作流要用的顶部搜索框、
+联想下拉、联系人资料区、左侧导航区。
 
 默认值是照企业微信界面猜的，**不同版本、窗口尺寸、DPI 下都必须重标**。
-界面里点「截取目标窗口」可以对着实际窗口调比例——这个预览是纯只读的：
-不点击、不粘贴、不发送，也不会把目标窗口抢到前台。
+在**「界面标定」页**按场景（主界面 / 历史对话 / 联系人列表 / 搜索下拉列表）
+切到对应界面、截图、把每一块框出来——清单只有后端一份（`calibration/catalog.rs`），
+界面按它渲染。预览是纯只读的：不点击、不粘贴、不发送，也不会把目标窗口抢到前台。
+
+> 「任务」页上原来还有一份"手填百分比"的区域标定面板，已经删掉：它和「界面标定」页
+> 改的是同一份配置，两处并存只会让人不知道该信哪一边。
 
 ## 本地 OCR
 
-`tools/winocr` 用 Windows 自带的 `Windows.Media.Ocr` 实现 OCR 契约
-（stdin 收 PNG，stdout 出 JSON 数组），完全离线、不装第三方模型。
-构建后把路径填进配置：
+`tools/winocr` 是一个**本仓库自己的**可执行文件：从 stdin 收 PNG、调 Windows 自带的
+`Windows.Media.Ocr`、把 JSON 数组写到 stdout。完全离线、不装第三方模型。
+
+⚠️ **系统自带的是那个 OCR 引擎，不是这个 exe。** `winocr.exe` 得自己构建，而且
+**必须单独构建**——它不是 `desktop` 的依赖：
+
+```bash
+CARGO_INCREMENTAL=0 cargo build -p winocr
+```
+
+漏了这一步的症状很能骗人：程序照常打开、任务也点得动，一直到第一次识别才报
+「本地 OCR 进程启动失败：…\target\debug\winocr.exe：系统找不到指定的文件」。
+（`cargo test --workspace` 也**不会**生成它，只会在 `target\debug\deps\` 下留一个
+带哈希的副本。）构建后把路径填进配置：
 
 ```jsonc
 "ocr_command": "<仓库>/target/debug/winocr.exe"
@@ -151,6 +176,11 @@ CARGO_INCREMENTAL=0 cargo test --workspace
 # 要「双击就能跑」必须带 custom-protocol：不带它构建会被判定为 dev，
 # 前端资源根本不嵌进 exe，双击得到白窗口。
 CARGO_INCREMENTAL=0 cargo build -p desktop --features custom-protocol
+
+# 本地 OCR 程序。**必须单独建**：它不是 desktop 的依赖，
+# `cargo build -p desktop` 不会建它；`cargo test --workspace` 也只在
+# target\debug\deps\ 下留一个带哈希的副本，不生成 target\debug\winocr.exe。
+CARGO_INCREMENTAL=0 cargo build -p winocr
 
 cd apps/desktop && npm install && npm run build   # 前端产物（改了前端后必须重跑，再重新 cargo build）
 cd apps/desktop && npm run tauri dev              # 开发模式（靠 dev 服务器供页面）

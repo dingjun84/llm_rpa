@@ -12,8 +12,12 @@
 //!
 //! 消息正文只存在于内存与界面预览中，**不落库**；审计表只保存长度与哈希。
 
+pub mod calibration;
+pub mod capture_hotkey;
 pub mod confirmation;
+pub mod data_dir;
 pub mod icon_library;
+pub mod legacy_data;
 pub mod runtime;
 
 use std::collections::HashMap;
@@ -22,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automation_core::{
     CancelToken, EvidenceRecorder, Failure, Point, ProgressSink, Rect, Screenshot, SendTask,
-    StateChange, TaskId, TaskState, TextBox,
+    StateChange, TaskId, TaskState, TextBox, Workflow,
 };
 use serde::{Deserialize, Serialize};
 use storage::{EvidenceStore, RedactedImage, SqliteAuditStore, SqliteSendLedger};
@@ -91,8 +95,15 @@ pub struct TaskView {
 pub struct RuntimeInfo {
     pub config: RuntimeConfig,
     pub data_dir: String,
-    /// 图标库目录。界面上要显示它——模板是**文件**，用户有权知道它们存在哪。
+    /// 图标库目录（**当前生效**的那个）。界面上要显示它——模板是**文件**，
+    /// 用户有权知道它们存在哪。
     pub icons_dir: String,
+    /// 图标库目录**留空时的默认值**（数据目录下的 `icons/`）。
+    ///
+    /// 单独下发一个，是为了让界面上的输入框能把它当占位提示显示出来：
+    /// 前端自己拼一份的话，两边迟早不一致，而"默认到底存哪儿"恰恰是
+    /// 最需要说准的一件事。
+    pub icons_dir_default: String,
     /// 图标模板的边长下限 / 上限（像素）。
     ///
     /// 由 `vision` 的常量下发，**不在前端再写一份**：界面上「框得太小 / 太大」的
@@ -104,6 +115,11 @@ pub struct RuntimeInfo {
     pub is_windows: bool,
     /// 演练模式的显式提示，避免被误当成真实发送。
     pub notice: String,
+    /// 启动时那次一次性搬迁的结果（**只在真发生过、或搬失败时**才有值）。
+    ///
+    /// 下发给界面是为了让「配置怎么突然有值了」和「配置怎么是空的」
+    /// 这两个问题各自有个能看见的答案。见 [`migrate_legacy_data`]。
+    pub migration_note: Option<String>,
 }
 
 /// 标定预览图的最大宽度。
@@ -301,16 +317,46 @@ pub struct AppState<R: Runtime> {
     config: Arc<Mutex<RuntimeConfig>>,
     config_path: std::path::PathBuf,
     data_dir: std::path::PathBuf,
+    /// 启动时那次一次性搬迁的结果，**只在真发生过（或失败）时**是 `Some`。
+    ///
+    /// 存下来是为了让界面能说一句「旧配置已经从 AppData 搬过来了」：
+    /// 不说的话，用户看到配置里已经有值，只会疑惑"我什么时候填的"；
+    /// 而搬迁**失败**时不说更糟——界面显示的是空配置，看起来就像数据丢了。
+    migration_note: Option<String>,
+}
+
+/// 搬一次旧版留在 AppData 里的数据，并把它变成**一句给界面看的话**。
+///
+/// 返回 `None` 表示没什么可搬的（旧位置不存在、或者已经搬过）——
+/// 那是常态，界面上不必提。
+///
+/// **搬失败不阻断启动**，但要在界面上说出来。两者不对等：
+/// 搬不过来只是"要重新标定一次"，而启动失败是整个程序都用不了。
+/// 不说出来更糟——界面显示的是空配置，看起来就像数据丢了，
+/// 而实际上旧文件还好好躺在 AppData 里。见 [`legacy_data`]。
+fn migrate_legacy_data<R: Runtime>(
+    app: &AppHandle<R>,
+    data_dir: &std::path::Path,
+) -> Option<String> {
+    let legacy = app.path().app_data_dir().ok()?;
+    match legacy_data::migrate(&legacy, data_dir) {
+        Ok(Some(done)) => Some(done.summary()),
+        Ok(None) => None,
+        Err(err) => Some(format!(
+            "旧数据没能搬过来：{err}。旧文件仍在 {}，可以手工拷到 {}。",
+            legacy.display(),
+            data_dir.display()
+        )),
+    }
 }
 
 impl<R: Runtime> AppState<R> {
     pub fn new(app: &AppHandle<R>) -> Result<Self, String> {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|err| format!("无法定位应用数据目录：{err}"))?;
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|err| format!("无法创建应用数据目录：{err}"))?;
+        // 数据目录：**程序运行当前路径**下的 `data/`，每次启动都检查一遍，
+        // 不存在就建（见 `data_dir`）。路径规则不在这里另写一份——
+        // 图标库的默认位置也从那儿取。
+        let data_dir = data_dir::ensure()?;
+        let migration_note = migrate_legacy_data(app, &data_dir);
 
         let db_path = data_dir.join("audit.sqlite");
         let audit = SqliteAuditStore::open(&db_path).map_err(|err| err.to_string())?;
@@ -321,6 +367,7 @@ impl<R: Runtime> AppState<R> {
         Ok(Self::assemble(
             app,
             data_dir,
+            migration_note,
             Arc::new(audit),
             Arc::new(ledger),
             Arc::new(evidence),
@@ -329,8 +376,13 @@ impl<R: Runtime> AppState<R> {
 
     /// 测试用：数据库全部走内存，只有脱敏证据落在一个临时目录里。
     ///
-    /// 之所以不直接复用 [`AppState::new`]，是因为它依赖 `app_data_dir()`，
-    /// 而测试运行时（`MockRuntime`）没有真实的应用数据目录。
+    /// 之所以不直接复用 [`AppState::new`]，是因为它会去动**真实的数据目录**
+    /// （程序运行当前路径下的 `data/`），还会顺带搬一次旧数据——
+    /// 测试既不该往仓库里写，也不该碰用户的配置。
+    ///
+    /// 顺带把**图标库**也按到那个临时目录里（配置里没写时才按）：
+    /// 图标库的默认位置现在是数据目录下的 `icons/`，而测试进程的工作目录
+    /// 就是 `src-tauri/`，跑去那儿读写会把仓库弄脏，多个用例还会互相踩。
     pub fn in_memory(
         app: &AppHandle<R>,
         evidence_root: impl Into<std::path::PathBuf>,
@@ -346,18 +398,38 @@ impl<R: Runtime> AppState<R> {
         let evidence = EvidenceStore::in_memory(&evidence_root, EVIDENCE_RETENTION)
             .map_err(|err| err.to_string())?;
 
-        Ok(Self::assemble(
+        let state = Self::assemble(
             app,
-            data_dir,
+            data_dir.clone(),
+            None,
             Arc::new(audit),
             Arc::new(ledger),
             Arc::new(evidence),
-        ))
+        );
+        {
+            let mut config = state.config.lock().map_err(|_| "配置锁已中毒".to_string())?;
+            let configured = config
+                .icons_dir
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty();
+            if configured {
+                // 直接按到**这个用例自己的**数据目录下，**不能**走 `resolve_dir`：
+                // 它在没配置时优先返回数据目录下的 `icons/`——那正是这里要避开的目录。
+                // （踩过一次：测试把图标写进了仓库的 `data/icons/`，用例之间互相踩，
+                //   `the_icon_library_starts_empty_*` 直接因为"库里有东西"而失败。）
+                config.icons_dir =
+                    Some(data_dir.join(icon_library::ICONS_SUBDIR).display().to_string());
+            }
+        }
+        Ok(state)
     }
 
     fn assemble(
         app: &AppHandle<R>,
         data_dir: std::path::PathBuf,
+        migration_note: Option<String>,
         audit: Arc<SqliteAuditStore>,
         ledger: Arc<SqliteSendLedger>,
         evidence: Arc<EvidenceStore>,
@@ -379,11 +451,28 @@ impl<R: Runtime> AppState<R> {
             config: Arc::new(Mutex::new(config)),
             config_path,
             data_dir,
+            migration_note,
         }
     }
 
     fn record(&self, task_id: TaskId) -> Option<TaskRecord> {
         self.tasks.lock().ok()?.get(&task_id).cloned()
+    }
+
+    /// 图标库目录：**配置里写的**优先，否则数据目录下的 `icons/`。
+    ///
+    /// 每次现算而不是启动时算一次：界面上改了目录、保存配置之后应当**立刻**生效，
+    /// 否则会出现"我改了路径，列表却还是老样子"这种没人能想明白的现象。
+    ///
+    /// 兜底传 `&self.data_dir`：它是启动时已经解析好的绝对路径，
+    /// 所以即使 `resolve_dir` 拿不到当前工作路径，落到的地方**还是同一个**。
+    fn icons_dir(&self) -> std::path::PathBuf {
+        let configured = self
+            .config
+            .lock()
+            .ok()
+            .and_then(|config| config.icons_dir.clone());
+        icon_library::resolve_dir(configured.as_deref(), &self.data_dir)
     }
 
     /// 供集成测试核对审计内容。
@@ -458,6 +547,7 @@ fn start_task<R: Runtime>(
     let runner = runtime::build_runner(
         &config,
         &task,
+        &state.icons_dir(),
         state.audit.clone(),
         state.ledger.clone(),
         state.confirmation.clone(),
@@ -511,6 +601,28 @@ fn start_task<R: Runtime>(
             &format!("目标联系人 : {}", task.external_contact_name),
         );
         append_task_log(&log_path, &format!("运行模式   : {:?}", config.mode));
+        // 「哪条工作流」必须写进日志。
+        //
+        // 三条路的失败现象**一模一样**（都是「找不到联系人」），而处置方向完全相反：
+        // 搜索式要查联想下拉，列表式要查会话列表，导航式根本不找人。
+        // 日志里没有这一行时，看日志的人只能靠"有没有点过搜索框"去反推，
+        // 而那条证据要往后翻十几行才看得到——于是很容易把"跑的不是这条工作流"
+        // 误判成"这条工作流坏了"。
+        //
+        // 记的是**已保存配置**里的值，也就是这次任务真正用的那份。
+        // 界面上的下拉是草稿，改了不保存不会生效（`start_task` 读的是 `state.config`）。
+        append_task_log(
+            &log_path,
+            &format!(
+                "工作流     : {}（{:?}）",
+                config.workflow.describe(),
+                config.workflow
+            ),
+        );
+        if config.workflow == Workflow::NavigateOnly {
+            // 导航式只点一个图标，而"点的是哪个"决定了该看哪一组模板。
+            append_task_log(&log_path, &format!("导航目标   : {:?}", config.nav_target));
+        }
         append_task_log(&log_path, &format!("窗口类名   : {}", config.window_class));
         append_task_log(&log_path, &format!("目标程序   : {:?}", config.wecom_exe));
         append_task_log(&log_path, &format!("OCR 程序   : {:?}", config.ocr_command));
@@ -536,21 +648,22 @@ fn start_task<R: Runtime>(
             ),
         );
         // 「先点导航图标切视图」会改变"在哪一屏找联系人"，
-        // 出问题时第一件要确认的就是"当时到底开没开、用的哪张模板"。
+        // 出问题时第一件要确认的就是"当时到底开没开、用的哪个图标"。
         if config.navigate_before_search {
             let names = config
                 .nav_icon_templates
                 .iter()
-                .map(|path| path.trim())
-                .filter(|path| !path.is_empty())
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
                 .collect::<Vec<_>>()
                 .join(" | ");
             append_task_log(
                 &log_path,
                 &format!(
-                    "切换视图   : 开    模板 {} 张 [{}]    搜索区 {:?}    最低分 {:.2}",
-                    config.nav_icon_templates.iter().filter(|p| !p.trim().is_empty()).count(),
+                    "切换视图   : 开    图标 {} 个 [{}]    图标库 {}    搜索区 {:?}    最低分 {:.2}",
+                    config.nav_icon_templates.iter().filter(|n| !n.trim().is_empty()).count(),
                     names,
+                    state.icons_dir().display(),
                     config.nav_strip,
                     config.nav_icon_min_score
                 ),
@@ -712,12 +825,16 @@ fn runtime_info<R: Runtime>(
     Ok(RuntimeInfo {
         config,
         data_dir: state.data_dir.display().to_string(),
-        icons_dir: icon_library::dir(&state.data_dir).display().to_string(),
+        icons_dir: state.icons_dir().display().to_string(),
+        icons_dir_default: icon_library::resolve_dir(None, &state.data_dir)
+            .display()
+            .to_string(),
         template_min_side: vision::MIN_TEMPLATE_SIDE,
         template_max_side: vision::MAX_TEMPLATE_SIDE,
         audit_entry_count: state.audit.count().unwrap_or(0),
         is_windows: cfg!(windows),
         notice,
+        migration_note: state.migration_note.clone(),
     })
 }
 
@@ -727,10 +844,71 @@ fn set_runtime_config<R: Runtime>(
     _app: AppHandle<R>,
     config: RuntimeConfig,
 ) -> Result<(), String> {
+    persist_config(&state, config)
+}
+
+/// 校验并落盘一份配置，同时更新内存里的那一份。
+///
+/// [`set_runtime_config`] 与 [`prune_stale_marks`] 都走这里。抽出来是为了让
+/// 「**落到盘上的配置一定过了这一关**」只有一处实现——两条写入路径各写一份的话，
+/// 迟早有一条会漏掉校验，而漏掉的表现是配置里安静地躺着一个没人读的键。
+fn persist_config<R: Runtime>(state: &AppState<R>, config: RuntimeConfig) -> Result<(), String> {
+    // 兜底校验。界面在拖完框、以及保存前会调 `validate_area_mark` 先问一遍，
+    // 但那条路挡不住**手改配置文件**——拼错的 key 会安静地躺在配置里，
+    // `plan()` 读不到、任务也读不到，**不报任何错**，
+    // 只表现为"框明明拖了却不起作用"。所以落盘前再过一遍。
+    // 判据取自 `calibration`（键问 `find_item`、矩形问 `validate_rect`），
+    // 这里不另写一份。
+    for (key, mark) in &config.area_marks {
+        if calibration::find_item(key).is_none() {
+            return Err(format!("界面标定里有未知的项 `{key}`——它不会被任何流程读到"));
+        }
+        calibration::validate_rect(mark.rect)
+            .map_err(|err| format!("界面标定项 `{key}` 的坐标不合法：{err}"))?;
+    }
+
     let text = serde_json::to_string_pretty(&config).map_err(|err| err.to_string())?;
     std::fs::write(&state.config_path, text).map_err(|err| format!("保存配置失败：{err}"))?;
     *state.config.lock().map_err(|_| "配置锁已中毒".to_string())? = config;
     Ok(())
+}
+
+/// 清掉配置里那些**清单已经没有**的标定项，返回清掉的个数。
+///
+/// ## 为什么需要一个命令，而不是只让界面自己删
+///
+/// 清单会随流程完善而改（改名、拆并、删项），而配置是**持久化**的：
+/// 清单改过之后，旧 key 就留在了 `area_marks` 里。它们不会被任何流程读到，
+/// **却会挡住保存**——[`persist_config`] 拒绝未知 key。
+/// 于是升级到新清单的人会卡在「一保存就报错，但界面上找不到那个项」：
+/// 报错说得没错（那个键确实没人读），可**没有出口**。这条命令就是那个出口。
+///
+/// 清完**立刻落盘**：它清掉的正是让保存失败的那些键，
+/// 只改内存、等用户再点一次「保存」的话，那一次保存仍然会被自己挡住。
+/// 落盘仍然走 [`persist_config`]，所以校验没有被绕开。
+///
+/// `_app` 这个参数**不读请求体**，它存在的唯一理由是钉住泛型 `R`：
+/// `State<'r, T>` 的 `CommandArg` 实现里 `R` 与 `T` 没有约束关系，
+/// 所以只写 `State<'_, AppState<R>>` 时 `R` 是自由变量，
+/// `generate_handler!` 会报 `E0283: type annotations needed`。
+/// 带上 `AppHandle<R>` 之后 `R` 就出现在 trait 的 `Self` 类型上，能推断出来了。
+/// 前端调用方式完全不变。
+#[tauri::command]
+fn prune_stale_marks<R: Runtime>(
+    state: State<'_, AppState<R>>,
+    _app: AppHandle<R>,
+) -> Result<usize, String> {
+    let mut config = state
+        .config
+        .lock()
+        .map_err(|_| "配置锁已中毒".to_string())?
+        .clone();
+    let removed = calibration::prune_stale_marks(&mut config);
+    if removed == 0 {
+        return Ok(0);
+    }
+    persist_config(&state, config)?;
+    Ok(removed)
 }
 
 /// 按「窗口类名 +（可选）可执行文件路径」构造桌面适配器。
@@ -972,6 +1150,69 @@ fn record_window_geometry<R: Runtime>(
     }
 }
 
+/// 读出**界面标定计划**：有哪些界面要标、每一项该框哪儿、当前标到哪一步了。
+///
+/// 纯只读：只读配置，不碰屏幕、不截屏、不聚焦，因此**不按运行模式设限**——
+/// 标定属于「配置」而不是「执行」，实际使用顺序也往往是"先把区域标好，
+/// 再决定用哪种模式跑"，卡在模式上只会让人没法做准备。
+///
+/// 为什么要由后端下发清单，而不是前端自己写一份：标定项的权威定义在
+/// `calibration::ITEMS`，**「哪一项存哪个配置字段」也在那里**。
+/// 前端另写一份的话，迟早会出现「界面上有这一项、任务里却读不到」——
+/// 而这种错位**不报任何错**，只表现为某个框永远不起作用。
+#[tauri::command]
+fn list_calibration_plan<R: Runtime>(
+    _app: AppHandle<R>,
+    state: State<'_, AppState<R>>,
+) -> Result<calibration::CalibrationPlan, String> {
+    let config = state.config.lock().map_err(|_| "配置锁已中毒".to_string())?;
+    Ok(calibration::plan(&config))
+}
+
+/// 校验一项界面标定的坐标，**不改任何状态**。
+///
+/// 为什么是纯校验、而不是直接落盘：
+/// 界面是**草稿式**保存的——拖框只改前端草稿，点「保存配置」才写盘。
+/// 若拖一下就写服务端配置，`dirty` 标记与「保存」按钮就都失去意义了
+/// （用户拖一个框配置已经变了，按钮却还亮着"有未保存的改动"）。
+/// 所以这里只回答「这个框合不合法」，配置仍走 `set_runtime_config`。
+///
+/// 校验本身不是可选的：`RegionCanvas` 已经在 0–1 内夹过一遍，但那只保证
+/// **不会越界**，不保证符合编排层的全部要求（最小尺寸等）。
+/// 两条判据都取自 `calibration`，这里只负责把它们串起来——
+/// 判据本身**只有一处**。
+/// 每条工作流需要哪些标定区域，以及**这份（草稿）配置里标了没有**。
+///
+/// ## 为什么由后端算
+///
+/// 「这条工作流需要哪几块」是一个**判据**——装配期就是按它拒绝任务的
+/// （`runtime::required_marks`）。界面自己再列一张表的话，两边不一致时的
+/// 表现是「界面说齐了、点开始却被拒」，而人只会去怀疑标定本身。
+///
+/// ## 为什么参数是配置，而不是读服务端那份
+///
+/// 界面是**草稿式**的：操作者刚把工作流改成搜索式、还没点「保存配置」时，
+/// 他要看的是"我现在这份配置还缺什么"。读服务端那份会答非所问。
+#[tauri::command]
+fn workflow_requirements<R: Runtime>(
+    _app: AppHandle<R>,
+    config: RuntimeConfig,
+) -> Vec<runtime::WorkflowRequirement> {
+    runtime::workflow_requirements(&config)
+}
+
+#[tauri::command]
+fn validate_area_mark<R: Runtime>(
+    _app: AppHandle<R>,
+    key: String,
+    rect: [f32; 4],
+) -> Result<(), String> {
+    if calibration::find_item(&key).is_none() {
+        return Err(format!("未知的标定项「{key}」——它不会被任何流程读到"));
+    }
+    calibration::validate_rect(rect)
+}
+
 /// 「测试图标匹配」的结果。
 ///
 /// 刻意**不是**"成功 / 失败"两态：这是一个标定工具，最有用的是**分数本身**。
@@ -1012,14 +1253,19 @@ pub struct NavIconHit {
 
 /// 在当前画面上试一次图标模板匹配，把**分数和位置**报出来。
 ///
-/// 这是给「先点击导航图标跳转」做标定用的：模板截得对不对、阈值该定多少，
+/// 这是给「先点击导航图标跳转」做标定用的：图标截得对不对、阈值该定多少，
 /// 都只能靠对着真实画面量一次。纯只读——只截屏，不点击、不聚焦、不产生任何输入。
 ///
-/// 参数一律取**草稿**（理由同 `preview_target_window`）：用户刚填好路径还没点保存时，
-/// 按草稿量出来的结果才是他此刻看到的那份配置。
+/// 参数一律取**草稿**（理由同 `preview_target_window`）：用户刚改完还没点保存时，
+/// 按草稿量出来的结果才是他此刻看到的那份配置。图标的载入走的是与任务装配
+/// **同一个函数**，所以这里报出来的分数和任务里真正会用的那些图一致。
+///
+/// `templates` 传的是**图标名**（不是路径）；一个名字底下有几张图就量几张，
+/// 报出来的是其中分数最高的那张。
 #[tauri::command]
 fn probe_nav_icon<R: Runtime>(
     _app: AppHandle<R>,
+    state: State<'_, AppState<R>>,
     window_class: String,
     wecom_exe: Option<String>,
     nav_strip: [f32; 4],
@@ -1044,9 +1290,12 @@ fn probe_nav_icon<R: Runtime>(
         return Err(format!("最低分数必须在 0–1 之间（当前 {min_score}）"));
     }
 
-    // 模板载入与任务装配用的是**同一个函数**：这个按钮报出来的分数必须和任务里
-    // 真正会用的那张图一致，否则标定就白做了。
-    let templates = runtime::load_nav_icon_templates(&templates)?;
+    // 图标载入与任务装配用的是**同一个函数**：这个按钮报出来的分数必须和任务里
+    // 真正会用的那些图一致，否则标定就白做了。
+    //
+    // 目标名传「导航」：这个按钮量的就是导航图标，但它在哪一组（联系人 / 聊天历史）
+    // 由界面选，这里不必猜——报错要人做的事（去图标库补一张）对两组都一样。
+    let templates = runtime::load_nav_icon_templates(&state.icons_dir(), &templates, "导航")?;
 
     #[cfg(windows)]
     {
@@ -1140,9 +1389,13 @@ fn probe_nav_icon<R: Runtime>(
 // 图标库里存的是「从真实画面上框出来的小图标」。它服务的是导航图标那一步：
 // 图标上没有文字，OCR 读不到，只能靠模板匹配。
 //
-// 四个命令分三类：
+// **一个名字底下可以有多张图**（选中 / 未选中 / 带气泡 / 气泡数字不同）——
+// 它们指的是同一个图标，所以配置里引用的是**名字**，不是路径。
 //
-// - **库的管理**（`list_icons` / `delete_icon`）：不碰屏幕，纯文件操作；
+// 五个命令分三类：
+//
+// - **库的管理**（`list_icons` / `delete_icon` / `delete_icon_variant`）：
+//   不碰屏幕，纯文件操作；
 // - **取模板**（`save_icon_from_crop`）：**只读屏幕**，把界面上框出来的那块裁下来存好；
 // - **验证**（`click_icon`）：**会真的点一下**。这是唯一会产生输入事件的命令，
 //   也是唯一一个必须由人明确点下去的——它不在任务流程里，任务走的是编排器。
@@ -1152,7 +1405,7 @@ fn list_icons<R: Runtime>(
     _app: AppHandle<R>,
     state: State<'_, AppState<R>>,
 ) -> Result<Vec<IconEntry>, String> {
-    icon_library::list(&state.data_dir)
+    icon_library::list(&state.icons_dir())
 }
 
 #[tauri::command]
@@ -1161,7 +1414,23 @@ fn delete_icon<R: Runtime>(
     state: State<'_, AppState<R>>,
     name: String,
 ) -> Result<(), String> {
-    icon_library::delete(&state.data_dir, &name)
+    icon_library::delete(&state.icons_dir(), &name)
+}
+
+/// 删除一个图标里的**某一张**图，留下同一个名字下的其他张。
+///
+/// `relative` 是**相对图标库目录**的路径（`list_icons` 带回来的那个，
+/// 形如 `聊天/2.png`）。为什么不直接传绝对路径：这是个删除命令，
+/// 前端传来的字符串不能当路径用——校验在 `icon_library::delete_variant` 里，
+/// 路径由校验过的名字重新拼。
+#[tauri::command]
+fn delete_icon_variant<R: Runtime>(
+    _app: AppHandle<R>,
+    state: State<'_, AppState<R>>,
+    name: String,
+    relative: String,
+) -> Result<(), String> {
+    icon_library::delete_variant(&state.icons_dir(), &name, &relative)
 }
 
 /// 把预览图上框出来的一块换算成**窗口图像坐标系**里的框。
@@ -1225,6 +1494,12 @@ fn window_rect_from_preview(
 /// `rect` 是**预览图坐标系**里的框（`[x, y, w, h]`），`preview` 是那张预览图的像素尺寸。
 /// 两个都要传：光有框没法换算回窗口坐标。
 ///
+/// ## 同一个名字可以反复存
+///
+/// 存第二次不是"重名错误"，而是**给这个图标追加一张变体**（`聊天/1.png`、`2.png`…）。
+/// 同一个图标在选中 / 未选中 / 带气泡时长得不一样，它们指的是同一个图标；
+/// 逼着人给同一件事起四个名字、再在配置里勾四次，漏一次就有一个状态匹配不上。
+///
 /// ## 为什么重新截一张，而不是直接从预览图上裁
 ///
 /// 预览图是缩过的（[`PREVIEW_MAX_WIDTH`] + Triangle 滤波）。从它上面裁出来的模板
@@ -1278,7 +1553,7 @@ fn save_icon_from_crop<R: Runtime>(
             return Err(format!(
                 "窗口尺寸在预览之后变了：预览时 {}×{}，现在是 {}×{}。\
                  框选的坐标是按当时那张图量的，直接换算会落到别的地方——\
-                 请重新点「截取窗口画面」，在**当前**这张图上重新框一次。",
+                 请重新点「截取窗口画面」，在当前这张图上重新框一次。",
                 preview[0],
                 preview[1],
                 scaled.width(),
@@ -1287,7 +1562,7 @@ fn save_icon_from_crop<R: Runtime>(
         }
 
         let rect = window_rect_from_preview(rect, preview, shot.width, shot.height)?;
-        icon_library::save(&state.data_dir, &name, &shot, rect)
+        icon_library::save(&state.icons_dir(), &name, &shot, rect)
     }
     #[cfg(not(windows))]
     {
@@ -1337,6 +1612,7 @@ pub struct IconClickResult {
 #[allow(clippy::too_many_arguments)]
 fn click_icon<R: Runtime>(
     _app: AppHandle<R>,
+    state: State<'_, AppState<R>>,
     window_class: String,
     wecom_exe: Option<String>,
     nav_strip: [f32; 4],
@@ -1374,8 +1650,9 @@ fn click_icon<R: Runtime>(
         return Err(format!("最低分数必须在 0–1 之间（当前 {min_score}）"));
     }
 
-    // 模板载入与任务装配用的是**同一个函数**：这里量到的分数必须就是任务里会用的那个。
-    let templates = runtime::load_nav_icon_templates(&templates)?;
+    // 图标载入与任务装配用的是**同一个函数**：这里量到的分数必须就是任务里会用的那个。
+    // 目标名传「导航」的理由同 `probe_nav_icon`：量的是哪一组由界面选，这里不猜。
+    let templates = runtime::load_nav_icon_templates(&state.icons_dir(), &templates, "导航")?;
 
     #[cfg(windows)]
     {
@@ -1397,7 +1674,7 @@ fn click_icon<R: Runtime>(
             Ok(true) => {}
             Ok(false) => {
                 return Err(
-                    "系统判定目标窗口**没有响应**（界面线程没在取消息）。\
+                    "系统判定目标窗口没有响应（界面线程没在取消息）。\
                      往卡死的窗口里点击不会有任何效果，先看看客户端是不是卡住了。"
                         .to_string(),
                 )
@@ -1430,8 +1707,11 @@ fn click_icon<R: Runtime>(
         // 失败时把"什么都没点"说在最前面：操作者按的是个会真的产生点击的按钮，
         // 他必须先知道这一下有没有落下去。
         let found = vision::TemplateLocator
-            .locate(&strip_shot, &templates, min_score)
-            .map_err(|err| format!("这一次**没有执行任何点击**——先得能确定图标在哪，才谈得上点它：{err}"))?;
+            .locate(
+                &strip_shot,
+                &automation_core::IconQuery::new(&templates, min_score),
+            )
+            .map_err(|err| format!("这一次没有执行任何点击——先得能确定图标在哪，才谈得上点它：{err}"))?;
 
         let hit_screen = found.bounds.to_screen(Point {
             x: strip_screen.x,
@@ -1493,7 +1773,7 @@ fn click_icon<R: Runtime>(
         } else {
             format!(
                 "已点击：模板「{}」分数 {:.3}，点击屏幕 ({}, {})。\
-                 但点击后联系人候选区的画面**没有变化**。两种可能：\
+                 但点击后联系人候选区的画面没有变化。两种可能：\
                  ①界面本来就已经停在这个视图上（正常，上次点完就留在这儿了）；\
                  ②这次点击没有生效（客户端卡住、图标被别的窗口挡住、\
                  或者框到的那块位置根本不响应点击）。\
@@ -1541,7 +1821,9 @@ fn click_icon<R: Runtime>(
 /// 抽成泛型函数的好处是：生产入口用 `Wry`、测试入口用 `MockRuntime`，
 /// 共用同一份命令表，避免"测试跑的命令和线上不是同一批"。
 pub fn with_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
-    builder.invoke_handler(tauri::generate_handler![
+    // 热键状态由 `capture_hotkey::attach` 挂上；「为什么挂在装配点而不是 setup」
+    // 的理由写在那边的文档注释里。
+    capture_hotkey::attach(builder).invoke_handler(tauri::generate_handler![
         start_task,
         list_tasks,
         get_task,
@@ -1551,12 +1833,19 @@ pub fn with_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R
         set_runtime_config,
         preview_target_window,
         pick_target_window,
+        capture_hotkey::register_capture_hotkey,
+        capture_hotkey::unregister_capture_hotkey,
         launch_client,
         record_window_geometry,
+        list_calibration_plan,
+        workflow_requirements,
+        validate_area_mark,
+        prune_stale_marks,
         probe_nav_icon,
         list_icons,
         save_icon_from_crop,
         delete_icon,
+        delete_icon_variant,
         click_icon
     ])
 }
@@ -1575,6 +1864,7 @@ pub fn run() {
                     return Err(err.into());
                 }
             }
+            // 热键状态由 `with_commands` 挂上（生产与测试共用同一个装配点），这里不再重复。
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -1582,88 +1872,4 @@ pub fn run() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 没有缩放时（窗口宽度本来就没超过预览上限）框应当**原样**通过。
-    #[test]
-    fn a_frame_without_scaling_maps_one_to_one() {
-        let rect = window_rect_from_preview([100, 50, 26, 26], [974, 734], 974, 734).unwrap();
-        assert_eq!(
-            (rect.x, rect.y, rect.width, rect.height),
-            (100, 50, 26, 26)
-        );
-    }
-
-    /// 窗口比预览上限宽时，框要按比例放大回原始分辨率。
-    ///
-    /// 这一条盯的是"模板大小必须与真实图标一致"：换算错了，截出来的模板
-    /// 会是图标的一部分或者连着一圈背景，而匹配分数只是"偏低一点"。
-    #[test]
-    fn a_scaled_preview_maps_the_box_back_up() {
-        // 2560x1440 的窗口被缩到 1280x720 做预览 ⇒ 比例 2。
-        let rect = window_rect_from_preview([100, 50, 26, 26], [1280, 720], 2560, 1440).unwrap();
-        assert_eq!((rect.x, rect.y), (200, 100));
-        assert_eq!((rect.width, rect.height), (52, 52));
-    }
-
-    /// 两条边分别取整：宽高不能"用宽度乘比例"算出来，否则会差一个像素。
-    ///
-    /// 用一个必然踩到取整边界的比例（1.5，框宽 1）：
-    ///
-    /// - 分别取整：左边界 `round(1×1.5)=2`、右边界 `round(2×1.5)=3` ⇒ 宽 1（正确，
-    ///   它盖住的正是画面里 `[2, 3)` 这一个像素）；
-    /// - 直接乘：`round(1×1.5)=2` ⇒ 宽 2，多吃了旁边一列像素。
-    ///
-    /// 图标只有二十几个像素，多吃一列就是整条边都带着隔壁的背景。
-    #[test]
-    fn both_edges_are_rounded_independently() {
-        let rect = window_rect_from_preview([1, 1, 1, 1], [100, 60], 150, 90).unwrap();
-        assert_eq!(rect.x, 2);
-        assert_eq!(
-            rect.width, 1,
-            "宽度必须由两条边相减得出，不能直接用宽度乘比例"
-        );
-        assert_eq!(rect.height, 1);
-    }
-
-    /// 越界的框只**平移**进画面，不缩尺寸。
-    ///
-    /// 缩尺寸会把模板改小，而模板大小必须与图标严格一致：改小之后分数会掉下来，
-    /// 且没有任何提示告诉人"是坐标换算把它改小了"。
-    #[test]
-    fn an_out_of_bounds_box_is_shifted_not_shrunk() {
-        // 比例 2，框右边界超出预览宽度 ⇒ 换算后越过画面右边缘。
-        let rect = window_rect_from_preview([1270, 0, 20, 20], [1280, 720], 2560, 1440).unwrap();
-        assert_eq!(rect.width, 40, "尺寸必须保持，不能被缩");
-        assert_eq!(rect.x + rect.width, 2560, "整体平移到贴住右边缘");
-
-        // 负数左边界：夹到 0。比例是 2，所以 40 个预览像素对应 80 个窗口像素——
-        // 尺寸按比例走，夹的只是位置。
-        let rect = window_rect_from_preview([-30, -30, 40, 40], [1280, 720], 2560, 1440).unwrap();
-        assert_eq!((rect.x, rect.y), (0, 0));
-        assert_eq!((rect.width, rect.height), (80, 80));
-    }
-
-    /// 换算后不足一个像素、或者比画面还大的框，一律明确报错。
-    #[test]
-    fn a_degenerate_or_oversized_box_is_refused() {
-        assert!(window_rect_from_preview([0, 0, 0, 0], [1280, 720], 2560, 1440).is_err());
-        assert!(window_rect_from_preview([0, 0, 3000, 20], [1280, 720], 2560, 1440).is_err());
-        // 预览尺寸为 0：说明界面传了个没截过图的空值。
-        assert!(window_rect_from_preview([0, 0, 10, 10], [0, 0], 2560, 1440).is_err());
-    }
-
-    /// 极端输入不能 panic（前端传的是原始 JSON 数字，什么都有可能）。
-    #[test]
-    fn absurd_numbers_are_rejected_without_panicking() {
-        assert!(window_rect_from_preview(
-            [i32::MAX, i32::MAX, i32::MAX, i32::MAX],
-            [1280, 720],
-            2560,
-            1440
-        )
-        .is_err());
-        assert!(window_rect_from_preview([i32::MIN, 0, 10, 10], [1280, 720], 2560, 1440).is_err());
-    }
-}
+mod tests;

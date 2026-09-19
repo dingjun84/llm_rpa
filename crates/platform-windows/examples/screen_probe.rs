@@ -41,6 +41,7 @@ fn main() {
         "list" => list_windows(),
         "pick" => pick(&args),
         "focus" => focus_window(&args),
+        "move" => move_cursor_to(&args),
         "annotate" => annotate(&args),
         "capture" => capture_window(&args),
         "shot" => capture_region_of_window(&args),
@@ -73,15 +74,18 @@ screen_probe —— 真机诊断工具（坐标均为窗口内相对坐标）
   list                                    列出所有可见窗口
   pick [秒数]                             打印光标下的窗口（类名/标题/exe）；给秒数则持续采样
   focus <窗口类名> [exe路径]                只做「接管窗口」：定位 + 带到前台，然后报结果
+  move <标题前缀> <x> <y> [像素/秒]         只把光标沿轨迹移到窗口内某点：不点击、不滚动、不抢前台
+                                        默认 1200 像素/秒。打印光标前后位置，用来确认
+                                        「移动到底有没有发生、走得像不像人」
   annotate <标题前缀> <输出.png> [标定.json]  截图上画出四个区域 + 10% 网格，供人工确认
   capture <标题前缀> <输出.png>            截取整个窗口
   shot <标题前缀> <输出.png> <x> <y> <w> <h>  截取窗口内的一个区域
   printshot <标题前缀> <输出.png>          用 PrintWindow 抓窗口自身画面（能抓到 WebView2 内容）
   template <标题前缀> <输出.png> <x> <y> <w> <h>
-                                        从窗口里裁出一块**图标模板**存成 PNG（供「先点击导航图标跳转」用）
+                                        从窗口里裁出一块图标模板存成 PNG（供「先点击导航图标跳转」用）
                                         并打印可直接粘进配置的路径
   findicon <标题前缀> <模板.png> [最低分] [x y w h]
-                                        在当前画面上按模板匹配找图标，报出**分数与位置**
+                                        在当前画面上按模板匹配找图标，报出分数与位置
                                         搜索区默认用 core 的 DEFAULT_NAV_STRIP；给 x y w h 可临时改
                                         这是标定「模板对不对、阈值定多少」的唯一手段
   click <标题前缀> <x> <y>                 受保护地点击窗口内某点
@@ -177,7 +181,7 @@ fn pick(args: &[String]) -> Result<(), String> {
         };
     }
 
-    println!("采样 {seconds} 秒：把鼠标移到目标窗口上**停住**，不用点击。");
+    println!("采样 {seconds} 秒：把鼠标移到目标窗口上停住，不用点击。");
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut seen: Vec<String> = Vec::new();
     while Instant::now() < deadline {
@@ -585,7 +589,7 @@ fn cut_icon_template(args: &[String]) -> Result<(), String> {
     println!("下一步：把它填进配置，或直接用 findicon 量一次分数——");
     println!("  screen_probe findicon \"{prefix}\" \"{out}\"");
     println!();
-    println!("⚠️ 一个图标在**选中 / 未选中**两种状态下长得不一样。");
+    println!("⚠️ 一个图标在选中 / 未选中两种状态下长得不一样。");
     println!("   如果点完停在这个页面上，下次可能就匹配不上了——");
     println!("   建议把两种状态各截一张，都填进配置。");
     Ok(())
@@ -808,6 +812,44 @@ fn focus_window(args: &[String]) -> Result<(), String> {
     println!(
         "接管成功：类名「{class}」{}x{} @({}, {})，缩放 {scale}",
         window.width, window.height, window.x, window.y
+    );
+    Ok(())
+}
+
+/// 只把光标沿轨迹移到窗口内某点：**不点击、不滚动、不抢前台**。
+///
+/// 存在的理由：`click` / `scroll` 都先要求目标窗口在前台，而"光标能不能走过去、
+/// 走得像不像人"是**另一件事**——这条子命令把它单独拎出来看，不掺别的动作。
+///
+/// 它把光标的前后位置都打出来，因为「移动 API 返回成功、光标却没动」是真实存在
+/// 的情形（前台窗口属于更高完整性的进程等）。两行一样就是没动。
+fn move_cursor_to(args: &[String]) -> Result<(), String> {
+    let prefix = arg(args, 1, "标题前缀")?;
+    let x = number(args, 2, "x")?;
+    let y = number(args, 3, "y")?;
+    let speed = match args.get(4) {
+        Some(raw) => raw
+            .parse::<f64>()
+            .map_err(|_| format!("速度必须是数字（像素/秒），收到「{raw}」"))?,
+        None => WindowsDesktopConfig::default().pointer_speed_px_per_sec,
+    };
+
+    // `locate` 是只读的：不抢前台，所以这条命令在任何窗口上都能跑。
+    let window = locate(&prefix)?;
+    let target = (window.x + x, window.y + y);
+
+    let (from_x, from_y) = winapi::cursor_position()?;
+    winapi::move_cursor(target.0, target.1, speed)?;
+    let (to_x, to_y) = winapi::cursor_position()?;
+
+    println!(
+        "光标 ({from_x}, {from_y}) → ({to_x}, {to_y})；目标 窗口内 ({x}, {y}) = 屏幕 ({}, {})；速度 {speed:.0} 像素/秒",
+        target.0, target.1
+    );
+    println!(
+        "落点偏差：dx={} dy={}（都为 0 才是精确落位；两行坐标完全相同 = 光标根本没动）",
+        to_x - target.0,
+        to_y - target.1
     );
     Ok(())
 }

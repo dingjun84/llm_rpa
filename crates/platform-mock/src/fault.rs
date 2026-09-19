@@ -47,10 +47,19 @@ pub struct MockFaults {
     pub launch: Option<Fault>,
     pub focus: Option<Fault>,
     pub metrics: Option<Fault>,
+    /// 调整窗口尺寸。单独一格：它和 `focus` 是两件事，
+    /// "定位到了但调不动"与"根本定位不到"要能分开测。
+    pub resize: Option<Fault>,
     /// 按调用顺序注入的截图故障；用尽后恢复正常。
     pub capture: std::collections::VecDeque<Fault>,
     pub click: Option<Fault>,
     pub paste: Option<Fault>,
+    /// 逐字输入。与 `paste` 分开：两者是两条不同的输入路径，
+    /// 合成一个的话，"粘贴失败了"与"逐字输入失败了"就分不出来。
+    pub type_text: Option<Fault>,
+    /// 清空输入框。与 `type_text` 分开：清空失败时输入仍然可能成功，
+    /// 而后果是"新词接在旧词后面"——合成一格就测不出这个区别了。
+    pub clear: Option<Fault>,
     pub send: Option<Fault>,
 }
 

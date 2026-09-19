@@ -24,8 +24,19 @@ pub enum VisionError {
     PixelBufferMismatch { expected: usize, actual: usize },
     #[error("图像尺寸无效")]
     InvalidDimensions,
+    /// 编码失败（`encode_png`）等**与某一张模板无关**的图像操作失败。
+    ///
+    /// 模板**读不进来**走 [`VisionError::TemplateUnreadable`]——那条要带上标签，
+    /// 见它的说明。
     #[error("图像编解码失败：{0}")]
     Image(#[from] image::ImageError),
+    /// 这张图标**读不出来**（文件损坏、根本不是图片、扩展名对不上）。
+    ///
+    /// 为什么不复用 [`VisionError::Image`]：一个图标名底下可以有多张图
+    /// （选中 / 未选中 / 带气泡），只说"图像编解码失败"没法告诉人是**哪一张**坏了——
+    /// 而修的时候正是要精确到那一张。尺寸越界的报错一直是带标签的，这里补齐。
+    #[error("图标模板「{label}」读不出来：{reason}")]
+    TemplateUnreadable { label: String, reason: String },
     #[error("裁切区域超出图像范围")]
     CropOutOfBounds,
     #[error(
@@ -55,11 +66,12 @@ impl From<VisionError> for AutomationError {
             VisionError::PixelBufferMismatch { .. }
             | VisionError::InvalidDimensions
             | VisionError::CropOutOfBounds
-            // 模板尺寸不对是**配置问题**，只有人能修：报 NeedsHumanReview
+            // 模板尺寸不对、图读不出来都是**配置问题**，只有人能修：报 NeedsHumanReview
             // 会让任务停下来并说清是哪一张模板、多大、上限多少，
             // 而不是变成一个看起来像"识别不准"的模糊失败。
             | VisionError::TemplateTooSmall { .. }
-            | VisionError::TemplateTooLarge { .. } => AutomationError::NeedsHumanReview(err.to_string()),
+            | VisionError::TemplateTooLarge { .. }
+            | VisionError::TemplateUnreadable { .. } => AutomationError::NeedsHumanReview(err.to_string()),
             other => AutomationError::Platform(other.to_string()),
         }
     }

@@ -20,6 +20,11 @@ dist-ssr/
 # 清空 dist 的动作（见项目记忆第 8 条），所以验证打包时改用这个全新目录。
 dist-verify/
 **/dist-verify/
+
+# ---------- 沙箱改写受阻时的过渡目录 ----------
+# 助手在沙箱里改不动工作区已存在的文件（`ModifyBackup failed: path index collision`），
+# 只能把新版文件写到这里、再由用户手动移到位。属于工具链的临时产物，不入库。
+/_patch/
 .vite/
 *.tsbuildinfo
 *.local
@@ -45,6 +50,9 @@ pnpm-debug.log*
 /evidence/
 /logs/
 *.log
+
+# mem-diag 每次跑都生成一份带时间戳的报告，不进版本库
+tools/mem-diag-*.txt
 
 # ---------- 环境变量与密钥 ----------
 .env

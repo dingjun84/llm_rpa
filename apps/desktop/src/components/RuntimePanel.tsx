@@ -1,15 +1,19 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-import { launchClient, recordWindowGeometry } from "../api";
+import { launchClient, recordWindowGeometry, workflowRequirements } from "../api";
 import {
+  NAV_TARGET_LABELS,
   SCENARIO_LABELS,
+  WORKFLOW_LABELS,
   type DemoScenario,
+  type NavTarget,
   type PickedWindow,
   type RuntimeConfig,
   type RuntimeInfo,
   type RuntimeMode,
+  type Workflow,
+  type WorkflowRequirement,
 } from "../types";
-import { RegionCalibration } from "./RegionCalibration";
 import { WindowPicker } from "./WindowPicker";
 
 interface Props {
@@ -40,6 +44,14 @@ const MODE_LABELS: Record<RuntimeMode, string> = {
 };
 
 /**
+ * 工作流下拉的顺序：**按"离能发消息还有多远"排**，不是按字母序。
+ *
+ * 第一个是默认值，也是操作者当下要的那条路；「只做导航」放在最后——
+ * 它是**排查工具**，不是日常要跑的任务。
+ */
+const WORKFLOWS: Workflow[] = ["search_contact", "scroll_list_contact", "navigate_only"];
+
+/**
  * 比例输入（0–1）的取值。
  *
  * 输入框清空或内容不是数字时**保留原值**，不要退回 0：
@@ -60,6 +72,41 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
   /** 「记录窗口尺寸」的结果提示（成功或失败）。 */
   const [measureNotice, setMeasureNotice] = useState<string | null>(null);
   const [measuring, setMeasuring] = useState(false);
+  /** 当前工作流需要哪些标定区域（**后端**算好下发，这里只渲染）。 */
+  const [requirement, setRequirement] = useState<WorkflowRequirement | null>(null);
+
+  /**
+   * 标定结果的一个**稳定签名**，用来当刷新依赖。
+   *
+   * 直接依赖 `draft` 会让每次按键都去问一遍后端；而只有「工作流改了」
+   * 或「标定结果变了」才会改变答案。用 JSON 串而不是对象本身：
+   * `area_marks` 每次 `onPatch` 都会换一个新对象，按引用比会一直不相等。
+   */
+  const marksSignature = JSON.stringify(draft.area_marks ?? {});
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const all = await workflowRequirements(draft);
+        if (cancelled) return;
+        setRequirement(all.find((item) => item.workflow === draft.workflow) ?? null);
+      } catch {
+        // 问不到就**不显示**这条提示。
+        //
+        // 它只是"点开始之前先提醒一句"，真正的判据在装配期（后端会拒绝并列出
+        // 缺哪几块）。为了它弹一个错误，反而会盖住页面上真正的问题。
+        if (!cancelled) setRequirement(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // 只在这两项变了才重问：答案只取决于它们。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft.workflow, marksSignature]);
+
+  const missingMarks = requirement?.required.filter((item) => !item.marked) ?? [];
 
   const update = <K extends keyof RuntimeConfig>(key: K, value: RuntimeConfig[K]) => {
     onPatch({ [key]: value } as Partial<RuntimeConfig>);
@@ -117,10 +164,14 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
 
   // 界面上显示的是 `draft`（草稿），而 `start_task` 读的是**已保存的** `state.config`
   // （见 `lib.rs::start_task`）。两者不一致时，光看界面会以为改动已经生效——
-  // 必须明说。否则"我明明切到真实模式了"会变成一次误判：
-  // 以为在跑真实模式，实际按演练模式跑完，还什么都没发生。
+  // 必须明说，而且要说清**现在真正生效的是什么**。
+  //
+  // ⚠️ 这里**不逐项列"哪些字段改了"**：那是一份会漂移的清单，漏掉一项就正好漏掉
+  // 最要命的那一项。原来只有「模式」有提示，工作流就没有——于是"我明明把工作流
+  // 切到列表式了"变成了三次都在跑搜索式，而日志里当时连工作流都没记。
+  // 所以判据是**草稿与已保存不一致**（`dirty`），提示里报出已保存那份的
+  // 模式与工作流（这两个决定任务会怎么跑），值一律取自后端下发的 `info.config`。
   const effectiveMode = info.config.mode;
-  const modePending = draft.mode !== effectiveMode;
 
   return (
     <section className="panel">
@@ -133,13 +184,19 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
         {info.notice}
       </p>
 
-      {modePending && (
+      {dirty && (
         <p className="notice notice-warn">
-          模式已经改成「{MODE_LABELS[draft.mode]}」，但<strong>还没保存</strong>——
-          现在点「开始任务」仍然按「{MODE_LABELS[effectiveMode]}」执行。
+          界面上的配置有改动，<strong>还没保存</strong>——现在点「开始任务」用的仍然是
+          已保存的那一份：模式「{MODE_LABELS[effectiveMode]}」、工作流「
+          {WORKFLOW_LABELS[info.config.workflow]}」。
           要让改动生效，点最下面的「保存配置」。
         </p>
       )}
+
+      {/* 启动时那次一次性数据搬迁的结果（旧版把配置与图标库放在 AppData 里）。
+          有值就一定要显示：搬成功了用户会疑惑"配置怎么突然有值了"，
+          搬失败了会以为"数据丢了"——两种都得有答案。 */}
+      {info.migration_note && <p className="notice notice-warn">{info.migration_note}</p>}
 
       <label className="field">
         <span className="field-label">模式</span>
@@ -175,6 +232,78 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
             选一个失败场景，可以直观看到"不确定就不发送"的收敛结果。
           </span>
         </label>
+      )}
+
+      {/* ── 工作流 ──────────────────────────────────────────────────
+          它和「运行模式」是两件事：模式决定"怎么执行"（替身还是真桌面），
+          工作流决定"做哪一件事"。所以放在模式下面、标定之前——
+          它决定了后面哪些区域是必须的。 */}
+      <label className="field">
+        <span className="field-label">工作流</span>
+        <select
+          value={draft.workflow}
+          onChange={(event) => update("workflow", event.target.value as Workflow)}
+        >
+          {WORKFLOWS.map((workflow) => (
+            <option key={workflow} value={workflow}>
+              {WORKFLOW_LABELS[workflow]}
+            </option>
+          ))}
+        </select>
+        <span className="field-hint">
+          三条路<strong>看的是不同的界面</strong>，而它们的失败现象一模一样
+          （都是「找不到联系人」），所以必须显式选，不能自动判断——
+          选错了，现场就分不清是"搜索没生效"还是"列表里真的没有这个人"。
+        </span>
+      </label>
+
+      {draft.workflow === "navigate_only" && (
+        <label className="field">
+          <span className="field-label">要点哪一个图标</span>
+          <select
+            value={draft.nav_target}
+            onChange={(event) => update("nav_target", event.target.value as NavTarget)}
+          >
+            {(Object.keys(NAV_TARGET_LABELS) as NavTarget[]).map((target) => (
+              <option key={target} value={target}>
+                {NAV_TARGET_LABELS[target]}
+              </option>
+            ))}
+          </select>
+          <span className="field-hint">
+            两个图标各有各的模板组，在「图标库」页分别勾。
+            这一条工作流<strong>不查找任何人</strong>，只用来看图标匹配准不准——
+            混在完整流程里时，点错图标的症状会表现为「找不到联系人」，
+            排查方向会一路偏向 OCR。
+          </span>
+        </label>
+      )}
+
+      {/* 这条工作流还缺哪几块标定。判据在后端，这里只渲染它算出来的结果——
+          前端自己列一张表的话，两边不一致时的表现是
+          「界面说齐了、点开始却被拒」，而人只会去怀疑标定本身。 */}
+      {requirement && requirement.required.length > 0 && (
+        <p className={missingMarks.length > 0 ? "notice notice-warn" : "notice"}>
+          「{requirement.label}」需要标定：{" "}
+          {requirement.required.map((item, index) => (
+            <span key={item.key}>
+              {index > 0 && "、"}
+              <strong className={item.marked ? undefined : "missing-mark"}>
+                {item.label}
+                {item.marked ? "" : "（还没标）"}
+              </strong>
+            </span>
+          ))}
+          。到「界面标定」页把没标的框出来——
+          {missingMarks.length > 0 ? (
+            <>
+              现在点「开始任务」会在<strong>装配期</strong>被直接拒绝
+              （不会在任务列表里留下记录）。
+            </>
+          ) : (
+            <>这几块都已经标好了。</>
+          )}
+        </p>
       )}
 
       {/* 下面这一组是**配置**，刻意不放在「模式」分支里。
@@ -245,8 +374,8 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
           />
           <span className="field-hint">
             定位目标窗口按类名匹配；填了上面的可执行文件路径时，会同时校验窗口属于该程序。
-            点「指认窗口」会自动填入；下面的「截图并标注」也用这个值去截窗口，
-            改完不用保存就能直接截图看效果。
+            点「指认窗口」会自动填入。「界面标定」页截图用的也是这个值，
+            改完不用保存就能直接切过去截图看效果。
           </span>
         </label>
 
@@ -265,13 +394,13 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
             <span className="field-hint">
               已记录 <strong>{draft.calibrated_window.width}×{draft.calibrated_window.height}</strong>
               {" "}@({draft.calibrated_window.x}, {draft.calibrated_window.y})，缩放{" "}
-              {draft.calibrated_window.scale_factor}。任务只在<strong>这个尺寸</strong>下运行；
-              位置不校验，窗口挪到哪儿都行。
+              {draft.calibrated_window.scale_factor}。任务只在<strong>这个尺寸</strong>下运行：
+              尺寸对不上会先把窗口调回这个尺寸，调不动才转人工；位置不校验，窗口挪到哪儿都行。
             </span>
           ) : (
             <span className="field-hint">
-              还没有记录。真实模式必须先点这个按钮——任务只在标定时的窗口尺寸下运行，
-              尺寸对不上会直接转人工，不会按错的尺寸去点。
+              还没有记录。真实模式必须先点这个按钮——任务只在标定时的窗口尺寸下运行：
+              尺寸对不上会先把窗口调回来，客户端的最小尺寸不允许时才会转人工。
             </span>
           )}
           {measureNotice && <p className="notice">{measureNotice}</p>}
@@ -294,17 +423,14 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
 
       </section>
 
-      <RegionCalibration
-        regions={draft.regions}
-        onChange={(regions) => update("regions", regions)}
-        disabled={busy}
-        windowClass={draft.window_class}
-        wecomExe={draft.wecom_exe}
-      />
+      {/* 四个区域（列表区 / 对话标题 / 对话内容 / 输入框）只在「界面标定」页标：
+          那里是"截一张图、在图上框一块"，每一块按它所在的界面分场景列出、带编号和提示。
+          这里原来还有一份"填个数字、看一眼框"的旧版面板，改的是**同一份配置**，
+          留着只会让人不知道该信哪一边，已经删掉。 */}
 
       {/* 导航图标那一组（开关 / 模板 / 阈值 / 搜索区）在「图标库」页。
-          它的操作方式是"截一张图、在图上框一个图标、起名字"，和这里
-          "填个数字、看一眼框"是两回事，混在一起两边都别扭。 */}
+          它的操作方式是"截一张图、在图上框一个图标、起名字"，
+          和界面标定那种"框一块区域"是两回事，混在一起两边都别扭。 */}
 
       <div className="field">
         <span className="field-label">超时（毫秒 / 秒）</span>
@@ -429,6 +555,8 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
           </label>
         </div>
         <span className="field-hint">
+          <strong>只对「列表扫描式」那条工作流生效</strong>——搜索式看的是顶部
+          联想下拉，不滚这个列表。下面这些旋钮就是那条路要用的：
           目标不在当前可见范围时，会在联系人候选区向下滚动继续找。
           列表按「最近有消息」排序，扫描期间到达的新消息会把目标顶到最上面，
           而那一屏早被翻过去了——所以扫完一轮会<strong>回到顶部再扫一轮</strong>。
@@ -531,6 +659,10 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
           <span className="field-hint">
             打开后流程走到「准备消息」就结束：把正文填进输入框，<strong>绝不发送</strong>。
             用来验证"定位联系人 + 输入文字"是否准确，不会给对方造成任何影响。
+            <br />
+            <strong>搜索式工作流不受这个开关控制</strong>：它还没接发送那一段，
+            所以<strong>一定</strong>停在「已填入正文，未发送」——不会申请发送台账，
+            也不会写消息摘要，审计里不会留下任何"像发过了"的痕迹。
           </span>
         </span>
       </label>
@@ -562,6 +694,66 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
         />
       </label>
 
+      {/* ── 逐字输入与靶标文字 ──────────────────────────────────────
+          这两类值都是"随客户端版本变"的，所以做成配置而不是写死在代码里。
+          它们合在一起是因为**改动理由相同**：换一个靶标（或客户端升级）时，
+          要动的就是这几个字与这个间隔。 */}
+      <section className="calibration">
+        <div className="calibration-head">
+          <h3>逐字输入与靶标文字</h3>
+        </div>
+
+        <label className="field">
+          <span className="field-label">逐字输入间隔（毫秒）</span>
+          <input
+            type="number"
+            min={0}
+            step={5}
+            value={draft.typing_interval_ms}
+            onChange={(event) =>
+              update("typing_interval_ms", Math.max(0, Math.round(Number(event.target.value) || 0)))
+            }
+          />
+          <span className="field-hint">
+            搜索词与消息正文都是<strong>逐字</strong>输入的，这是字符之间的间隔
+            （<code>0</code> = 不留间隔）。搜索框是联想式的：一次性灌进去的字符
+            会让联想请求互相打断，下拉列表只按第一个字符的结果定格——
+            现象是"搜出来的东西不对"，不会让人想到是<strong>输入太快</strong>。
+            机器慢就调大，嫌慢就调小。
+          </span>
+        </label>
+
+        <label className="field">
+          <span className="field-label">资料页「进入聊天」入口的文字</span>
+          <input
+            type="text"
+            value={draft.profile_chat_entry_text}
+            onChange={(event) => update("profile_chat_entry_text", event.target.value)}
+          />
+          <span className="field-hint">
+            资料页滚到底之后要点的那个入口上写的字（默认「发消息」）。
+            这一项<strong>不能留空</strong>：空文字在「包含」判断里会匹配到任何一行，
+            结果不是"找不到"而是<strong>找错</strong>。找不到时任务会转人工并说明原因。
+          </span>
+        </label>
+
+        <label className="field">
+          <span className="field-label">搜索下拉里「联系人」分组的标题</span>
+          <input
+            type="text"
+            value={draft.search_contact_group_label}
+            onChange={(event) => update("search_contact_group_label", event.target.value)}
+          />
+          <span className="field-hint">
+            下拉是<strong>分组</strong>的（联系人 / 聊天记录 / 群聊…），
+            只有「联系人」这一组下面才是人。编排时会先找这个标题，
+            再<strong>只往它下方</strong>找匹配输入词的那一行——
+            否则会把「聊天记录里提到这个名字」当成联系人，点进去就是别的地方。
+            同样不能留空。
+          </span>
+        </label>
+      </section>
+
       <button className="primary" disabled={busy || !canSave} onClick={onSave}>
         {!canSave ? "标定不合法，无法保存" : dirty ? "保存配置" : "已保存"}
       </button>
@@ -577,6 +769,15 @@ export function RuntimePanel({ info, draft, onPatch, onSave, dirty, canSave, bus
         <dt>审计记录</dt>
         <dd>{info.audit_entry_count} 条</dd>
       </dl>
+      <p className="field-hint">
+        数据目录是<strong>程序运行当前路径</strong>下的 <code>data/</code>，
+        配置、图标库、任务日志、证据图都在里面，整个目录可以整体拷走。
+        因为它是相对路径，<strong>换个目录启动程序它就会跟着变</strong>——
+        双击 <code>target\debug\desktop.exe</code> 启动的话，数据目录是
+        <code>target\debug\data\</code>，而 <code>cargo clean</code> 会把它一起删掉。
+        想固定位置，就在你想让数据落地的目录里启动它（仓库里带了
+        <code>run.cmd</code>，它先切到仓库根目录再启动）。
+      </p>
     </section>
   );
 }

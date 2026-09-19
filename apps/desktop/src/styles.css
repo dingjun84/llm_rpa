@@ -206,6 +206,14 @@ button.ghost {
   border: 1px solid #fde68a;
 }
 
+/* 「这一块还没标定」。
+   它不是错误（还没标是**如实**的状态），但必须在"点开始之前"被看见——
+   装配期会拒绝，而那时人已经点过一次了。所以用告警色加重，不用报错红。 */
+.missing-mark {
+  color: var(--warn);
+  text-decoration: underline dotted;
+}
+
 .meta-list {
   display: grid;
   grid-template-columns: 84px 1fr;
@@ -877,9 +885,10 @@ button.ghost {
   gap: 8px;
 }
 
+/* 一行 = 一个图标：名字在左，它底下的**全部变体**排在中间，动作在右。 */
 .icon-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
   padding: 8px 10px;
   border: 1px solid var(--border);
@@ -887,10 +896,59 @@ button.ghost {
   background: #fff;
 }
 
-/* 文件坏了（尺寸越界、编码损坏）要一眼看得出来：它会让任务在装配期直接失败。 */
+/* 有一个变体读不出来（尺寸越界、编码损坏）就要一眼看得出来：
+   它会让任务在装配期直接失败。 */
 .icon-row.is-broken {
   border-color: #f3c2c0;
   background: #fef7f7;
+}
+
+/* 一个名字底下的全部变体。会换行——补到七八张时一行放不下。 */
+.icon-variants {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.icon-variant {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  position: relative;
+}
+
+.icon-variant.is-broken .icon-thumb {
+  border-color: #f3c2c0;
+  background: #fef7f7;
+}
+
+.icon-variant-meta {
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.2;
+}
+
+/* 「删除这张」要小、要轻：它只丢一张，重截一张的成本很低。
+   删**整组**才是重动作，那个按钮在右边、要两下。 */
+.icon-variant-remove {
+  font-size: 10px !important;
+  padding: 1px 6px !important;
+  line-height: 1.4;
+}
+
+/* 坏在哪：贴在缩略图下面，够窄就换行，别把整行撑开。 */
+.icon-variant-problem {
+  max-width: 140px;
+  font-size: 10px;
+  color: var(--bad);
+  line-height: 1.25;
+  text-align: center;
 }
 
 .icon-thumb {
@@ -916,8 +974,8 @@ button.ghost {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  min-width: 0;
-  flex: 1 1 auto;
+  min-width: 96px;
+  flex: 0 0 auto;
 }
 
 .icon-name {

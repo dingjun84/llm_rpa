@@ -44,10 +44,22 @@ pub struct MockDesktop {
     scroll_bottom: AtomicI32,
     screen_version: AtomicU32,
     send_count: AtomicU32,
+    /// 模拟客户端自己的最小窗口尺寸。
+    ///
+    /// 请求比它小的尺寸时**被夹到它**，而调用照样"成功"——真实的
+    /// `SetWindowPos` 就是这样：报成功，窗口却没变成你要的尺寸。
+    /// "调完必须再量一遍"这条判据就是靠它才测得出来。
+    min_window_size: Mutex<Option<(i32, i32)>>,
     pub clicks: Mutex<Vec<Point>>,
     pub pasted: Mutex<Vec<String>>,
+    /// 逐字输入过的文本（按调用顺序）。与 `pasted` 分开记：
+    /// "走的是粘贴还是逐字"本身就是被测的行为，混在一起就验不出来了。
+    pub typed: Mutex<Vec<String>>,
     /// 每次滚动的位置与格数。`notches > 0` 表示向下滚。
     pub scrolls: Mutex<Vec<(Point, i32)>>,
+    /// 每次**请求**调整到的窗口尺寸（按调用顺序）。记的是请求值而不是结果值：
+    /// "有没有去调"和"调成了没有"是两条不同的判据，结果值在 `window()` 里。
+    pub resizes: Mutex<Vec<(i32, i32)>>,
     pub focus_calls: AtomicU32,
 }
 
@@ -73,15 +85,26 @@ impl MockDesktop {
             scroll_bottom: AtomicI32::new(DEFAULT_SCROLL_BOTTOM),
             screen_version: AtomicU32::new(0),
             send_count: AtomicU32::new(0),
+            min_window_size: Mutex::new(None),
             clicks: Mutex::new(Vec::new()),
             pasted: Mutex::new(Vec::new()),
+            typed: Mutex::new(Vec::new()),
             scrolls: Mutex::new(Vec::new()),
+            resizes: Mutex::new(Vec::new()),
             focus_calls: AtomicU32::new(0),
         }
     }
 
     pub fn set_window(&self, window: Rect) {
         *self.window.lock().unwrap() = window;
+    }
+
+    /// 模拟客户端的最小窗口尺寸：请求比它小的尺寸会被**夹到它**，调用照样成功。
+    ///
+    /// 用途是测「自动调整没生效」那条分支——真实客户端（微信）确实有最小尺寸，
+    /// 标定值比它小的时候就会这样。
+    pub fn set_min_window_size(&self, min: (i32, i32)) {
+        *self.min_window_size.lock().unwrap() = Some(min);
     }
 
     pub fn window(&self) -> Rect {
@@ -148,6 +171,15 @@ impl MockDesktop {
 
     pub fn pasted_texts(&self) -> Vec<String> {
         self.pasted.lock().unwrap().clone()
+    }
+
+    /// 逐字输入过的文本，按先后顺序。
+    ///
+    /// 与 [`Self::pasted_texts`] 分开记：粘贴和逐字输入是**两条不同的输入路径**，
+    /// 混在一起时，"搜索框那一次到底走的是哪条路"就分不出来了——
+    /// 而搜索框必须逐字敲才会触发联想，用粘贴的话下拉根本不弹。
+    pub fn typed_texts(&self) -> Vec<String> {
+        self.typed.lock().unwrap().clone()
     }
 
     /// 已发生的滚动次数。
@@ -219,6 +251,24 @@ impl DesktopPlatform for MockDesktop {
             }
             None => Ok(self.window()),
         }
+    }
+
+    fn resize_wecom(&self, width: i32, height: i32) -> Result<Rect, AutomationError> {
+        if let Some(fault) = self.faults.lock().unwrap().resize.take() {
+            return Err(fault.into_error());
+        }
+        self.resizes.lock().unwrap().push((width, height));
+        self.record("resize");
+        // 客户端自己的最小尺寸会把请求夹住，而调用照样"成功"——真实
+        // `SetWindowPos` 就是这个行为，也是"调完必须再量一遍"的来源。
+        let (width, height) = match *self.min_window_size.lock().unwrap() {
+            Some((min_width, min_height)) => (width.max(min_width), height.max(min_height)),
+            None => (width, height),
+        };
+        let mut window = self.window.lock().unwrap();
+        window.width = width;
+        window.height = height;
+        Ok(*window)
     }
 
     fn screen_metrics(&self) -> Result<ScreenMetrics, AutomationError> {
@@ -296,6 +346,29 @@ impl DesktopPlatform for MockDesktop {
         }
         self.record("paste");
         self.pasted.lock().unwrap().push(text.to_string());
+        Ok(())
+    }
+
+    fn type_text(&self, text: &str, expected_window: Rect) -> Result<(), AutomationError> {
+        if let Some(fault) = self.faults.lock().unwrap().type_text.take() {
+            return Err(fault.into_error());
+        }
+        if expected_window != self.window() {
+            return Err(AutomationError::ScreenChanged);
+        }
+        self.record("type");
+        self.typed.lock().unwrap().push(text.to_string());
+        Ok(())
+    }
+
+    fn clear_text_field(&self, expected_window: Rect) -> Result<(), AutomationError> {
+        if let Some(fault) = self.faults.lock().unwrap().clear.take() {
+            return Err(fault.into_error());
+        }
+        if expected_window != self.window() {
+            return Err(AutomationError::ScreenChanged);
+        }
+        self.record("clear");
         Ok(())
     }
 

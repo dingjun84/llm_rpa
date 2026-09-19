@@ -27,6 +27,17 @@ const CLIPBOARD_SETTLE_FALLBACK: Duration = Duration::from_millis(200);
 /// 这点容差拦不住，也不该拦。
 const CURSOR_LANDING_TOLERANCE_PX: i32 = 2;
 
+/// 「全选」与「删除」两次按键之间的间隔。
+///
+/// 取 120ms 而不是 0：全选是目标程序要**处理并应用**的一次动作（把选区建立起来），
+/// 随后的 Delete 才会删掉整段而不是一个字符。两次按键之间不留间隔时，
+/// 删除有可能赶在选区建立之前到达——症状是"只删掉一个字"，而残留的旧词
+/// 会让后面的联想结果跑偏，看不出是**清空没做干净**。
+///
+/// 这个值与本仓库诊断工具 `screen_probe clear-input` 手工验证时用的是同一个
+/// （点击 → 等 250ms → Ctrl+A → 等 120ms → Delete），在真实客户端上实测可用。
+const CLEAR_KEY_GAP: Duration = Duration::from_millis(120);
+
 /// 真实平台实现。
 ///
 /// 不注入、不 Hook、不读取其他进程内存；所有输入操作都先校验前台窗口。
@@ -319,6 +330,22 @@ impl DesktopPlatform for WindowsDesktop {
         Ok(rect)
     }
 
+    fn resize_wecom(&self, width: i32, height: i32) -> Result<Rect, AutomationError> {
+        // 非法尺寸要**报错**，不能"夹到某个最小值"接着调：那等于把标定记录里的
+        // 错误值悄悄改成一个别的值，而调用方会以为窗口已经回到了标定尺寸。
+        if width <= 0 || height <= 0 {
+            return Err(AutomationError::NeedsHumanReview(format!(
+                "标定记录的窗口尺寸不合法（{width}×{height}），不能拿它去调整窗口。\
+                 请重新点「记录窗口尺寸」并保存配置。"
+            )));
+        }
+        // 用 `current_target()` 而不是重新 `locate()`：目标窗口是 `focus_wecom`
+        // 已经确定好的那一个，重定位有可能选中同类的另一个窗口（Qt 系程序所有
+        // 顶层窗口共用同一个类名），那就调到别的窗口上去了。
+        let hwnd = self.current_target()?;
+        winapi::resize_window(hwnd, width, height).map_err(AutomationError::Platform)
+    }
+
     fn screen_metrics(&self) -> Result<ScreenMetrics, AutomationError> {
         let (width, height) = winapi::primary_screen_size();
         if width == 0 || height == 0 {
@@ -357,10 +384,15 @@ impl DesktopPlatform for WindowsDesktop {
     }
 
     fn guarded_click(&self, target: Point, expected_window: Rect) -> Result<(), AutomationError> {
-        self.verify_guard(expected_window)?;
-        winapi::move_cursor(target.x, target.y).map_err(AutomationError::Platform)?;
+        let hwnd = self.verify_guard(expected_window)?;
+        winapi::move_cursor(target.x, target.y, self.config.pointer_speed_px_per_sec)
+            .map_err(AutomationError::Platform)?;
         // 移动后再次确认前台窗口没有被抢走。
         self.verify_guard(expected_window)?;
+        // 再确认光标**真的到了**。滚动那条路一直有这道校验，点击这条路原先漏了：
+        // 移动被系统静默忽略时，这次点击会落到光标实际停着的地方——在客户端里
+        // 就是**点到了别的按钮上**，而"点错了"比"没点到"难查得多。
+        self.ensure_cursor_over_target(target, hwnd)?;
         winapi::left_click().map_err(AutomationError::Platform)
     }
 
@@ -381,7 +413,8 @@ impl DesktopPlatform for WindowsDesktop {
         if notches == 0 {
             return Ok(());
         }
-        winapi::move_cursor(at.x, at.y).map_err(AutomationError::Platform)?;
+        winapi::move_cursor(at.x, at.y, self.config.pointer_speed_px_per_sec)
+            .map_err(AutomationError::Platform)?;
         // 移动后再次确认前台窗口没有被抢走，再真正滚动。
         // 这次只看"有没有被抢走"，句柄不另取——`current_target()` 在一次运行内不会变。
         self.verify_guard(expected_window)?;
@@ -417,6 +450,40 @@ impl DesktopPlatform for WindowsDesktop {
             let _ = winapi::clear_clipboard();
         }
         result
+    }
+
+    fn type_text(&self, text: &str, expected_window: Rect) -> Result<(), AutomationError> {
+        self.verify_guard(expected_window)?;
+        winapi::send_unicode_text(text, self.config.typing_interval)
+            .map_err(AutomationError::Platform)?;
+        // 输入完之后**再确认一次**前台窗口没被抢走。
+        //
+        // 逐字输入是一个**持续几百毫秒**的动作，不像点击那样是一次瞬时事件：
+        // 中途被别的窗口（弹窗、通知、用户自己切了一下）抢走焦点的话，
+        // 后半段字符会敲进那个窗口里——而调用方从返回值上完全看不出来。
+        //
+        // 这一道**挡不住**中途被抢（那需要逐字符检查），它只保证
+        // "结束时的状态是已知的"：真的被抢了，这里会如实报错，
+        // 而不是让一次敲错地方的输入看起来完全正常。
+        self.verify_guard(expected_window).map(|_| ())
+    }
+
+    fn clear_text_field(&self, expected_window: Rect) -> Result<(), AutomationError> {
+        self.verify_guard(expected_window)?;
+
+        // 先等焦点落定。调用方刚刚点过这个控件，但"点到了"和"键盘焦点已经
+        // 进到里面"是两件事：后者要等目标程序的消息循环处理完那次点击。
+        // 不等的话，下面这几个按键会敲进上一个有焦点的控件里，而
+        // `SendInput` 照样返回成功——错误要过一会儿才以别的面目出现。
+        std::thread::sleep(self.config.focus_settle_timeout);
+
+        winapi::send_ctrl_a().map_err(AutomationError::Platform)?;
+        std::thread::sleep(CLEAR_KEY_GAP);
+        winapi::send_delete().map_err(AutomationError::Platform)?;
+
+        // 与 `type_text` 同一个道理：清空是一串按键，中途被抢走焦点的话
+        // 后半段会敲到别处。这一道保证"结束时的状态是已知的"。
+        self.verify_guard(expected_window).map(|_| ())
     }
 
     fn send_message_shortcut(&self, expected_window: Rect) -> Result<(), AutomationError> {

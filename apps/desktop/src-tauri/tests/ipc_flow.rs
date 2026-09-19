@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use automation_core::TaskState;
 use base64::Engine as _;
 use desktop_lib::runtime::{DemoScenario, RuntimeConfig, RuntimeMode};
+use automation_core::Workflow;
 use desktop_lib::{AppState, TaskView, EVENT_TASK_UPDATED};
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -87,12 +88,19 @@ impl Harness {
     ///
     /// 配置不是直接塞进内存，而是**先写成 `config.json` 再启动**，
     /// 这样顺带验证了配置的读取路径。
+    ///
+    /// 工作流显式选**列表扫描式**：应用层的默认值已经是**搜索式**，而搜索式
+    /// 要求先标好三块只有对着真实窗口框一次才知道在哪儿的区域。这些用例演的是
+    /// 「任务能不能一路跑到底」与各类失败收敛，与走哪条路无关；
+    /// 沿用默认值会让它们全部卡在"缺标定区域"上，而那条报错看起来像是流程坏了。
+    /// 搜索式那条路另有专门的用例，见本文件末尾。
     fn new(tag: &str, scenario: DemoScenario) -> Self {
         Self::with_config(
             tag,
             RuntimeConfig {
                 mode: RuntimeMode::DryRun,
                 demo_scenario: scenario,
+                workflow: Workflow::ScrollListContact,
                 // 确认窗口收紧到 5 秒，让"确认过期"这类用例不必真的等一分钟。
                 confirmation_ttl_secs: 5,
                 ..Default::default()
@@ -241,8 +249,18 @@ fn a_dry_run_task_travels_the_full_happy_path_through_ipc() {
     assert!(!id.is_empty(), "start_task 应返回任务 ID");
 
     // 刚创建时应停在 Draft，且已经进入等待确认之前的步骤。
+    //
+    // ⚠️ 判据里**必须带上 `awaiting_confirmation`**，不能只等状态。
+    // 编排层是**两步**做的：先 `advance(AwaitingHumanConfirmation)`（这一步就会推送一次
+    // 视图，而那时确认请求还没登记，`is_pending` 还是 false），再 `confirm_send()`
+    // 登记请求。只等状态的话，`wait_until` 可能正好取到那两步之间的快照，
+    // 断言就会偶发失败——只在整轮并行（`-j 2`）时才撞得上，单跑必过。
+    //
+    // 界面不受这个窗口影响：它靠 `task://confirmation-requested` 弹确认框，
+    // 而那个事件是在 `slots.insert()` **之后**才发的。所以这是测试的判据问题，
+    // 不是程序的 bug——**别去改编排层的顺序**。
     let pending = harness.wait_until(&id, "进入等待人工确认", |view| {
-        view.state == TaskState::AwaitingHumanConfirmation
+        view.state == TaskState::AwaitingHumanConfirmation && view.awaiting_confirmation
     });
     assert!(pending.awaiting_confirmation, "等待确认时应置位 awaiting_confirmation");
     assert_eq!(pending.external_contact_name, "张三");
@@ -787,20 +805,20 @@ fn probe_nav_icon_validates_its_arguments_before_touching_the_screen() {
     );
     assert!(message.contains("窗口类名"), "应指出类名为空：{message}");
 
-    // 比例越界：必须在读模板之前就拦下。
+    // 比例越界：必须在读图标之前就拦下。
     let message = harness.err(
         "probe_nav_icon",
         json!({
             "windowClass": "Progman",
             "wecomExe": null,
             "navStrip": [0.0, 0.0, 1.5, 1.0],
-            "templates": ["Z:/definitely/missing.png"],
+            "templates": ["根本不存在的图标"],
             "minScore": 0.8,
         }),
     );
     assert!(
         message.contains("导航图标搜索区"),
-        "比例越界应先于模板载入被拦下：{message}"
+        "比例越界应先于图标载入被拦下：{message}"
     );
 
     // 阈值越界。
@@ -810,17 +828,17 @@ fn probe_nav_icon_validates_its_arguments_before_touching_the_screen() {
             "windowClass": "Progman",
             "wecomExe": null,
             "navStrip": [0.0, 0.0, 0.08, 1.0],
-            "templates": ["Z:/definitely/missing.png"],
+            "templates": ["根本不存在的图标"],
             "minScore": 1.4,
         }),
     );
     assert!(message.contains("0–1"), "应指出阈值越界：{message}");
 }
 
-/// 一张模板都没配时，必须明确报错而不是返回"没找到图标"。
+/// 一个图标都没配时，必须明确报错而不是返回"没找到图标"。
 ///
-/// 这两者的区别很关键：`hit: null` 意味着"模板都对不上"，
-/// 而"一张模板都没配"是**配置缺失**——界面要提示用户去截一张图，
+/// 这两者的区别很关键：`hit: null` 意味着"图标都对不上"，
+/// 而"一个图标都没配"是**配置缺失**——界面要提示用户去截一张图，
 /// 不是让他去调阈值。
 #[test]
 fn probe_nav_icon_refuses_an_empty_template_list() {
@@ -837,46 +855,68 @@ fn probe_nav_icon_refuses_an_empty_template_list() {
         }),
     );
     assert!(
-        message.contains("没有配置任何图标模板"),
-        "空模板列表要报配置缺失：{message}"
+        message.contains("没有配置「导航」图标的模板"),
+        "空列表要报配置缺失，并说清是哪一组：{message}"
+    );
+    assert!(
+        message.contains("图标库"),
+        "要告诉人下一步去哪配：{message}"
     );
 }
 
-/// 模板文件不存在 / 尺寸不可用：在装配期就报错，不留到"分数很低"。
+/// 图标不存在 / 尺寸不可用：在装配期就报错，不留到"分数很低"。
 #[test]
 fn probe_nav_icon_reports_an_unusable_template_immediately() {
     let harness = Harness::new("probe-icon-badtpl", DemoScenario::Happy);
+    let icons_dir = runtime_info(&harness).icons_dir;
 
+    // 名字对不上：说清是哪个名字、以及去哪儿看。
     let message = harness.err(
         "probe_nav_icon",
         json!({
             "windowClass": "Progman",
             "wecomExe": null,
             "navStrip": [0.0, 0.0, 0.08, 1.0],
-            "templates": [std::env::temp_dir().join("rpa-llm-no-such-icon.png").display().to_string()],
+            "templates": ["根本没有这个图标"],
             "minScore": 0.8,
         }),
     );
     assert!(
-        !message.is_empty(),
-        "模板读不出来时必须给出原因，而不是继续往下走"
+        message.contains("根本没有这个图标") && message.contains("图标库"),
+        "图标找不到时要给出名字和去处，而不是继续往下走：{message}"
     );
 
-    // 过大的模板同样当场拒绝。
-    let dir = std::env::temp_dir().join("rpa-llm-probe-icon-big");
-    let big = write_icon_png(&dir, "big.png", 300, 40);
+    // 旧配置里留下的**路径**：给一句能照着做的提示，而不是"图标丢了"。
     let message = harness.err(
         "probe_nav_icon",
         json!({
             "windowClass": "Progman",
             "wecomExe": null,
             "navStrip": [0.0, 0.0, 0.08, 1.0],
-            "templates": [big],
+            "templates": ["D:\\icons\\聊天.png"],
+            "minScore": 0.8,
+        }),
+    );
+    assert!(message.contains("名字"), "要说清现在按名字引用：{message}");
+
+    // 过大的图同样当场拒绝。
+    write_icon_png(
+        &std::path::Path::new(&icons_dir).join("太大"),
+        "1.png",
+        300,
+        40,
+    );
+    let message = harness.err(
+        "probe_nav_icon",
+        json!({
+            "windowClass": "Progman",
+            "wecomExe": null,
+            "navStrip": [0.0, 0.0, 0.08, 1.0],
+            "templates": ["太大"],
             "minScore": 0.8,
         }),
     );
     assert!(message.contains("太大"), "报错要说清是尺寸问题：{message}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 对着一个确实存在的窗口走完整条链路，检查报出来的东西**自洽**。
@@ -893,8 +933,8 @@ fn probe_nav_icon_reports_an_unusable_template_immediately() {
 #[test]
 fn probe_nav_icon_returns_self_consistent_geometry_for_a_real_window() {
     let harness = Harness::new("probe-icon-real", DemoScenario::Happy);
-    let dir = std::env::temp_dir().join("rpa-llm-probe-icon-real");
-    let template = write_icon_png(&dir, "icon.png", 20, 20);
+    let icons_dir = runtime_info(&harness).icons_dir;
+    let icon = put_icon(&icons_dir, "图标", 1);
 
     let probe: desktop_lib::NavIconProbe = match harness.call(
         "probe_nav_icon",
@@ -902,7 +942,7 @@ fn probe_nav_icon_returns_self_consistent_geometry_for_a_real_window() {
             "windowClass": "Progman",
             "wecomExe": null,
             "navStrip": [0.0, 0.0, 0.08, 1.0],
-            "templates": [template],
+            "templates": [icon],
             "minScore": 0.8,
         }),
     ) {
@@ -910,7 +950,6 @@ fn probe_nav_icon_returns_self_consistent_geometry_for_a_real_window() {
         Err(err) => {
             // 没有交互式桌面（无头环境）就跳过，不把环境问题当缺陷。
             eprintln!("跳过：当前会话没有可用的交互式桌面（{err}）");
-            let _ = std::fs::remove_dir_all(&dir);
             return;
         }
     };
@@ -972,8 +1011,6 @@ fn probe_nav_icon_returns_self_consistent_geometry_for_a_real_window() {
         assert_eq!(hit.accepted, hit.score >= 0.8, "accepted 与分数/阈值不一致");
     }
     assert!(!probe.notice.trim().is_empty(), "必须给操作者一句话结论");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── 图标库（模板从哪来） ────────────────────────────────────────────────
@@ -997,46 +1034,62 @@ fn runtime_info(harness: &Harness) -> desktop_lib::RuntimeInfo {
     harness.ok("runtime_info", json!({}))
 }
 
-/// 往图标库目录里放一张**真的能用**的 PNG（20×20，有纹理）。
+/// 往图标库里放一个**真的能用**的图标：名字对应一个目录，底下带 `variants` 张图。
+///
+/// 返回**图标名**——配置里引用的、以及 `probe_nav_icon` / `click_icon` 收的
+/// 都是名字，不是路径。
 ///
 /// 自己 `create_dir_all`：图标库目录只有在**保存过图标之后**才存在
 /// （`list` 把"目录不存在"当成空库而不是错误），所以测试不能假定它在。
-fn put_icon(icons_dir: &str, name: &str) -> String {
-    std::fs::create_dir_all(icons_dir).expect("创建图标库目录失败");
-    let path = std::path::Path::new(icons_dir).join(format!("{name}.png"));
-    let mut pixels = Vec::new();
-    for y in 0..20u32 {
-        for x in 0..20u32 {
-            pixels.extend_from_slice(&[(x * 13) as u8, (y * 29) as u8, ((x + y) * 7) as u8, 255]);
-        }
+fn put_icon(icons_dir: &str, name: &str, variants: u32) -> String {
+    for index in 1..=variants {
+        write_icon_png(
+            &std::path::Path::new(icons_dir).join(name),
+            &format!("{index}.png"),
+            20,
+            20,
+        );
     }
-    let shot = automation_core::Screenshot {
-        pixels,
-        width: 20,
-        height: 20,
-        captured_at: std::time::SystemTime::now(),
-        fingerprint: String::new(),
-    };
-    let rgba = vision::pixels::to_rgba(&shot).unwrap();
-    std::fs::write(&path, vision::pixels::encode_png(&rgba).unwrap()).unwrap();
-    path.display().to_string()
+    name.to_string()
 }
 
-/// 尺寸上下限必须由后端下发，而且与 `vision` 的常量一致。
+/// 图标库位置与尺寸上下限必须由后端下发，而且与 `vision` 的常量一致。
 ///
 /// 界面上「框得太小 / 太大」的即时提示用的就是这两个值。前端另写一份的话，
 /// 迟早会出现「界面说没问题、点保存却被拒」——那是最让人不知所措的组合。
+///
+/// 图标库的位置有**两个**要下发：当前生效的那个（`icons_dir`），
+/// 以及留空时的默认值（`icons_dir_default`，项目根下的 `data/icons/`）。
+/// 后者是给界面上的输入框当占位提示用的——前端自己拼一份的话，
+/// 两边迟早不一致，而"默认到底存哪儿"恰恰最需要说准。
 #[test]
 fn runtime_info_carries_the_icon_library_location_and_template_limits() {
     let harness = Harness::new("icon-info", DemoScenario::Happy);
     let info = runtime_info(&harness);
 
+    // 测试实例把图标库按在临时数据目录里（`AppState::in_memory`），
+    // 免得跑到真实的项目目录里去读写。
     assert!(
         info.icons_dir.ends_with("icons"),
-        "图标库目录应当是数据目录下的 icons/：{}",
+        "图标库目录应当是某个数据目录下的 icons/：{}",
         info.icons_dir
     );
-    assert!(info.icons_dir.starts_with(&info.data_dir), "图标库在数据目录之下");
+    assert!(info.icons_dir.starts_with(&info.data_dir), "测试实例的图标库在临时数据目录之下");
+
+    // 默认值必须指向**项目里**，不是 AppData：图标模板是人对着屏幕框出来的素材，
+    // 找得到、备份得了才算数。
+    let default = std::path::Path::new(&info.icons_dir_default);
+    assert!(
+        default.ends_with(std::path::Path::new("data").join("icons")),
+        "默认图标库应当是项目根下的 data/icons/：{}",
+        info.icons_dir_default
+    );
+    assert!(
+        default.is_absolute(),
+        "默认图标库要是个绝对路径，界面直接显示它：{}",
+        info.icons_dir_default
+    );
+
     assert_eq!(info.template_min_side, vision::MIN_TEMPLATE_SIDE);
     assert_eq!(info.template_max_side, vision::MAX_TEMPLATE_SIDE);
 }
@@ -1057,47 +1110,135 @@ fn the_icon_library_starts_empty_and_deleting_a_missing_icon_says_so() {
     assert!(message.contains("没有"), "删一个不存在的图标要说清楚：{message}");
 }
 
-/// 列表要能读出文件、量出尺寸，并且**坏文件带原因留下来**。
+/// 列表要能读出文件、量出尺寸、**一个名字底下的多张图都列出来**，
+/// 并且**坏文件带原因留下来**。
 ///
-/// 图标库目录是给人看也给人手工放的（有人会用画图另存一遍）。
-/// 坏文件从列表里藏起来，只会让人以为「我明明存过」；显示出来，
-/// 顺手就把「任务装配时才发现模板不可用」提前到了列表里。
+/// 图标库目录是给人看也给人手工放的（有人会用画图另存一遍、也有人直接丢一张
+/// `<名字>.png` 进去）。坏文件从列表里藏起来，只会让人以为「我明明存过」；
+/// 显示出来，顺手就把「任务装配时才发现模板不可用」提前到了列表里。
 #[test]
 fn the_icon_library_lists_files_and_flags_the_broken_ones() {
     let harness = Harness::new("icon-list", DemoScenario::Happy);
     let icons_dir = runtime_info(&harness).icons_dir;
+    let root = std::path::Path::new(&icons_dir);
 
-    put_icon(&icons_dir, "通讯录");
-    std::fs::write(
-        std::path::Path::new(&icons_dir).join("坏的.png"),
-        b"this is not a png",
-    )
-    .unwrap();
+    // 一个名字，三张图（未选中 / 选中 / 带气泡）。
+    put_icon(&icons_dir, "聊天", 3);
+    // 一张坏的（有人拿别的工具改坏了）。
+    std::fs::create_dir_all(root.join("坏的")).unwrap();
+    std::fs::write(root.join("坏的").join("1.png"), b"this is not a png").unwrap();
+    // 旧式的单文件图标：命令行产出的就是这种，照样要认。
+    let legacy = write_icon_png(root, "通讯录.png", 20, 20);
+    assert!(std::path::Path::new(&legacy).is_file());
     // 非 PNG 要跳过：图标库目录里混进别的文件不该让整个列表打不开。
-    std::fs::write(std::path::Path::new(&icons_dir).join("说明.txt"), b"x").unwrap();
+    std::fs::write(root.join("说明.txt"), b"x").unwrap();
 
     let listed: Vec<desktop_lib::icon_library::IconEntry> =
         harness.ok("list_icons", json!({}));
-    assert_eq!(listed.len(), 2, "应当只认 PNG：{listed:?}");
+    assert_eq!(listed.len(), 3, "应当只认 PNG：{listed:?}");
 
-    let good = listed.iter().find(|item| item.name == "通讯录").expect("应当有「通讯录」");
-    assert_eq!((good.width, good.height), (20, 20));
-    assert!(good.problem.is_none());
-    assert!(
-        good.image.starts_with("data:image/png;base64,"),
-        "缩略图要以 data URL 形式带回来，界面一次调用就能画完列表"
+    let chat = listed.iter().find(|item| item.name == "聊天").expect("应当有「聊天」");
+    assert_eq!(chat.variants.len(), 3, "一个名字底下的三张图都要列出来");
+    assert_eq!(
+        chat.variants.iter().map(|item| item.relative.clone()).collect::<Vec<_>>(),
+        ["聊天/1.png", "聊天/2.png", "聊天/3.png"]
     );
+    assert!(chat.usable, "三张都读得出来，这个图标就能用于导航");
+    for variant in &chat.variants {
+        assert_eq!((variant.width, variant.height), (20, 20));
+        assert!(variant.problem.is_none());
+        assert!(
+            variant.image.starts_with("data:image/png;base64,"),
+            "缩略图要以 data URL 形式带回来，界面一次调用就能画完列表"
+        );
+    }
 
     let broken = listed.iter().find(|item| item.name == "坏的").expect("坏文件要留在列表里");
-    assert!(broken.problem.is_some(), "坏文件必须带上原因，而不是静默消失");
-    assert_eq!((broken.width, broken.height), (0, 0));
+    assert!(broken.variants[0].problem.is_some(), "坏文件必须带上原因，而不是静默消失");
+    assert_eq!((broken.variants[0].width, broken.variants[0].height), (0, 0));
+    assert!(!broken.usable, "有一张坏的，这个图标就不能用于导航");
 
-    // 删除之后列表要跟着变，而且删除是按名字精确指的。
-    harness.ok::<()>("delete_icon", json!({ "name": "通讯录" }));
+    let legacy = listed.iter().find(|item| item.name == "通讯录").expect("旧式单文件也要认");
+    assert_eq!(legacy.variants.len(), 1);
+    assert_eq!(legacy.variants[0].relative, "通讯录.png");
+    assert!(legacy.usable);
+
+    // 删掉一张变体：同一个名字还在，只是少了一张。
+    harness.ok::<()>(
+        "delete_icon_variant",
+        json!({ "name": "聊天", "relative": "聊天/2.png" }),
+    );
+    let listed: Vec<desktop_lib::icon_library::IconEntry> =
+        harness.ok("list_icons", json!({}));
+    let chat = listed.iter().find(|item| item.name == "聊天").unwrap();
+    assert_eq!(
+        chat.variants.iter().map(|item| item.relative.clone()).collect::<Vec<_>>(),
+        ["聊天/1.png", "聊天/3.png"],
+        "删掉中间那张之后，剩下的编号不重排"
+    );
+
+    // 删除整组：三张（现在剩两张）一起走。
+    harness.ok::<()>("delete_icon", json!({ "name": "聊天" }));
+    let listed: Vec<desktop_lib::icon_library::IconEntry> =
+        harness.ok("list_icons", json!({}));
+    assert!(!listed.iter().any(|item| item.name == "聊天"), "整组删除要连变体一起删掉");
+
+    // 旧式单文件也能按相对路径删掉。
+    harness.ok::<()>(
+        "delete_icon_variant",
+        json!({ "name": "通讯录", "relative": "通讯录.png" }),
+    );
     let listed: Vec<desktop_lib::icon_library::IconEntry> =
         harness.ok("list_icons", json!({}));
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "坏的");
+}
+
+/// 删除变体**不能**被前端传来的一串路径带出图标库。
+///
+/// 这是个删除命令，`relative` 来自界面。不校验的话，一个 `../../重要文件.png`
+/// 就能删掉磁盘上任何东西——而界面上什么异常都看不出来。
+#[test]
+fn delete_icon_variant_refuses_a_path_outside_the_icon_library() {
+    let harness = Harness::new("icon-delete-escape", DemoScenario::Happy);
+    let icons_dir = runtime_info(&harness).icons_dir;
+    put_icon(&icons_dir, "聊天", 2);
+
+    // 图标库**外面**放一个文件，它绝不能因为"名字对得上"就被删掉。
+    let outside = std::env::temp_dir().join("rpa-llm-outside-icon-lib");
+    std::fs::create_dir_all(&outside).unwrap();
+    let victim = write_icon_png(&outside, "重要文件.png", 20, 20);
+
+    for relative in [
+        "../重要文件.png",
+        "..\\重要文件.png",
+        "C:/Windows/System32/calc.png",
+        "聊天/../../重要文件.png",
+        "聊天",
+        "",
+    ] {
+        assert!(
+            harness
+                .err(
+                    "delete_icon_variant",
+                    json!({ "name": "聊天", "relative": relative }),
+                )
+                .len()
+                > 0,
+            "「{relative}」不该被当成「聊天」的变体删掉"
+        );
+    }
+
+    assert!(
+        std::path::Path::new(&victim).is_file(),
+        "图标库外面的文件一个都不该被碰"
+    );
+    let listed: Vec<desktop_lib::icon_library::IconEntry> =
+        harness.ok("list_icons", json!({}));
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].variants.len(), 2, "两次都没删掉东西");
+
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// 参数校验必须发生在**任何截屏动作之前**。
@@ -1148,8 +1289,8 @@ fn save_icon_from_crop_validates_its_arguments_before_touching_the_screen() {
 #[test]
 fn click_icon_refuses_bad_arguments_without_clicking_anything() {
     let harness = Harness::new("icon-click-args", DemoScenario::Happy);
-    let dir = std::env::temp_dir().join("rpa-llm-click-args");
-    let icon = put_icon(&dir.display().to_string(), "通讯录");
+    let icons_dir = runtime_info(&harness).icons_dir;
+    let icon = put_icon(&icons_dir, "通讯录", 2);
 
     let base = json!({
         "windowClass": "Progman",
@@ -1177,19 +1318,240 @@ fn click_icon_refuses_bad_arguments_without_clicking_anything() {
     body["minScore"] = json!(1.4);
     assert!(harness.err("click_icon", body).contains("0–1"));
 
-    // 一张模板都没配：这是**配置缺失**，不是"没找到图标"。
+    // 一个图标都没配：这是**配置缺失**，不是"没找到图标"。
     let mut body = base.clone();
     body["templates"] = json!(["  ", ""]);
     let message = harness.err("click_icon", body);
     assert!(
-        message.contains("没有配置任何图标模板"),
-        "空模板列表要报配置缺失：{message}"
+        message.contains("没有配置「导航」图标的模板"),
+        "空图标列表要报配置缺失，并说清是哪一组：{message}"
     );
 
-    // 模板文件不存在：同样在装配期报错，不留到"分数很低"。
+    // 图标名对不上：同样在装配期报错，不留到"分数很低"。
     let mut body = base.clone();
-    body["templates"] = json!([dir.join("根本没有.png").display().to_string()]);
-    assert!(!harness.err("click_icon", body).is_empty());
+    body["templates"] = json!(["根本没有这个图标"]);
+    let message = harness.err("click_icon", body);
+    assert!(
+        message.contains("根本没有这个图标"),
+        "图标找不到时要说清是哪个：{message}"
+    );
+}
 
-    let _ = std::fs::remove_dir_all(&dir);
+// ── 工作流：装配期该拒绝什么 ────────────────────────────────────────────
+//
+// 「这条工作流需要哪几块标定区域」是一个**判据**——装配期就是按它拒绝任务的。
+// 所以既要验"缺了会被拒"，也要验"界面拿到的那份清单和后端那一条是同一份"。
+
+/// 搜索式缺三块区域 ⇒ 装配期拒绝，**任务列表里不留记录**。
+///
+/// "不留记录"这一条是重点：装配失败发生在登记之前，所以列表里不该出现
+/// 一条永远不推进的草稿——那会让人以为任务已经提交了。
+#[test]
+fn the_search_workflow_is_refused_without_its_regions() {
+    let harness = Harness::with_config(
+        "search-no-regions",
+        RuntimeConfig {
+            mode: RuntimeMode::DryRun,
+            workflow: Workflow::SearchContact,
+            ..Default::default()
+        },
+    );
+
+    let message = harness.err(
+        "start_task",
+        json!({ "request": { "external_contact_name": "张三", "text": "你好" } }),
+    );
+
+    // 报错要说清"哪条工作流、缺哪几块"，并且用界面上的说法（label）而不是 key：
+    // 只报 `main_search` 的话，人得自己把它翻译成标定页里的某一项。
+    assert!(message.contains("搜索式查找联系人"), "{message}");
+    for label in ["搜索框区", "下拉列表区域", "联系人资料区域"] {
+        assert!(message.contains(label), "缺哪块要说清（{label}）：{message}");
+    }
+    assert!(message.contains("界面标定"), "要告诉人下一步去哪标：{message}");
+
+    let tasks: Vec<TaskView> = harness.ok("list_tasks", json!({}));
+    assert!(tasks.is_empty(), "装配失败时不该登记任务，实际有 {} 条", tasks.len());
+}
+
+/// 列表扫描式**不**要求搜索式那三块——这是"按工作流分别要求"的另一半。
+///
+/// 没有这条，上面那条用例可以被"一概全要"糊弄过去，而代价是
+/// 每个只想跑列表式的人都被逼着去标三块用不上的区域。
+#[test]
+fn the_list_workflow_does_not_need_the_search_regions() {
+    let harness = Harness::with_config(
+        "list-no-search-regions",
+        RuntimeConfig {
+            mode: RuntimeMode::DryRun,
+            workflow: Workflow::ScrollListContact,
+            ..Default::default()
+        },
+    );
+
+    // 能一路跑到结束就够了——这里不关心终态，只关心"装配没有被拒"。
+    let id = harness.start("外部测试联系人", "你好");
+    assert!(!id.is_empty());
+}
+
+/// 靶标文字留空 ⇒ 装配期拒绝。
+///
+/// 空串在「包含」判断里**匹配一切**：空的分组标题会让下拉里的第一行被当成
+/// 「联系人」组的标题，于是后面整段判据全部错位。而这**不会报错**——
+/// 只会表现为"点到了不相干的一行"。
+#[test]
+fn blank_target_texts_are_refused_at_assembly_time() {
+    let harness = Harness::with_config(
+        "blank-target-text",
+        RuntimeConfig {
+            mode: RuntimeMode::DryRun,
+            workflow: Workflow::ScrollListContact,
+            profile_chat_entry_text: "   ".into(),
+            ..Default::default()
+        },
+    );
+
+    let message = harness.err(
+        "start_task",
+        json!({ "request": { "external_contact_name": "张三", "text": "你好" } }),
+    );
+    assert!(message.contains("不能留空"), "{message}");
+    assert!(
+        message.contains("profile_chat_entry_text"),
+        "要说清是哪一个字段：{message}"
+    );
+}
+
+/// `workflow_requirements` 下发的清单必须与装配期用的是**同一份**。
+///
+/// 这是这条命令存在的全部理由：界面自己列一张表的话，两边不一致时的表现是
+/// 「界面说齐了、点开始却被拒」，而人只会去怀疑标定本身。
+/// 所以这里**拿命令的输出去构造一次装配**：命令说"缺这几块"，
+/// 那就把这几块补上，装配必须随之成功。
+#[test]
+fn the_requirement_list_matches_what_assembly_enforces() {
+    let harness = Harness::with_config(
+        "requirements-match",
+        RuntimeConfig {
+            mode: RuntimeMode::DryRun,
+            workflow: Workflow::SearchContact,
+            ..Default::default()
+        },
+    );
+
+    let requirements: Vec<desktop_lib::runtime::WorkflowRequirement> = harness.ok(
+        "workflow_requirements",
+        json!({ "config": serde_json::to_value(RuntimeConfig {
+            mode: RuntimeMode::DryRun,
+            workflow: Workflow::SearchContact,
+            ..Default::default()
+        }).unwrap() }),
+    );
+    let search = requirements
+        .iter()
+        .find(|item| item.workflow == Workflow::SearchContact)
+        .expect("三条工作流都要下发");
+    assert_eq!(
+        search.required.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
+        ["main_search", "search_dropdown", "contact_profile"],
+        "顺序即界面上显示的顺序"
+    );
+    assert!(
+        search.required.iter().all(|item| !item.marked),
+        "默认配置一块都没标，如实报 false"
+    );
+
+    // 清单里说"一条都不用"的那两条工作流，实际装配也确实不要求。
+    for workflow in [Workflow::ScrollListContact, Workflow::NavigateOnly] {
+        let item = requirements
+            .iter()
+            .find(|item| item.workflow == workflow)
+            .expect("三条工作流都要下发");
+        assert!(item.required.is_empty(), "{workflow:?} 不该要求任何新增区域");
+    }
+}
+
+// ── 一键截屏热键 ────────────────────────────────────────────────────────
+//
+// 这三个用例**都不注册真实热键**：它们走的是校验失败与幂等注销那两条路，
+// 到不了 `RegisterHotKey`。校验逻辑本身在 `platform-windows` 里另有单元测试，
+// 这里测的是**命令层的往返**——命令有没有登记、请求字段名跟前端对不对得上、
+// 错误文案能不能原样传到界面。这三件事任一件错了，症状都是「点了按钮没反应」
+// 或者「界面报了个看不懂的错」，而代码本身看不出问题。
+
+/// 没勾修饰键的组合**必须被拒**。
+///
+/// 注册一个不带修饰键的 `A`，会把那个键从整个系统里抢走——用户在**任何**程序里
+/// 都打不出 a。这不是「配置没生效」，是把别人的键盘弄坏，所以后端直接拒绝。
+#[test]
+fn a_bare_hotkey_key_is_rejected_through_ipc() {
+    let harness = Harness::new("hotkey-bare-key", DemoScenario::Happy);
+
+    let message = harness.err(
+        "register_capture_hotkey",
+        json!({ "request": { "ctrl": false, "alt": false, "shift": false, "win": false, "key": "A" } }),
+    );
+
+    assert!(
+        message.contains("修饰键"),
+        "错误文案要说清为什么，不能只报一句非法参数：{message}"
+    );
+}
+
+/// 认不出的主键要被拒，而且**要点名是哪一个**。
+///
+/// `F13` 是最容易踩的那个：功能键只到 `F12`。报错里不点名的话，操作者盯着
+/// 界面上那个 `F13` 看不出哪里不对。
+#[test]
+fn an_unsupported_hotkey_key_is_named_in_the_error() {
+    let harness = Harness::new("hotkey-bad-key", DemoScenario::Happy);
+
+    let message = harness.err(
+        "register_capture_hotkey",
+        json!({ "request": { "ctrl": true, "alt": false, "shift": false, "win": false, "key": "F13" } }),
+    );
+
+    assert!(message.contains("F13"), "要点名是哪个键：{message}");
+    assert!(
+        message.contains("F1") || message.contains("F12"),
+        "要说明允许的范围：{message}"
+    );
+}
+
+/// 注销**幂等**：没注册过也算成功。
+///
+/// 界面在离开标定页、以及每次改组合键之前都会调它。要是「本来就没注册」返回错误，
+/// 界面就得为它写一堆无意义的判断，而那种判断迟早会有人漏掉一个。
+#[test]
+fn unregistering_a_hotkey_that_was_never_registered_succeeds() {
+    let harness = Harness::new("hotkey-unregister", DemoScenario::Happy);
+
+    harness.ok::<()>("unregister_capture_hotkey", json!({}));
+    harness.ok::<()>("unregister_capture_hotkey", json!({}));
+}
+
+/// 真机用例：完整走一遍 `invoke` → 注册 → 注销。
+///
+/// 与 `platform-windows` 里那条的区别：那条测注册/注销本身，这条测**命令层的往返**
+/// ——参数怎么反序列化、返回的组合键写法对不对。返回的那个写法就是界面上显示的
+/// 「已生效：Ctrl+Alt+Shift+F12」，所以它必须与操作者勾的、填的完全一致
+/// （大小写规范化、修饰键顺序固定）。
+///
+/// 默认跳过：会真的占一个全系统热键。要跑：
+/// `cargo test -p desktop --features custom-protocol -- --ignored a_hotkey_survives`
+#[test]
+#[ignore]
+fn a_hotkey_survives_a_round_trip_through_ipc() {
+    let harness = Harness::new("hotkey-round-trip", DemoScenario::Happy);
+
+    let label = harness.ok::<String>(
+        "register_capture_hotkey",
+        json!({ "request": { "ctrl": true, "alt": true, "shift": true, "win": false, "key": "f12" } }),
+    );
+    assert_eq!(
+        label, "Ctrl+Alt+Shift+F12",
+        "小写 f12 要规范化成 F12，修饰键顺序固定为 Ctrl+Alt+Shift+Win"
+    );
+
+    harness.ok::<()>("unregister_capture_hotkey", json!({}));
 }

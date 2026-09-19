@@ -31,15 +31,17 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_A,
+    KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_A,
     VK_CONTROL, VK_DELETE, VK_RETURN, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
     GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, SetCursorPos,
-    SetForegroundWindow, ShowWindow, WindowFromPoint, GA_ROOT, PW_RENDERFULLCONTENT, SM_CXSCREEN,
-    SM_CYSCREEN, SW_RESTORE,
+    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible,
+    SetForegroundWindow, SetWindowPos, ShowWindow, WindowFromPoint, GA_ROOT, PW_RENDERFULLCONTENT,
+    SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_RESTORE,
 };
 
 /// `CF_UNICODETEXT`：Win32 中稳定的剪贴板格式常量。
@@ -385,7 +387,49 @@ pub fn is_minimized(hwnd: HWND) -> bool {
     unsafe { IsIconic(hwnd) }.as_bool()
 }
 
+/// 把窗口的**外框**尺寸改成 `width`×`height`，位置不动、层级不动、不抢前台。
+///
+/// 三个标志缺一不可：
+/// - `SWP_NOMOVE`：位置本来就不校验（只校验尺寸与 DPI），顺手挪窗口只会改变
+///   操作者桌面上的布局，而且没必要；
+/// - `SWP_NOZORDER`：不动 Z 序，免得把窗口从它所在的层级里拽出来；
+/// - `SWP_NOACTIVATE`：不抢前台。前台切换是**异步**的、还可能被前台锁定策略吞掉
+///   （见 [`wait_until_foreground`]），不该混进这一步——这一步只负责改尺寸。
+///
+/// 返回**重新量取的**边界：客户端可能有自己的最小尺寸限制，`SetWindowPos` 会报成功
+/// 而窗口并没有变成请求的尺寸。判据只能是量出来的值，不能是请求值。
+pub fn resize_window(hwnd: HWND, width: i32, height: i32) -> WinResult<Rect> {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    }
+    .map_err(|err| format!("调整窗口尺寸失败：{err}"))?;
+    window_rect(hwnd)
+}
+
 /// 把窗口置于前台。先尝试还原最小化窗口，再设置前台。
+///
+/// **只有前台进程能成功**：Windows 只允许"当前前台进程"切换前台窗口，后台进程的请求
+/// 会被静默吞掉（表现是任务栏闪一下）。返回 `true` 也只表示"请求被接受"，不代表已经
+/// 切过去了——调用方必须用 [`wait_until_foreground`] 核实，不能立刻读 `GetForegroundWindow`。
+///
+/// ★★ **不要试图绕过前台锁定**（2026-09-19 实测，两条路都堵死了）：
+///
+/// 1. `AttachThreadInput` 这个老办法**在 Win10/11 上已经失效**。实测把本线程分别附到
+///    前台线程与目标线程上（两次 `AttachThreadInput` 都返回成功）之后，
+///    `SetForegroundWindow` **依然返回 `false`**，前台一动不动。
+/// 2. `BringWindowToTop` / `SetWindowPos(HWND_TOPMOST)` 只改 **Z 序**，
+///    **不给键盘焦点**——而 `SendInput` 只送给前台窗口，所以对输入毫无帮助。
+///
+/// 结论：**抢前台这条路走不通**。要么调用方自己就是前台进程（界面上点「开始任务」
+/// 时就是这样），要么请操作者点一下目标窗口。失败时如实报错，不要兜底重试。
 pub fn bring_to_foreground(hwnd: HWND) -> WinResult<()> {
     if is_minimized(hwnd) {
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
@@ -648,6 +692,24 @@ fn mouse_input_with(
     input
 }
 
+/// 一次绝对坐标的鼠标移动。
+///
+/// `dx` / `dy` 是**已归一化**到 0..=65535 的坐标（见 [`move_cursor_absolute`]），
+/// 不是像素——所以这里不能复用按像素说话的 [`mouse_input_with`]。
+fn mouse_move_input(dx: i32, dy: i32) -> INPUT {
+    let mut input = INPUT::default();
+    input.r#type = INPUT_MOUSE;
+    input.Anonymous.mi = MOUSEINPUT {
+        dx,
+        dy,
+        mouseData: 0,
+        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        time: 0,
+        dwExtraInfo: 0,
+    };
+    input
+}
+
 /// Win32 的 `WHEEL_DELTA`：滚轮一格对应的 `mouseData` 增量。
 const WHEEL_DELTA_UNITS: i32 = 120;
 
@@ -683,8 +745,125 @@ pub fn scroll_wheel(notches: i32) -> WinResult<()> {
     Ok(())
 }
 
-pub fn move_cursor(x: i32, y: i32) -> WinResult<()> {
-    unsafe { SetCursorPos(x, y) }.map_err(|err| format!("移动鼠标失败：{err}"))
+// ── 光标轨迹 ────────────────────────────────────────────────────────────
+
+/// 光标轨迹相邻两步之间的间隔。
+///
+/// 8ms ≈ 125Hz，正是最常见 USB 鼠标的**默认回报率**：真鼠标每秒只向系统报告约
+/// 125 次位置，系统的鼠标消息也按这个节奏合并。按它走，轨迹在系统里留下的痕迹
+/// 与真鼠标是同一种东西。
+///
+/// 写死而不做成配置，是因为它描述的是"真鼠标长什么样"，**不随机器变**
+/// （换台机器，USB 鼠标还是 125Hz）。该由人调的是**速度**，那个是配置。
+const POINTER_STEP_INTERVAL: Duration = Duration::from_millis(8);
+
+/// 一次移动的最短耗时。
+///
+/// 低于这个时长，人眼看到的仍是一次瞬移——正是要消除的那个现象。
+const POINTER_MIN_DURATION: Duration = Duration::from_millis(120);
+
+/// 一次移动的最长耗时。
+///
+/// 人做一次大幅度移动也就是这个量级；再长就不像"移动"而像"卡住"，
+/// 而且每个点击都要多等这么久。
+///
+/// **代价**：真正超长的距离（跨多个显示器）会被压缩到这个时长，轨迹会显得偏快。
+/// 这是刻意的取舍——「看得见」比「严格按速度走完」更重要，而且速度本身是可配的。
+const POINTER_MAX_DURATION: Duration = Duration::from_millis(800);
+
+/// 把光标沿一条**人形轨迹**移到 `(x, y)`。
+///
+/// ## 为什么要走轨迹
+///
+/// 一步跳过去（`SetCursorPos`）在系统里留下的是"光标凭空出现在别处"：操作者
+/// 看不出发生了什么，目标程序的悬停/移入事件也只收到一个终态。按真鼠标那样分步
+/// 走，光标是**看得见地飞过去**的，目标程序依次收到的也是与真鼠标同型的移动消息。
+///
+/// ## 轨迹形状
+///
+/// 用 smoothstep（`3t² - 2t³`）缓动：起步慢、中间快、收尾慢，与人手做指向动作
+/// 时的速度曲线同型。**不用随机抖动**——那会把「同一个点击为什么这次成功那次
+/// 失败」变成查不清的问题，而本项目要求行为可复现。
+///
+/// ## 参数怎么来的
+///
+/// 总时长只由**距离与速度**算出（`距离 ÷ 速度`），再按 [`POINTER_STEP_INTERVAL`]
+/// 切成若干步。速度由调用方从配置传入，所以"快慢"可调，"像不像人手"是算出来的。
+pub fn move_cursor(x: i32, y: i32, speed_px_per_sec: f64) -> WinResult<()> {
+    if !speed_px_per_sec.is_finite() || speed_px_per_sec <= 0.0 {
+        return Err(format!("光标速度必须是正数，收到 {speed_px_per_sec}"));
+    }
+
+    let (from_x, from_y) = cursor_position()?;
+    let dx = (x - from_x) as f64;
+    let dy = (y - from_y) as f64;
+    let distance = (dx * dx + dy * dy).sqrt();
+    // 已经在那儿了（或差不到一个像素）就直接落位：别为了"像人"在原地抖满最短时长。
+    if distance < 1.0 {
+        return move_cursor_absolute(x, y);
+    }
+
+    let duration = Duration::from_secs_f64(distance / speed_px_per_sec)
+        .clamp(POINTER_MIN_DURATION, POINTER_MAX_DURATION);
+    let steps =
+        ((duration.as_secs_f64() / POINTER_STEP_INTERVAL.as_secs_f64()).round() as u32).max(1);
+    let step_delay = duration / steps;
+
+    for step in 1..=steps {
+        let t = step as f64 / steps as f64;
+        let eased = t * t * (3.0 - 2.0 * t);
+        let px = (from_x as f64 + dx * eased).round() as i32;
+        let py = (from_y as f64 + dy * eased).round() as i32;
+        move_cursor_absolute(px, py)?;
+        // 最后一步之后不再睡：位置已经到位，多等一帧只是拖慢每个点击。
+        if step < steps {
+            std::thread::sleep(step_delay);
+        }
+    }
+    Ok(())
+}
+
+/// 发一次绝对坐标的鼠标移动。
+///
+/// 走 `SendInput` 而不是 `SetCursorPos`：前者是**真实输入管线**，返回值就是系统
+/// 实际接受的事件数——被拦下时是 0，我们能当场发现。后者存在"返回成功、光标却没动"
+/// 的情形（前台窗口属于更高完整性的进程等），而"鼠标没动"正是最难查的成因：
+/// 后面那次点击会落到光标**实际停着**的地方。
+fn move_cursor_absolute(x: i32, y: i32) -> WinResult<()> {
+    let (left, top, width, height) = virtual_screen_rect();
+    if width <= 1 || height <= 1 {
+        return Err(format!("虚拟桌面尺寸异常（{width}x{height}），拒绝发送绝对坐标"));
+    }
+    // 绝对坐标要归一化到 0..=65535，且 65535 对应虚拟桌面的**右下角像素**，
+    // 所以分母是 (尺寸 - 1)：用尺寸会让整条轨迹往右下偏一格。
+    let nx = ((x - left) as i64 * 65_535 / (width as i64 - 1)) as i32;
+    let ny = ((y - top) as i64 * 65_535 / (height as i64 - 1)) as i32;
+
+    let input = mouse_move_input(nx, ny);
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        return Err(format!(
+            "移动鼠标到 ({x}, {y}) 失败：系统没有接受这次输入（目标窗口可能属于更高权限的进程）"
+        ));
+    }
+    Ok(())
+}
+
+/// 虚拟桌面（所有显示器合起来）的左上角与尺寸。
+///
+/// 多显示器下主屏左上角不一定是 (0,0)——左侧或上方的显示器会让坐标为负。
+/// 而 `MOUSEEVENTF_ABSOLUTE` 的归一化基准是整个**虚拟桌面**，不是主屏；
+/// 按主屏算，副屏上的坐标会整体偏移。
+fn virtual_screen_rect() -> (i32, i32, i32, i32) {
+    // SAFETY: `GetSystemMetrics` 是纯只读查询，无指针、无所有权。
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
 }
 
 pub fn left_click() -> WinResult<()> {
@@ -725,6 +904,59 @@ fn send_ctrl_key(key: VIRTUAL_KEY, what: &str) -> WinResult<()> {
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent != inputs.len() as u32 {
         return Err(format!("发送{what}失败"));
+    }
+    Ok(())
+}
+
+/// 一个 Unicode 字符（UTF-16 码元）的按下 / 抬起事件。
+fn unicode_input(unit: u16, up: bool) -> INPUT {
+    let mut input = INPUT::default();
+    input.r#type = INPUT_KEYBOARD;
+    input.Anonymous.ki = KEYBDINPUT {
+        // 走 `KEYEVENTF_UNICODE` 时 `wVk` 必须为 0，字符本身放在 `wScan` 里。
+        wVk: VIRTUAL_KEY(0),
+        wScan: unit,
+        dwFlags: if up { KEYEVENTF_KEYUP | KEYEVENTF_UNICODE } else { KEYEVENTF_UNICODE },
+        time: 0,
+        dwExtraInfo: 0,
+    };
+    input
+}
+
+/// 逐字符输入文本，**不经过剪贴板**。
+///
+/// ## 为什么用 `KEYEVENTF_UNICODE` 而不是虚拟键码
+///
+/// 虚拟键码只能表达键盘上**真实存在**的键，中文根本没有对应的键。
+/// `KEYEVENTF_UNICODE` 直接把一个 UTF-16 码元交给目标窗口的键盘消息处理，
+/// 与输入法上屏走的是同一条路——这是逐字输入中文唯一可行的办法。
+///
+/// ## 为什么按 UTF-16 码元而不是 `char`
+///
+/// BMP 之外的字符（emoji 等）在 Windows 上是**代理对**，占两个码元。
+/// 按 `char` 发会让目标窗口收到半个代理对，显示成一个方块。
+///
+/// ## 为什么字符之间要等
+///
+/// 客户端的搜索框是**联想式**的：收到一个字符就发一次查询、刷新下拉列表。
+/// 连珠炮式地发完，联想请求会互相打断，下拉列表可能只按第一个字符的结果定格——
+/// 而现象是"搜出来的东西不对"，不会让人想到是**输入太快**。
+/// 间隔由调用方给（平台侧配置），这里不写死。
+pub fn send_unicode_text(text: &str, interval: Duration) -> WinResult<()> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    for (index, unit) in units.iter().enumerate() {
+        let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent != inputs.len() as u32 {
+            return Err(format!(
+                "发送第 {} 个字符失败（共 {} 个）",
+                index + 1,
+                units.len()
+            ));
+        }
+        if !interval.is_zero() && index + 1 < units.len() {
+            std::thread::sleep(interval);
+        }
     }
     Ok(())
 }

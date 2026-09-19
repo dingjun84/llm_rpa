@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import * as api from "./api";
+import { CalibrationPanel, type CachedPreview } from "./components/CalibrationPanel";
 import { ConfirmationDialog } from "./components/ConfirmationDialog";
 import { IconLibraryPanel } from "./components/IconLibraryPanel";
 import { regionsAreValid } from "./components/RegionCalibration";
@@ -17,7 +18,7 @@ import {
   type TaskView,
 } from "./types";
 
-type Tab = "tasks" | "icons";
+type Tab = "tasks" | "calibration" | "icons";
 
 export function App() {
   const [tasks, setTasks] = useState<TaskView[]>([]);
@@ -31,12 +32,44 @@ export function App() {
    * 配置**草稿**。
    *
    * 由这里持有、而不是交给某个子面板：配置里有一组字段（导航图标）是在
-   * 「图标库」页改的，另一组（窗口、区域、超时）在「任务」页改的。
-   * 两页各持一份草稿的话，保存时总有一份被覆盖掉——而且被覆盖的那一份
+   * 「图标库」页改的，另一组（窗口、区域、超时）在「任务」页改的，
+   * 还有一组（界面标定出来的区域）在「界面标定」页改的。
+   * 各页各持一份草稿的话，保存时总有一份被覆盖掉——而且被覆盖的那一份
    * 看起来"刚才明明改过"。
    */
   const [draft, setDraft] = useState<RuntimeConfig | null>(null);
   const [dirty, setDirty] = useState(false);
+
+  /**
+   * 标定页的截图缓存：场景 id → 那次截图。
+   *
+   * ★ 为什么放在**这里**、而不是标定页自己持有：切到「任务」或「图标库」
+   * 页签时标定页会被卸载，它自己的 state 全没了。截图要重截一次，
+   * 代价是重新把客户端摆成那个界面——用户明确抱怨过这件事。
+   * 跟 `draft` 同一个道理：活得比页签久的状态，就该由 App 持有。
+   *
+   * ★ 只活在进程内、**不落盘**：截图里有联系人姓名和聊天内容。
+   */
+  const [calibrationPreviews, setCalibrationPreviews] = useState<
+    Record<string, CachedPreview>
+  >({});
+
+  const cachePreview = useCallback((sceneId: string, entry: CachedPreview) => {
+    setCalibrationPreviews((current) => ({ ...current, [sceneId]: entry }));
+  }, []);
+
+  /**
+   * 标定页正停在哪个场景、哪一项。
+   *
+   * ★ 跟截图缓存同一个理由：标定页切页签会被卸载，`sceneId` 留在它自己
+   * 身上就会被重置成第一个场景。用户切去「任务」看一眼再回来，
+   * 会发现自己刚才在标的是「历史对话」，界面却跳回了「主界面」，
+   * 而那张截图看起来就"不见了"——其实一直在缓存里。
+   *
+   * `null` = 还没定，由标定页读到计划后落到第一个场景上。
+   */
+  const [calibrationSceneId, setCalibrationSceneId] = useState<string | null>(null);
+  const [calibrationActiveKey, setCalibrationActiveKey] = useState<string | null>(null);
 
   const upsert = useCallback((task: TaskView) => {
     setTasks((current) => {
@@ -95,7 +128,8 @@ export function App() {
   // "草稿"重新对齐——这正是那个 `dirty` 标记能自动清掉的原因。
   useEffect(() => {
     if (!info) return;
-    setDraft(info.config);
+    // `info.config` 本来就带着 `area_marks`（后端序列化下来的）。
+    setDraft(info.config as RuntimeConfig);
     setDirty(false);
   }, [info]);
 
@@ -157,7 +191,7 @@ export function App() {
 
   // 演练模式不碰真实窗口，标定值用不上；真实模式则必须保证四个区域都合法，
   // 否则后端 `RelativeRegion::validate` 会在执行时才报错，白白浪费一次任务。
-  // 两个页面共用这一个判断——保存按钮在两边都有，判据只能有一处。
+  // 三个页面共用这一个判断——保存按钮在每页都有，判据只能有一处。
   const canSave = draft ? draft.mode === "dry_run" || regionsAreValid(draft.regions) : false;
 
   return (
@@ -183,6 +217,13 @@ export function App() {
           onClick={() => setTab("tasks")}
         >
           任务
+        </button>
+        <button
+          type="button"
+          className={tab === "calibration" ? "tab is-active" : "tab"}
+          onClick={() => setTab("calibration")}
+        >
+          界面标定
         </button>
         <button
           type="button"
@@ -273,6 +314,35 @@ export function App() {
 
           <div className="column">
             <TaskHistory tasks={tasks} activeId={activeId} onSelect={setActiveId} />
+          </div>
+        </main>
+      )}
+
+      {tab === "calibration" && (
+        <main className="app-grid is-single">
+          <div className="column">
+            {info && draft ? (
+              <CalibrationPanel
+                info={info}
+                draft={draft}
+                onPatch={patch}
+                onSave={handleSaveConfig}
+                dirty={dirty}
+                canSave={canSave}
+                busy={running}
+                previews={calibrationPreviews}
+                onCachePreview={cachePreview}
+                sceneId={calibrationSceneId}
+                onSceneId={setCalibrationSceneId}
+                activeKey={calibrationActiveKey}
+                onActiveKey={setCalibrationActiveKey}
+              />
+            ) : (
+              <section className="panel">
+                <h2>界面标定</h2>
+                <p className="muted-line">正在读取运行配置…</p>
+              </section>
+            )}
           </div>
         </main>
       )}

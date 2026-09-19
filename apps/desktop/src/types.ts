@@ -3,8 +3,11 @@ export type TaskState =
   | "launching_client"
   | "waiting_for_client"
   | "navigating_to_view"
+  | "navigated"
   | "searching_contact"
   | "verifying_candidate"
+  | "verifying_profile"
+  | "opening_chat_from_profile"
   | "verifying_chat_header"
   | "preparing_message"
   | "awaiting_human_confirmation"
@@ -16,6 +19,18 @@ export type TaskState =
   | "failed"
   | "cancelled";
 
+/**
+ * 时间线上要展示的状态顺序。
+ *
+ * ⚠️ 它是**两条工作流的并集**，不是某一条的路径：搜索式会多走
+ * `verifying_profile` → `opening_chat_from_profile`（点下拉那一行落在资料页上，
+ * 还要从资料页点一次「发消息」），列表扫描式则直接进聊天页。
+ * 所以"哪一步走过了"必须按**实际轨迹**判断，不能按"下标小于当前"推——
+ * 后者会把列表式从没走过的资料页两步也标成"已完成"。
+ *
+ * 并集的相对顺序对两条路都成立：两条路在 `verifying_candidate` 之后分岔，
+ * 在 `verifying_chat_header` 之前汇合。
+ */
 export const HAPPY_PATH: TaskState[] = [
   "draft",
   "launching_client",
@@ -26,6 +41,9 @@ export const HAPPY_PATH: TaskState[] = [
   "navigating_to_view",
   "searching_contact",
   "verifying_candidate",
+  // 只有搜索式会经过这两步。
+  "verifying_profile",
+  "opening_chat_from_profile",
   "verifying_chat_header",
   "preparing_message",
   "awaiting_human_confirmation",
@@ -41,8 +59,13 @@ export const STATE_LABELS: Record<TaskState, string> = {
   launching_client: "接入客户端",
   waiting_for_client: "客户端已就绪",
   navigating_to_view: "切换视图",
+  // 「只做导航」那条路的终态：找到图标、点它，到此为止。
+  // 它不是"走完了整条流程"，所以与 `completed` 分开。
+  navigated: "已切换视图",
   searching_contact: "查找联系人",
   verifying_candidate: "核验联系人",
+  verifying_profile: "核验资料页",
+  opening_chat_from_profile: "从资料页进入聊天",
   verifying_chat_header: "核验聊天页标题",
   preparing_message: "准备消息",
   awaiting_human_confirmation: "等待人工确认",
@@ -60,10 +83,13 @@ export const STATE_LABELS: Record<TaskState, string> = {
  *
  * `prepared` 也是终态，但和 `completed` 一样属于**正常结束**：
  * 它表示"按配置在发送前停下"，没有发生任何意外，只是没发出去。
+ *
+ * `navigated` 同理：它是「只做导航」那条路的正常结束，只是那条路本来就不发送。
  */
 export const TERMINAL_STATES: TaskState[] = [
   "completed",
   "prepared",
+  "navigated",
   "needs_human_review",
   "failed",
   "cancelled",
@@ -133,6 +159,86 @@ export interface RegionConfig {
   composer: [number, number, number, number];
 }
 
+/**
+ * 一次区域标定的结果。
+ *
+ * 存的是**相对窗口的比例**，不是像素：窗口挪动、换分辨率都不用重标。
+ * ⚠️ 但**窗口尺寸变了要重标**——界面元素（左侧图标栏、头像列）是固定像素宽的，
+ * 同一份比例在另一个尺寸下会落到别的地方（见 `docs/todo.md` T2）。
+ * 所以每一项都记下 `window`，用来回答"这一份比例是在多大的窗口上量的"。
+ */
+export interface AreaMark {
+  rect: [number, number, number, number];
+  calibrated_at_ms: number;
+  /** 标定时目标窗口的几何。位置只用于显示，不参与判断。 */
+  window: Rect;
+}
+
+/** 标定计划里的一个界面状态。一次只引导标一个。 */
+export interface CalibrationScene {
+  id: string;
+  label: string;
+  /** 「现在请把客户端切成什么样」。决定了截图里有没有要标的东西。 */
+  instruction: string;
+  items: CalibrationItem[];
+}
+
+/** 一个标定项。清单由后端下发，前端不自己写一份。 */
+export interface CalibrationItem {
+  key: string;
+  label: string;
+  hint: string;
+  /** 真实模式下缺了它就跑不起来的项。 */
+  required: boolean;
+  /**
+   * 坐标存在草稿的哪个字段。
+   *
+   * **由后端下发**（`calibration::ITEMS` 里的 `storage`），前端不自己判断——
+   * 这个映射写成两份的话，迟早有一项会写进一个没人读的地方，
+   * 而症状是「框明明拖了，任务里却用不上」。
+   */
+  storage: "regions" | "area_marks";
+  /**
+   * 写进 `regions` 时该用的**字段名**。只有 `storage === "regions"` 的项才有。
+   *
+   * ★★ 必须用它当键，**不能用 `key`** —— 两者不一定相同：
+   * 「列表区」的 key 是 `list_area`，存的却是 `regions.contact_panel`。
+   * 拿 `key` 当字段名的话，框会写进一个配置里不存在的键，后端 serde
+   * 反序列化时**静默丢掉**：不报错、不警告，症状只是
+   * 「标完、保存，再打开就没了」——用户 2026-09-19 实测报的就是这个。
+   *
+   * 权威定义在后端 `CoreRegion::field_name`（只此一处）。
+   */
+  region_field: string | null;
+  /** 当前坐标（比例）。`null` = **还没标定**，不要用默认值把它填上。 */
+  rect: [number, number, number, number] | null;
+  /** 标定元数据。只有 `area_marks` 存储的项才有——`regions` 里存不下这些。 */
+  mark: AreaMark | null;
+  /**
+   * 命令行探针截图（`screen_probe annotate`）上的角标编号 `1`~`4`。
+   *
+   * 只有 `regions` 那四项有值。它与界面上的清单编号（`2.3` 这种）**是两套**：
+   * 四个核心区域分散在不同场景里，编号对不上。两个都显示出来，
+   * 操作者按截图说「把 3 往左挪」时才不会指错。
+   */
+  probe_index: number | null;
+}
+
+export interface CalibrationPlan {
+  scenes: CalibrationScene[];
+  marked_count: number;
+  total_count: number;
+  /**
+   * 配置里存着、但**清单里已经没有**的标定项（key 已按字典序排好）。
+   *
+   * 它们不会被任何流程读到，**却会挡住保存**——后端落盘前会拒绝未知 key。
+   * 于是升级到新清单的人会卡在「一保存就报错，但界面上找不到那个项」。
+   * 界面必须把它们显示出来并提供清理入口（`pruneStaleMarks`），
+   * 否则用户没有出路。
+   */
+  stale_keys: string[];
+}
+
 export interface RuntimeConfig {
   mode: RuntimeMode;
   demo_scenario: DemoScenario;
@@ -160,16 +266,19 @@ export interface RuntimeConfig {
   /**
    * 滚动时鼠标落在联系人列表内的哪个位置（相对该区域的比例，0–1）。
    *
-   * 默认 `(0.62, 0.5)` = 上下居中、左右偏右一点。
-   * 不用区域中心的原因：联系人候选区的左边界是 0.0，把左侧导航图标栏和头像列
-   * 一起圈了进来，水平中心恰好压在头像列上。
+   * 默认 `(0.62, 0.5)` = 上下居中、左右偏右一点（由后端常量下发，前端不另写一份）。
+   * 不用区域中心的原因：联系人候选区的左边界是 0.14，**正好落在姓名那一列上**，
+   * 区域中心会压住姓名与消息预览的交界处；而左边界取 0 会把导航图标栏与
+   * 头像列（含未读红点）一起圈进来，红点会被 OCR 并进姓名里（实测把「丁俊」
+   * 读成「0 丁俊」），逐字匹配就永远找不到人。
    */
   scroll_anchor: { x: number; y: number };
   /**
    * 标定时记录的窗口几何。
    *
-   * 客户端由操作者手动启动并登录，任务只在**这个尺寸**下工作：尺寸对不上就转人工，
-   * 绝不按错的尺寸去点。真实模式下这一项必须有值，否则任务会被拒绝装配。
+   * 客户端由操作者手动启动并登录，任务只在**这个尺寸**下工作：尺寸对不上会先
+   * **自动把窗口调回这个尺寸**，客户端的最小尺寸不允许时才会转人工——绝不按错的
+   * 尺寸去点。真实模式下这一项必须有值，否则任务会被拒绝装配。
    */
   calibrated_window: WindowGeometry | null;
   /**
@@ -215,24 +324,174 @@ export interface RuntimeConfig {
    */
   navigate_before_search: boolean;
   /**
-   * 参与匹配的图标模板：**图标库里的文件路径**。
+   * 参与匹配的图标：**图标名**（不是路径）。
    *
    * 界面上不直接编辑这一项——「图标库」页里每个图标旁边有「用于导航」开关，
-   * 打开就等于把它的路径加进来。手抄路径是抄不错才怪的东西。
+   * 打开就等于把它的名字加进来。一个名字底下可以有多张图（选中 / 未选中 /
+   * 带气泡 / 气泡数字不同），它们**全都**会参与匹配。
    */
   nav_icon_templates: string[];
+  /**
+   * 界面标定拖出来的框，key 见后端 `calibration::ITEMS`。
+   *
+   * 为什么是可选：**老配置文件里没有这个键**。后端那个字段带
+   * `#[serde(default)]`，文件里没有就不会下发，前端读到 `undefined`。
+   * 读的地方一律 `config.area_marks ?? {}`——**不要补默认框**，
+   * 猜出来的框会让人以为已经标好了，然后对着它调半天。
+   */
+  area_marks?: Record<string, AreaMark>;
+  /**
+   * 图标库目录。留空 = 用默认（数据目录下的 `icons/`）。
+   *
+   * 默认放在数据目录里而不是 AppData：AppData 底下那层目录名是包标识符，
+   * 没人记得住；而图标模板是人对着屏幕一张一张框出来的素材。
+   * 写相对路径时挂在**程序运行当前路径**上（与数据目录同一条规则）。
+   */
+  icons_dir: string | null;
   /** 图标匹配的最低分数（0–1），低于它转人工。 */
   nav_icon_min_score: number;
   /** 导航图标搜索区，相对窗口比例 `[x, y, w, h]`。 */
   nav_strip: [number, number, number, number];
+  /**
+   * 本次任务走哪条路。见后端 `automation_core::Workflow`。
+   *
+   * 「找联系人」有两条**看不同界面**的路，而它们的失败现象一模一样
+   * （都是"找不到联系人"），所以必须由操作者显式选，不能自动判断：
+   *
+   * - `search_contact`：点顶部搜索框 → 逐字输入 → 从联想下拉里挑人 →
+   *   资料页 → 点「发消息」→ 输入正文。需要 `main_search` /
+   *   `search_dropdown` / `contact_profile` 三块区域。
+   * - `scroll_list_contact`：在左侧会话列表里滚动扫描找人。只用「列表区」。
+   * - `navigate_only`：**只做导航**——找到图标、点它、结束。不找任何人，
+   *   用来单独验证图标匹配准不准。
+   */
+  workflow: Workflow;
+  /** `navigate_only` 要点哪一个图标。其余工作流不读它。 */
+  nav_target: NavTarget;
+  /**
+   * **聊天历史**图标的模板：图标名，可以多个变体。
+   *
+   * 与 `nav_icon_templates`（联系人图标）分开：两个图标长得不一样，
+   * 混成一个列表时"用错了哪一组"会退化成一次分数不高的匹配，
+   * 而不是一个能一眼看出来的配置错误。
+   */
+  history_icon_templates: string[];
+  /**
+   * 位置先验的分数容差，`0` = **关掉**先验。
+   *
+   * 导航栏是一列纵向排列、彼此长得很像的图标，逐张模板取最高分时偶尔会出现
+   * 「旁边那个图标分数略高一点」。而这件事有先验可用：**越靠近导航区中心的
+   * 命中越可信**。容差决定"分数差多少以内才允许用位置来取舍"——
+   * 定大了等于用位置替代了识别，定小了先验基本不生效。
+   */
+  icon_prior_score_tolerance: number;
+  /**
+   * 逐字输入时**字符之间**的间隔（毫秒）。`0` = 不留间隔。
+   *
+   * 搜索框是联想式的：一次性灌进去的字符会让联想请求互相打断，
+   * 下拉列表只按第一个字符的结果定格——现象是"搜出来的东西不对"，
+   * 不会让人想到是**输入太快**。做成配置是因为不同机器处理输入的速度差很多。
+   */
+  typing_interval_ms: number;
+  /**
+   * 资料页里"进入聊天"那个入口上的文字（默认「发消息」）。
+   *
+   * 靶标相关的文字，换客户端版本就可能不一样。**不能留空**：
+   * 空串在「包含」判断里会匹配到任何一行，结果不是"找不到"而是**找错**。
+   */
+  profile_chat_entry_text: string;
+  /**
+   * 搜索下拉里「联系人」那一组的标题文字（默认「联系人」）。
+   *
+   * 下拉是**分组**的（联系人 / 聊天记录 / 群聊…），只有"联系人"那一组下面
+   * 才是人。同样不能留空。
+   */
+  search_contact_group_label: string;
 }
 
-/** 图标库里的一张图标模板。 */
-export interface IconEntry {
-  /** 名字（不含扩展名）。配置引用它对应的文件路径。 */
-  name: string;
+/** 工作流。见 `RuntimeConfig.workflow`。 */
+export type Workflow = "navigate_only" | "search_contact" | "scroll_list_contact";
+
+/** 「只做导航」要点哪一个图标。 */
+export type NavTarget = "contact" | "history";
+
+/**
+ * 工作流的下拉选项。
+ *
+ * 文案要说清**看的是哪个界面**，而不只是"查找联系人"：
+ * 两条路的失败现象一模一样，说清区别才能让人选对、也才能在失败时
+ * 一眼看出是哪条路出的问题。
+ */
+export const WORKFLOW_LABELS: Record<Workflow, string> = {
+  search_contact: "搜索式查找联系人（点顶部搜索框 → 从下拉里挑人 → 资料页 → 发消息）",
+  scroll_list_contact: "列表扫描式查找联系人（在左侧会话列表里滚动找人）",
+  navigate_only: "只做导航（找到图标并点击，不查找任何人）",
+};
+
+export const NAV_TARGET_LABELS: Record<NavTarget, string> = {
+  contact: "联系人图标",
+  history: "聊天历史图标",
+};
+
+/** 一项标定区域对某条工作流的必要性（后端算好下发）。 */
+export interface MarkRequirement {
+  /** 标定项的 key（`calibration::ITEMS` 里的那个）。 */
+  key: string;
+  /** 界面上的说法（标定清单里的 `label`）。 */
+  label: string;
+  /** **这份配置里**标了没有。 */
+  marked: boolean;
+}
+
+/**
+ * 一条工作流要用到哪些标定区域。
+ *
+ * ⚠️ 这份清单由**后端**下发（`runtime::workflow_requirements`），
+ * 前端**不要**自己写一份：它同时就是装配期拒绝任务的那条判据，
+ * 两边不一致时的表现是「界面说齐了、点开始却被拒」。
+ */
+export interface WorkflowRequirement {
+  workflow: Workflow;
+  /** 工作流的名字，取自后端 `Workflow::describe`。 */
+  label: string;
+  /** 必须标好的区域；空表 = 这条工作流一块新增区域都不需要。 */
+  required: MarkRequirement[];
+}
+
+/**
+ * 一个「一键截屏」热键组合。
+ *
+ * 字段与后端 `capture_hotkey::HotkeyRequest` 一一对应，serde 直接按名读，没有命名转换。
+ *
+ * ⚠️ **必须至少勾一个修饰键**。只有主键的组合会被后端拒绝——注册一个"全局 A"
+ * 会让用户在任何程序里都打不出 a，那不是"配置没生效"，是把别人的键盘弄坏。
+ */
+export interface HotkeyRequest {
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  win: boolean;
+  /**
+   * 主键。只能是 `A`–`Z`、`0`–`9` 或 `F1`–`F12`。
+   *
+   * 用**字符串**而不是数字：`F1`–`F12` 没法用一个数字表达，而混着两种类型
+   * 会让界面上的下拉框取值变得别扭。后端解析规则见
+   * `platform_windows::hotkey::HotkeyKey::parse`。
+   */
+  key: string;
+}
+
+/** 图标库里的一张图：同一个图标的某一种样子。 */
+export interface IconVariant {
   /** PNG 的完整路径。 */
   file: string;
+  /**
+   * 相对**图标库目录**的路径（`聊天/2.png`）。
+   *
+   * 删除单张图时用它指名道姓——不传绝对路径，是因为那是个删除命令，
+   * 后端只接受"图标库目录下、且属于这个名字"的路径。
+   */
+  relative: string;
   /** 模板尺寸（窗口像素）。读不出来时是 0。 */
   width: number;
   height: number;
@@ -242,10 +501,32 @@ export interface IconEntry {
   /**
    * 这张图**现在不能当模板用**的原因（尺寸越界、文件损坏）。
    *
-   * 不为 `null` 时列表里要显眼地标出来：它会在任务装配时让任务直接失败，
+   * 不为 `null` 时列表里要显眼地标出来：它会让任务在装配期直接失败，
    * 提前看到总比那时候才发现好。
    */
   problem: string | null;
+}
+
+/**
+ * 图标库里的一项：**一个名字 + 它的全部变体**。
+ *
+ * 同一个图标在选中 / 未选中 / 带气泡提醒 / 气泡里数字不一样时长得都不一样，
+ * 而它们指的是同一个图标——所以配置引用的是名字，一个名字底下有几张图就存几张。
+ */
+export interface IconEntry {
+  /** 名字。配置里引用的就是它。 */
+  name: string;
+  /** 这个名字对应的目录（旧式的单文件图标则是那个文件本身）。 */
+  path: string;
+  /** 这个名字下的全部图，顺序即变体编号。 */
+  variants: IconVariant[];
+  /**
+   * 能不能拿去当导航模板：**每一张**都要读得出来。
+   *
+   * 由后端算好下发，界面不拿 `variants` 再判一遍——判据写在两处，
+   * 迟早会出现「界面说能用、任务装配时却被拒」。
+   */
+  usable: boolean;
 }
 
 /** 「定位并点击」的结果。 */
@@ -278,7 +559,7 @@ export interface NavIconHit {
   height: number;
   /** 归一化互相关系数，1.0 表示完全一致。 */
   score: number;
-  /** 命中的是哪一张模板（文件名）。 */
+  /** 命中的是哪一张图（相对图标库目录的路径，如 `聊天/2.png`）。 */
   template: string;
   /** 是否达到了最低分数。没过阈值也会给出位置——那才是判断模板对不对的依据。 */
   accepted: boolean;
@@ -311,15 +592,39 @@ export interface WindowGeometry {
 
 export interface RuntimeInfo {
   config: RuntimeConfig;
+  /**
+   * 数据目录的**实际位置**：程序运行当前路径下的 `data/`。
+   *
+   * 界面上要显示它。相对路径的唯一代价就是"到底落在哪儿"要看运行方式，
+   * 而这个目录里装的是配置、图标模板、任务日志与证据图——
+   * 路径不对时用户必须一眼能看见，而不是等到「配置怎么没生效」再来查。
+   */
   data_dir: string;
-  /** 图标库目录。模板是**文件**，用户有权知道它们存在哪。 */
+  /**
+   * 图标库目录（**当前生效**的那个）。模板是**文件**，用户有权知道它们存在哪。
+   */
   icons_dir: string;
+  /**
+   * 图标库目录**留空时的默认值**（数据目录下的 `icons/`）。
+   *
+   * 由后端下发、界面只拿它当占位提示：前端自己拼一份的话，两边迟早不一致，
+   * 而"默认到底存哪儿"恰恰最需要说准。
+   */
+  icons_dir_default: string;
   /** 图标模板的边长下限 / 上限（像素），由后端下发，前端不另写一份。 */
   template_min_side: number;
   template_max_side: number;
   audit_entry_count: number;
   is_windows: boolean;
   notice: string;
+  /**
+   * 启动时那次一次性数据搬迁的结果，**只在真发生过、或搬失败时**才有值。
+   *
+   * 数据目录从 `%APPDATA%\com.example.wecom-local-rpa\` 换到了这里，
+   * 旧配置与图标库会被搬一次。不说的话：搬成功了用户会疑惑
+   * 「配置怎么突然有值了」，搬失败了会以为「数据丢了」——两种都得有答案。
+   */
+  migration_note: string | null;
 }
 
 /** 屏幕坐标系下的矩形（像素）。 */

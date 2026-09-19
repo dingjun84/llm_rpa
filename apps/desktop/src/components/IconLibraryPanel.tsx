@@ -10,6 +10,7 @@ import {
 import {
   clickIcon,
   deleteIcon,
+  deleteIconVariant,
   listIcons,
   previewTargetWindow,
   probeNavIcon,
@@ -18,6 +19,7 @@ import {
 import type {
   IconClickResult,
   IconEntry,
+  IconVariant,
   NavIconHit,
   NavIconProbe,
   Rect,
@@ -58,10 +60,12 @@ const MIN_DRAG_PX = 3;
 const CROP_ZOOM = 4;
 
 /**
- * 路径比较用。Windows 的文件系统不区分大小写，分隔符也可能混用，
- * 直接字符串比较会把"同一个文件"判成两个，于是「用于导航」的勾选状态会莫名跳回去。
+ * 图标名的比较键。
+ *
+ * Windows 的文件系统不区分大小写，`Chat` 与 `chat` 指的是同一个目录。
+ * 直接字符串比较会把"同一个图标"判成两个，于是「用于导航」的勾选状态会莫名跳回去。
  */
-const normalizePath = (path: string) => path.trim().replace(/\\/g, "/").toLowerCase();
+const normalizeName = (name: string) => name.trim().toLowerCase();
 
 const clamp = (value: number, low: number, high: number) =>
   Math.min(high, Math.max(low, value));
@@ -168,9 +172,17 @@ function ShotOverlay({
  *
  * ## 名字是给谁看的
  *
- * 给**人**看的。配置里存的仍然是文件路径（`nav_icon_templates`），
- * 但界面上从不显示路径——路径是抄不错才怪的东西，而"通讯录""聊天-选中"
- * 这种名字一眼就能对上。
+ * 给**人**看的。配置里存的也是名字（`nav_icon_templates`），界面上从不显示路径——
+ * 路径是抄不错才怪的东西，而"聊天""通讯录"这种名字一眼就能对上。
+ *
+ * ## 一个名字 = 一组图
+ *
+ * 同一个图标在**选中 / 未选中 / 带气泡提醒 / 气泡里数字不一样**时长得都不一样，
+ * 而它们指的是**同一个**图标。所以：**名字输入框填同一个名字再存一次，就是给这个
+ * 图标补一张变体**，不是重名错误。列表里一行一个图标，那一行下面排着它的全部缩略图。
+ *
+ * 为什么不能只存一张：点完图标界面会停在这个视图上，图标随之变成选中态；
+ * 下一次跑的时候画面上是选中态，而库里只有未选中那张 ⇒ 再也匹配不上。
  */
 export function IconLibraryPanel({
   info,
@@ -199,6 +211,14 @@ export function IconLibraryPanel({
   const [click, setClick] = useState<IconClickResult | null>(null);
   /** 已经"上了膛"的那张图标：点一次变成「再点一次确认」，点第二次才真的点。 */
   const [armed, setArmed] = useState<string | null>(null);
+  /**
+   * 已经"上了膛"的**删除整组**按钮。
+   *
+   * 删一整组图标会连带它底下全部变体一起走，而每一张都是人对着屏幕框出来的——
+   * 攒一组不容易，所以它要两下。单张的「删除这张」不要二次确认：那一下只丢一张，
+   * 重截一张的成本很低，加确认反而让人每次都要点两遍。
+   */
+  const [armDelete, setArmDelete] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -229,14 +249,20 @@ export function IconLibraryPanel({
     setSelection(null);
   }, [preview]);
 
-  const configuredPaths = draft.nav_icon_templates;
-  const libraryPaths = useMemo(
-    () => new Set(entries.map((entry) => normalizePath(entry.file))),
+  const configuredNames = draft.nav_icon_templates;
+  const historyNames = draft.history_icon_templates;
+  const libraryNames = useMemo(
+    () => new Set(entries.map((entry) => normalizeName(entry.name))),
     [entries],
   );
-  /** 配置里引用了、但图标库里已经没有的模板（被删了，或者被手工改过路径）。 */
-  const dangling = configuredPaths.filter(
-    (path) => path.trim() !== "" && !libraryPaths.has(normalizePath(path)),
+  /** 配置里引用了、但图标库里已经没有的名字（被删了，或者被手工改过配置）。 */
+  const dangling = [...configuredNames, ...historyNames].filter(
+    (name) => name.trim() !== "" && !libraryNames.has(normalizeName(name)),
+  );
+  /** 输入框里那个名字是不是**已经存在**：决定保存按钮是"新建"还是"补一张"。 */
+  const existing = useMemo(
+    () => entries.find((entry) => normalizeName(entry.name) === normalizeName(name)) ?? null,
+    [entries, name],
   );
 
   const windowBox = selection && preview ? toWindowBox(selection, preview) : null;
@@ -313,6 +339,8 @@ export function IconLibraryPanel({
     setSaving(true);
     setError(null);
     setNotice(null);
+    // 保存之前先记下"这个名字原来有几张"，好把提示写成"补第几张"。
+    const wasExisting = existing !== null;
     try {
       const saved = await saveIconFromCrop(
         name,
@@ -321,10 +349,16 @@ export function IconLibraryPanel({
         [selection.x, selection.y, selection.width, selection.height],
         [preview.width, preview.height],
       );
+      const count = saved.variants.length;
+      const last = saved.variants[count - 1];
       setNotice(
-        `已存进图标库：${saved.name}（${saved.width}×${saved.height}）。` +
-          `同一个图标在**选中 / 未选中**两种状态下长得不一样——` +
-          `想再存一张，就把框挪到切换后的图标上、改个名字再保存。`,
+        wasExisting
+          ? `已给「${saved.name}」补上第 ${count} 张（${last.width}×${last.height}）。` +
+              `这一个名字下的 ${count} 张图都会参与匹配——把选中态、带气泡的样子都补上，` +
+              `换状态时就不会认不出来了。`
+          : `已新建图标「${saved.name}」（第 1 张，${last.width}×${last.height}）。` +
+              `接着把它的其他样子也存进来：框住另一个状态、名字填一样的再保存一次，` +
+              `就是给它补一张，不会覆盖前面那张。`,
       );
       setName("");
       setSelection(null);
@@ -336,32 +370,49 @@ export function IconLibraryPanel({
     }
   };
 
-  const toggleUse = (entry: IconEntry, on: boolean) => {
-    const key = normalizePath(entry.file);
-    const rest = configuredPaths.filter((path) => normalizePath(path) !== key);
-    onPatch({ nav_icon_templates: on ? [...rest, entry.file] : rest });
+  /**
+   * 把一个图标勾进 / 摘出某一组导航模板。
+   *
+   * ## 为什么是**两组**而不是一组
+   *
+   * 联系人图标与聊天历史图标长得不一样，模板不能通用。混成一个列表时，
+   * 「用错了哪一组」不会报错——只会拿聊天历史的模板去匹配联系人图标，
+   * 然后以一次分数不高的匹配转人工。分开之后，配错的那一组是**空的**，
+   * 装配期就能直接拒绝并说清是哪一组。
+   */
+  const toggleUse = (group: "nav_icon_templates" | "history_icon_templates", entry: IconEntry, on: boolean) => {
+    const key = normalizeName(entry.name);
+    const rest = draft[group].filter((name) => normalizeName(name) !== key);
+    onPatch({ [group]: on ? [...rest, entry.name] : rest } as Partial<RuntimeConfig>);
   };
 
+  /** 删掉一整组（含全部变体）。 */
   const remove = async (entry: IconEntry) => {
     setError(null);
     setNotice(null);
+    setArmDelete(null);
     try {
+      const count = entry.variants.length;
       await deleteIcon(entry.name);
-      // 文件没了，配置里那一条就是死的——留着它，任务装配时必然报
-      // 「图标模板不可用」。顺手一起摘掉，并在提示里说明白。
-      const key = normalizePath(entry.file);
-      const stillUsed = configuredPaths.some((path) => normalizePath(path) === key);
+      // 名字没了，配置里那一条就是死的——留着它，任务装配时必然报
+      // 「图标库里没有这个图标」。顺手一起摘掉，并在提示里说明白。
+      // **两组都要摘**：只摘一组的话，另一组里会留下一个死名字，
+      // 而症状是"另一条工作流一跑就在装配期报错"，看起来与这次删除无关。
+      const key = normalizeName(entry.name);
+      const stillUsed =
+        configuredNames.some((name) => normalizeName(name) === key) ||
+        historyNames.some((name) => normalizeName(name) === key);
       if (stillUsed) {
+        const strip = (names: string[]) =>
+          names.filter((name) => normalizeName(name) !== key);
         onPatch({
-          nav_icon_templates: configuredPaths.filter(
-            (path) => normalizePath(path) !== key,
-          ),
+          nav_icon_templates: strip(configuredNames),
+          history_icon_templates: strip(historyNames),
         });
       }
       setNotice(
-        stillUsed
-          ? `已删除「${entry.name}」，并把它从「用于导航」里摘掉了（记得点「保存配置」）。`
-          : `已删除「${entry.name}」。`,
+        `已删除「${entry.name}」${count > 1 ? `（连带 ${count} 张图）` : ""}` +
+          (stillUsed ? "，并把它从两组导航模板里都摘掉了（记得点「保存配置」）。" : "。"),
       );
       await refresh();
     } catch (err) {
@@ -369,7 +420,25 @@ export function IconLibraryPanel({
     }
   };
 
-  const runProbe = async (paths: string[], label: string) => {
+  /** 只删这一张，同一个名字下的其他图不动。 */
+  const removeVariant = async (entry: IconEntry, variant: IconVariant) => {
+    setError(null);
+    setNotice(null);
+    try {
+      await deleteIconVariant(entry.name, variant.relative);
+      const left = entry.variants.length - 1;
+      setNotice(
+        left > 0
+          ? `已删除「${entry.name}」的 ${variant.relative}，还剩 ${left} 张。`
+          : `已删除「${entry.name}」的最后一张，这个图标也从列表里没了。`,
+      );
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const runProbe = async (names: string[], label: string) => {
     setProbing(label);
     setProbingLabel(label);
     setProbe(null);
@@ -381,7 +450,7 @@ export function IconLibraryPanel({
           draft.window_class,
           draft.wecom_exe,
           draft.nav_strip,
-          paths,
+          names,
           draft.nav_icon_min_score,
         ),
       );
@@ -392,7 +461,7 @@ export function IconLibraryPanel({
     }
   };
 
-  const runClick = async (paths: string[], label: string) => {
+  const runClick = async (names: string[], label: string) => {
     setClicking(label);
     setArmed(null);
     setClick(null);
@@ -405,7 +474,7 @@ export function IconLibraryPanel({
           draft.wecom_exe,
           draft.nav_strip,
           draft.regions.contact_panel,
-          paths,
+          names,
           draft.nav_icon_min_score,
           // 复用「滚动停稳等待」：等待的是同一个物理现象（界面动画还没画完）。
           draft.scroll_settle_ms,
@@ -437,7 +506,13 @@ export function IconLibraryPanel({
         这件事只能靠<strong>模板匹配</strong>：拿一张图标的小图，在画面里找它最像的位置。
         <br />
         这一页就是造那张小图的地方：<strong>截一张窗口画面 → 在图上框住图标 → 起个名字存下来</strong>。
-        存好之后可以立刻「定位并点击」试一下，也可以勾上「用于导航」让任务在查找联系人之前先切视图。
+        存好之后可以立刻「定位并点击」试一下，也可以勾上「用于联系人导航」或
+        「用于聊天历史导航」，让任务在查找之前先切视图（「只做导航」那条工作流
+        则一定要勾——它除了点图标什么都不做）。
+        <br />
+        <strong>一个名字可以存多张图</strong>：同一个图标在选中 / 未选中 / 带气泡提醒 /
+        气泡里数字不一样时长得都不一样，而它们指的是同一个图标。名字填一样的再存一次就是
+        <strong>给它补一张</strong>，这一个名字下的所有图都会参与匹配。
       </p>
 
       {!windowReady && (
@@ -547,12 +622,31 @@ export function IconLibraryPanel({
                   type="text"
                   value={name}
                   disabled={disabled}
-                  placeholder="例如：通讯录 / 聊天 / 通讯录-选中"
+                  list="icon-library-names"
+                  placeholder="例如：聊天 / 通讯录"
                   onChange={(event) => setName(event.target.value)}
                 />
+                {/* 已存在的名字做成候选：想给同一个图标补一张时**不用手抄名字**，
+                    抄错一个字符就会悄悄多出一个新图标，而那个新图标只有一张图。 */}
+                <datalist id="icon-library-names">
+                  {entries.map((entry) => (
+                    <option key={entry.name} value={entry.name} />
+                  ))}
+                </datalist>
                 <span className="field-hint">
-                  名字是给你自己看的，也是引用它的依据。同一个图标建议把
-                  <strong>选中 / 未选中</strong>两种状态各存一张，名字区分开。
+                  名字是给你自己看的，也是引用它的依据。
+                  {existing ? (
+                    <>
+                      <strong>「{existing.name}」已经有 {existing.variants.length} 张图了</strong>
+                      ——再点保存就是给它<strong>补一张</strong>（框住另一个状态再存），
+                      不会覆盖前面那些。
+                    </>
+                  ) : (
+                    <>
+                      同一个图标有几种样子就存几张：<strong>名字填一样的</strong>，
+                      分别框住未选中 / 选中 / 带气泡的样子各存一次。
+                    </>
+                  )}
                 </span>
               </label>
 
@@ -565,7 +659,11 @@ export function IconLibraryPanel({
                   }
                   onClick={save}
                 >
-                  {saving ? "保存中…" : "保存到图标库"}
+                  {saving
+                    ? "保存中…"
+                    : existing
+                      ? `给「${existing.name}」补第 ${existing.variants.length + 1} 张`
+                      : "新建图标并存下这张"}
                 </button>
               </div>
               {sizeIssue && <p className="notice notice-warn">{sizeIssue}</p>}
@@ -580,7 +678,35 @@ export function IconLibraryPanel({
           <h3>图标库</h3>
           {loadingList && <span className="field-hint">读取中…</span>}
         </div>
-        <p className="field-hint mono">{info.icons_dir}</p>
+
+        <label className="field">
+          <span className="field-label">图标库目录</span>
+          <input
+            type="text"
+            value={draft.icons_dir ?? ""}
+            disabled={disabled}
+            placeholder={info.icons_dir_default}
+            onChange={(event) =>
+              onPatch({
+                icons_dir: event.target.value.trim() === "" ? null : event.target.value,
+              })
+            }
+          />
+          <span className="field-hint">
+            现在生效的是 <code className="mono">{info.icons_dir}</code>。
+            留空 = 用默认（<strong>项目根</strong>下的 <code>data/icons/</code>）；
+            写相对路径按项目根解析，所以换盘符、换机器都不会失效。
+            <br />
+            一个图标名对应这里的一个子目录，目录里可以放多张图。
+            {draft.icons_dir?.trim() ? (
+              <>
+                {" "}
+                ⚠️ 草稿里改过了——<strong>列表读的是已保存的目录</strong>，
+                改完要点下面的「保存配置」。
+              </>
+            ) : null}
+          </span>
+        </label>
 
         {listError && <p className="notice notice-error">读取图标库失败：{listError}</p>}
         {entries.length === 0 && !listError && (
@@ -589,46 +715,100 @@ export function IconLibraryPanel({
 
         <ul className="icon-list">
           {entries.map((entry) => {
-            const used = configuredPaths.some(
-              (path) => normalizePath(path) === normalizePath(entry.file),
+            const key = normalizeName(entry.name);
+            const usedForContact = configuredNames.some(
+              (name) => normalizeName(name) === key,
             );
-            const broken = entry.problem !== null;
+            const usedForHistory = historyNames.some(
+              (name) => normalizeName(name) === key,
+            );
+            const broken = !entry.usable;
             const isArmed = armed === entry.name;
+            const isArmedDelete = armDelete === entry.name;
+            const sizes = entry.variants
+              .filter((variant) => variant.problem === null)
+              .map((variant) => `${variant.width}×${variant.height}`);
+            const distinct = Array.from(new Set(sizes));
             return (
               <li key={entry.name} className={broken ? "icon-row is-broken" : "icon-row"}>
-                {entry.image ? (
-                  <img className="icon-thumb" src={entry.image} alt={entry.name} />
-                ) : (
-                  <span className="icon-thumb icon-thumb-empty">?</span>
-                )}
                 <div className="icon-meta">
                   <span className="icon-name">{entry.name}</span>
                   <span className="field-hint">
-                    {broken
-                      ? "尺寸读不出来"
-                      : `${entry.width}×${entry.height}`}{" "}
-                    · {entry.bytes} 字节
+                    {entry.variants.length} 张
+                    {distinct.length === 1 ? ` · ${distinct[0]}` : ""}
+                    {broken ? " · 有读不出来的" : ""}
                   </span>
-                  {broken && (
-                    <span className="notice notice-error">
-                      这张图现在不能当模板：{entry.problem}
-                    </span>
-                  )}
                 </div>
+
+                <ul className="icon-variants">
+                  {entry.variants.map((variant) => (
+                    <li
+                      key={variant.relative}
+                      className={variant.problem ? "icon-variant is-broken" : "icon-variant"}
+                    >
+                      {variant.image ? (
+                        <img
+                          className="icon-thumb"
+                          src={variant.image}
+                          alt={variant.relative}
+                          title={variant.relative}
+                        />
+                      ) : (
+                        <span className="icon-thumb icon-thumb-empty">?</span>
+                      )}
+                      <span className="icon-variant-meta">
+                        {variant.problem ? "读不出来" : `${variant.width}×${variant.height}`}
+                      </span>
+                      <button
+                        type="button"
+                        className="ghost icon-variant-remove"
+                        disabled={disabled}
+                        title={`删除 ${variant.relative}（同一个名字下的其他图不动）`}
+                        onClick={() => void removeVariant(entry, variant)}
+                      >
+                        删除这张
+                      </button>
+                      {variant.problem && (
+                        <span className="icon-variant-problem">
+                          这张现在不能当模板：{variant.problem}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+
                 <div className="icon-actions">
+                  {/* 两组分开勾：联系人图标与聊天历史图标长得不一样，模板不能通用。
+                      勾错一组不会报错——只会拿另一个图标的模板去匹配，然后以
+                      一次分数不高的匹配转人工。分开之后配错的那一组是空的，
+                      装配期就能直接拒绝并说清是哪一组。 */}
                   <label className="field-check icon-use">
                     <input
                       type="checkbox"
-                      checked={used}
+                      checked={usedForContact}
                       disabled={disabled || broken}
-                      onChange={(event) => toggleUse(entry, event.target.checked)}
+                      onChange={(event) =>
+                        toggleUse("nav_icon_templates", entry, event.target.checked)
+                      }
                     />
-                    <span>用于导航</span>
+                    <span>用于联系人导航</span>
+                  </label>
+                  <label className="field-check icon-use">
+                    <input
+                      type="checkbox"
+                      checked={usedForHistory}
+                      disabled={disabled || broken}
+                      onChange={(event) =>
+                        toggleUse("history_icon_templates", entry, event.target.checked)
+                      }
+                    />
+                    <span>用于聊天历史导航</span>
                   </label>
                   <button
                     type="button"
                     disabled={disabled || broken || !windowReady || probing !== null}
-                    onClick={() => runProbe([entry.file], entry.name)}
+                    title={`把「${entry.name}」的 ${entry.variants.length} 张图都拿去匹配一遍`}
+                    onClick={() => runProbe([entry.name], entry.name)}
                   >
                     {probing === entry.name ? "匹配中…" : "测试匹配"}
                   </button>
@@ -638,7 +818,7 @@ export function IconLibraryPanel({
                     disabled={disabled || broken || !windowReady || clicking !== null}
                     title="会真的在客户端窗口上点一下鼠标"
                     onClick={() => {
-                      if (isArmed) void runClick([entry.file], entry.name);
+                      if (isArmed) void runClick([entry.name], entry.name);
                       else setArmed(entry.name);
                     }}
                   >
@@ -650,11 +830,17 @@ export function IconLibraryPanel({
                   </button>
                   <button
                     type="button"
-                    className="ghost"
+                    className={isArmedDelete ? "danger" : "ghost"}
                     disabled={disabled}
-                    onClick={() => void remove(entry)}
+                    title={`删除「${entry.name}」以及它底下的 ${entry.variants.length} 张图`}
+                    onClick={() => {
+                      if (isArmedDelete) void remove(entry);
+                      else setArmDelete(entry.name);
+                    }}
                   >
-                    删除
+                    {isArmedDelete
+                      ? `再点一次＝删掉全部 ${entry.variants.length} 张`
+                      : "删除整个图标"}
                   </button>
                 </div>
               </li>
@@ -664,19 +850,31 @@ export function IconLibraryPanel({
 
         {dangling.length > 0 && (
           <p className="notice notice-warn">
-            配置里引用了 {dangling.length} 张<strong>不在图标库里</strong>的模板
-            （文件被删了、或者路径被手工改过）。任务装配时会直接报错，
-            建议在这里重新勾选，或者把它们从配置里去掉。
+            配置里引用了 {dangling.length} 个<strong>不在图标库里</strong>的图标
+            （{dangling.join("、")}——被删了，或者图标库目录被改过）。
+            任务装配时会直接报错，建议在这里重新勾选，或者把它们从配置里去掉。
           </p>
         )}
 
         <div className="calibration-actions">
           <button
             type="button"
-            disabled={disabled || probing !== null || configuredPaths.length === 0 || !windowReady}
-            onClick={() => runProbe(configuredPaths, "全部已选模板")}
+            disabled={
+              disabled ||
+              probing !== null ||
+              (configuredNames.length === 0 && historyNames.length === 0) ||
+              !windowReady
+            }
+            onClick={() =>
+              runProbe(
+                // 两组一起量：操作者点这个按钮时想知道的是"我配的这些到底行不行"，
+                // 而两组用的是同一套阈值与同一个搜索区。
+                [...configuredNames, ...historyNames],
+                "全部已选图标",
+              )
+            }
           >
-            {probing === "全部已选模板" ? "匹配中…" : "测试全部已选模板"}
+            {probing === "全部已选图标" ? "匹配中…" : "测试全部已选图标"}
           </button>
         </div>
       </section>
@@ -700,16 +898,19 @@ export function IconLibraryPanel({
             <span className="field-label">任务开始前先点击导航图标跳转</span>
             <span className="field-hint">
               打开后，任务在查找联系人之前会先匹配一次图标、点它一下。打开时必须
-              <strong>至少勾一张「用于导航」</strong>，否则任务在装配期就被拒绝
+              <strong>至少勾一张「用于联系人导航」</strong>，否则任务在装配期就被拒绝
               （不会在任务列表里留下一条注定失败的记录）。
+              <br />
+              「只做导航」那条工作流<strong>不受这个开关控制</strong>：
+              导航就是它的全部内容，所以它一定会去点图标，也就一定要求模板。
             </span>
           </span>
         </label>
 
-        {draft.navigate_before_search && configuredPaths.length === 0 && (
+        {draft.navigate_before_search && configuredNames.length === 0 && (
           <p className="notice notice-warn">
-            已经打开，但<strong>一张模板都没勾</strong>——这样保存下去，
-            点「开始任务」时会在装配期被直接拒绝。在上面勾一张「用于导航」。
+            已经打开，但<strong>一个图标都没勾</strong>——这样保存下去，
+            点「开始任务」时会在装配期被直接拒绝。在上面勾一个「用于联系人导航」。
           </p>
         )}
 
@@ -750,6 +951,25 @@ export function IconLibraryPanel({
                 />
               </label>
             ))}
+            <label>
+              <span>位置先验容差</span>
+              <input
+                type="number"
+                min={0}
+                max={1}
+                step={0.01}
+                value={draft.icon_prior_score_tolerance}
+                disabled={disabled}
+                onChange={(event) =>
+                  onPatch({
+                    icon_prior_score_tolerance: ratio(
+                      event.target.value,
+                      draft.icon_prior_score_tolerance,
+                    ),
+                  })
+                }
+              />
+            </label>
           </div>
           <span className="field-hint">
             <strong>搜索区</strong>是「去窗口的哪一块里找图标」（相对窗口的比例）。
@@ -761,6 +981,14 @@ export function IconLibraryPanel({
             <strong>最低分数</strong>是归一化互相关（1.0 = 完全一致）。
             <strong>不要照抄默认值</strong>——用「测试匹配」对着当前靶标量一次。
             定低了会点错图标，定高了会频繁转人工。
+          </span>
+          <span className="field-hint">
+            <strong>位置先验容差</strong>（<code>0</code> = 关掉先验，默认{" "}
+            <code>0.05</code>）：导航栏是一列纵向排列、彼此长得很像的图标，
+            逐张模板取最高分时偶尔会出现「旁边那个图标分数略高一点」。
+            而这件事有先验可用——<strong>越靠近导航区中心的命中越可信</strong>。
+            容差决定「分数差多少以内才允许用位置来取舍」：
+            定大了等于用位置替代了识别，定小了先验基本不生效。
           </span>
         </div>
 

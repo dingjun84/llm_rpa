@@ -12,14 +12,18 @@ use std::time::Duration;
 
 use automation_core::{
     AuditSink, CalibratedWindow, ContainsNameMatcher, HumanConfirmation, IconTemplate, LocalOcr,
-    RelativePoint, RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask,
-    StrictContactMatcher, WorkflowRunner, DEFAULT_MIN_CONFIDENCE, DEFAULT_NAV_ICON_MIN_SCORE,
-    DEFAULT_NAV_STRIP, DEFAULT_REGIONS,
+    NavTarget, RelativePoint, RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask,
+    StrictContactMatcher, Workflow, WorkflowRunner, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
+    DEFAULT_MIN_CONFIDENCE, DEFAULT_NAV_ICON_MIN_SCORE, DEFAULT_NAV_STRIP,
+    DEFAULT_PROFILE_CHAT_ENTRY_TEXT, DEFAULT_PROFILE_SCROLL_ANCHOR, DEFAULT_REGIONS,
+    DEFAULT_SCROLL_ANCHOR, DEFAULT_SEARCH_CONTACT_GROUP_LABEL,
 };
 use platform_mock::{
     MockContactMatcher, MockDesktop, MockHumanConfirmation, MockIconLocator, MockOcr, MockScenario,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::calibration;
 
 /// 单步超时相对 OCR 超时的余量（秒）。
 ///
@@ -101,7 +105,9 @@ pub struct ScrollAnchorConfig {
 
 impl Default for ScrollAnchorConfig {
     fn default() -> Self {
-        Self { x: 0.62, y: 0.5 }
+        // 从核心层的常量派生，**不在这里再写一份字面量**：界面按一份显示、
+        // 任务按另一份滚动时，现象只是「滚了半天没反应」，看不出是两边不同步。
+        Self { x: DEFAULT_SCROLL_ANCHOR.x, y: DEFAULT_SCROLL_ANCHOR.y }
     }
 }
 
@@ -166,7 +172,9 @@ pub struct RuntimeConfig {
     /// 标定时记录的窗口几何。
     ///
     /// 客户端由操作者手动启动并登录，任务只在**这个尺寸**下工作：
-    /// 尺寸对不上就转人工，绝不按错的尺寸去点。
+    /// 尺寸对不上会先自动把窗口调回这个尺寸（见
+    /// `automation_core::runner` 的 `ensure_calibrated_size`），
+    /// 客户端的最小尺寸不允许时才会转人工——绝不按错的尺寸去点。
     /// 真实模式下这一项必须有值（[`build_runner`] 会拦），演练模式下用不上。
     pub calibrated_window: Option<WindowGeometry>,
     /// 联系人列表最多**完整**扫描几轮（每轮 = 从列表顶部向下扫到底）。
@@ -216,15 +224,34 @@ pub struct RuntimeConfig {
     /// 演练模式同样要求配模板——两个模式的校验规则必须一致，
     /// 否则"演练通过、真实报错"这种事迟早会发生。
     pub navigate_before_search: bool,
-    /// 导航图标模板的 **PNG 路径**，可以多张（每行一个）。
+    /// 参与匹配的图标：**图标名**，可以多个。
     ///
-    /// 为什么要多张：同一个图标在**选中 / 未选中**两种状态下长得不一样。
-    /// 只留一张，就会出现"上一次运行点完停在这个页面上，这一次再也匹配不上"。
+    /// ## 为什么存的是名字，不是路径
     ///
-    /// 模板要**自己截**（用 `screen_probe template`，或系统的截图工具），
+    /// 一个名字底下可以有**任意多张图**（`data/icons/聊天/1.png`、`2.png`…）：
+    /// 同一个图标在选中 / 未选中 / 带气泡提醒 / 气泡里数字不一样时长得都不一样，
+    /// 而它们指的是**同一个**图标。
+    ///
+    /// 配置引用名字，载入时才展开成"这个名字下的全部图"。这样以后补一张变体
+    /// 不用回配置页重勾一次——每补一张都要重勾，迟早会漏，而漏掉的那张**不报任何错**，
+    /// 只表现为「这个状态下匹配不上」。
+    ///
+    /// ## 为什么必须有多张
+    ///
+    /// 只留一张（比如只留未选中态）会出现：上一次运行点完，界面**停在这个视图上**，
+    /// 图标随之变成选中态；这一次跑的时候画面上是选中态，于是再也匹配不上。
+    ///
+    /// 模板要**自己截**（界面上「图标库」页，或 `screen_probe template`），
     /// 不要指望程序自动裁一个：程序猜出来的模板会把"点错了地方"变成一次
     /// 看起来完全正常的运行——匹配分数照样很高，因为它匹配的是它自己刚裁的那块。
     pub nav_icon_templates: Vec<String>,
+    /// 图标库目录。**留空 = 用默认**（项目根下的 `data/icons/`）。
+    ///
+    /// 默认放在项目里而不是 AppData：AppData 底下那层目录名是包标识符，
+    /// 没人记得住，找一次要翻半天；而图标模板是人对着屏幕一张一张框出来的素材。
+    ///
+    /// 写相对路径时按**项目根**解析（例如 `data/icons`），换盘符/换机器都不会失效。
+    pub icons_dir: Option<String>,
     /// 图标模板匹配的最低分数（0–1），低于它转人工。
     ///
     /// 界面上那个「测试图标匹配」按钮就是用来量这个值的：它会报出当前画面上
@@ -232,6 +259,78 @@ pub struct RuntimeConfig {
     pub nav_icon_min_score: f32,
     /// 导航图标搜索区（相对窗口比例 `[x, y, w, h]`）。
     pub nav_strip: [f32; 4],
+    /// 本次任务走哪条路。见 [`automation_core::Workflow`]。
+    ///
+    /// ## 为什么要显式选，而不是自动判断
+    ///
+    /// 「找联系人」有两条完全不同的路：在顶部搜索框里打字、从联想下拉里挑人；
+    /// 或者在会话列表里往下滚、用 OCR 一行行认名字。两者看的是**不同的界面**，
+    /// 需要的标定区域也不同（搜索式要 `main_search` / `search_dropdown` /
+    /// `contact_profile`，列表式只用 `list_area`）。
+    ///
+    /// 而它们的失败现象一模一样：**「找不到联系人」**。自动判断一旦选错，
+    /// 现场就分不清是"搜索没生效"还是"列表里真的没有这个人"——
+    /// 这两种情况的处置方向完全相反。所以由操作者显式指定。
+    pub workflow: Workflow,
+    /// 「只做导航」时要点哪一个图标（只有 [`Workflow::NavigateOnly`] 读它）。
+    ///
+    /// 把"找图标 → 点它"单独拎出来跑一遍，是为了在图标匹配不准时**一眼看出来**：
+    /// 混在完整流程里的话，点错图标的症状会表现为"找不到联系人"，
+    /// 排查方向会一路偏向 OCR。
+    pub nav_target: NavTarget,
+    /// **聊天历史**图标的模板（**图标名**，可以多个变体）。
+    ///
+    /// 与 [`Self::nav_icon_templates`]（联系人图标）分开存：两个图标长得不一样，
+    /// 混成一个列表时，"用错了哪一组"会退化成一次分数不高的匹配，
+    /// 而不是一个能一眼看出来的配置错误。
+    pub history_icon_templates: Vec<String>,
+    /// 位置先验的分数容差，`0` = **关掉**先验。
+    ///
+    /// 导航栏是一列纵向排列、彼此长得很像的图标，逐张模板取最高分时偶尔会出现
+    /// "旁边那个图标分数略高一点"。而这件事有先验可用：**越靠近导航区中心的
+    /// 命中越可信**。容差决定"分数差多少以内才允许用位置来取舍"——
+    /// 定大了等于用位置替代了识别，定小了先验基本不生效。
+    pub icon_prior_score_tolerance: f32,
+    /// 逐字输入时**字符之间**的间隔（毫秒）。`0` = 不留间隔。
+    ///
+    /// 为什么要有间隔：输入框带联想（搜索框尤其明显），一次性灌进去的字符
+    /// 可能被联想逻辑吞掉或重排。逐字输入 + 间隔是"像人一样打字"的最小代价。
+    ///
+    /// 为什么是**配置项**而不是写死：不同机器上客户端处理输入的速度差很多，
+    /// 写死一个数必然在某些机器上偏快（丢字）、在另一些机器上白等。
+    pub typing_interval_ms: u64,
+    /// 资料页里"进入聊天"那个入口上的文字（默认「发消息」）。
+    ///
+    /// 做成配置而不是写死：这是**靶标相关的文字**，换一个客户端版本就可能不一样
+    /// （本机靶标是微信 4.x，`window_class` 默认值也是为它改过的）。
+    /// 写死的话，症状是"资料页滚到底了却找不到入口"——看不出是文字对不上。
+    pub profile_chat_entry_text: String,
+    /// 搜索下拉里"联系人"那一组的标题文字（默认「联系人」）。
+    ///
+    /// 下拉是**分组**的（联系人 / 聊天记录 / 群聊…），只有"联系人"那一组下面
+    /// 才是人。标题取错的话，会把"聊天记录里提到这个名字"当成联系人。
+    pub search_contact_group_label: String,
+    /// 界面标定出来的**新增区域**（键 = `calibration::ITEMS` 里的 `key`）。
+    ///
+    /// ## 为什么是 map，不是又一组具名字段
+    ///
+    /// 标定项会随流程完善而增长，而每加一项都要人对着屏幕重新框一次。
+    /// 每加一项都去动 Rust 结构体、TypeScript 类型、界面元数据表三处，
+    /// 漏一处**不会报错**——只表现为界面上少一个入口，或者多一个永远存不进去的框。
+    /// 存成 map 之后，清单只有 `calibration.rs` 一处，界面把它当数据渲染。
+    ///
+    /// ## 为什么没有默认值
+    ///
+    /// [`Self::regions`] 里那四个区域是有默认值的（编排层必须拿到它们），
+    /// 而这里的区域对应的步骤还没有编排代码。**没标就是没有**：
+    /// 给一个猜出来的默认值，症状会是「任务照常跑完，只是点到了别的地方」。
+    ///
+    /// ## 为什么存 `AreaMark` 而不是裸的 `[f32; 4]`
+    ///
+    /// 比例本身跨窗口尺寸可用，但界面元素（左侧图标栏、头像列）是**固定像素宽**的，
+    /// 换了窗口尺寸就得重标（见 `docs/todo.md` T2）。所以每一项都要能回答
+    /// "这一份比例是在多大的窗口上量的"——只存四个浮点数是答不出来的。
+    pub area_marks: calibration::AreaMarks,
 }
 
 impl Default for RuntimeConfig {
@@ -273,8 +372,24 @@ impl Default for RuntimeConfig {
             // 默认打开等于让每个还没准备模板的人都撞上一次装配错误。
             navigate_before_search: false,
             nav_icon_templates: Vec::new(),
+            // 留空 = 项目根下的 `data/icons/`，由 `icon_library::resolve_dir` 定夺。
+            icons_dir: None,
             nav_icon_min_score: DEFAULT_NAV_ICON_MIN_SCORE,
             nav_strip: flatten(DEFAULT_NAV_STRIP),
+            // 默认走**搜索式**：它不依赖"列表里滚得到人"，是操作者当下要的那条路。
+            // 列表扫描式仍然完整保留（`ScrollListContact`），改这一项即可切回去。
+            workflow: Workflow::SearchContact,
+            nav_target: NavTarget::Contact,
+            history_icon_templates: Vec::new(),
+            icon_prior_score_tolerance: DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
+            // 30ms 的依据：比人手打字快，又给客户端的联想逻辑留出处理时间。
+            // 这是**间隔**不是超时，累加起来也就每字符 30ms，不影响总时长。
+            typing_interval_ms: 30,
+            profile_chat_entry_text: DEFAULT_PROFILE_CHAT_ENTRY_TEXT.to_string(),
+            search_contact_group_label: DEFAULT_SEARCH_CONTACT_GROUP_LABEL.to_string(),
+            // 空表 = 一个新增区域都还没标。这不是"缺失"，是如实反映现状：
+            // 界面会把它们显示成「未标定」，而不是画一个猜出来的框。
+            area_marks: calibration::AreaMarks::new(),
         }
     }
 }
@@ -282,6 +397,21 @@ impl Default for RuntimeConfig {
 /// 把 [`RelativeRegion`] 摊平成配置里用的 `[x, y, w, h]`。
 fn flatten(region: RelativeRegion) -> [f32; 4] {
     [region.x, region.y, region.width, region.height]
+}
+
+/// 从标定结果里取一个**新增区域**的比例。
+///
+/// 键就是标定清单里的 `key`（`calibration::ITEMS`），所以这里不需要一张映射表——
+/// 多一张表就多一处会跟清单不同步的地方。
+///
+/// `None` = 还没标过。**不兜底、不猜**：给一个默认值的话，症状会是
+/// "任务照常跑完，只是点到了别的地方"，那是本项目最难查的一类现象。
+/// 缺哪些区域会在装配期被拦下（见 [`build_runner`]）。
+fn mark_region(config: &RuntimeConfig, key: &str) -> Option<RelativeRegion> {
+    config.area_marks.get(key).map(|mark| {
+        let [x, y, width, height] = mark.rect;
+        RelativeRegion::new(x, y, width, height)
+    })
 }
 
 impl RuntimeConfig {
@@ -337,6 +467,24 @@ impl RuntimeConfig {
                 self.nav_strip[2],
                 self.nav_strip[3],
             ),
+            workflow: self.workflow,
+            nav_target: self.nav_target,
+            // 与 `nav_icon_templates` 同理：载入 PNG 会失败，而本方法没有 `Result`。
+            // 由 `build_runner` 在装配期把两组模板都填上，失败就在任务登记之前报出来。
+            history_icon_templates: Vec::new(),
+            icon_prior_score_tolerance: self.icon_prior_score_tolerance,
+            // 这四个区域来自「界面标定」页。**没标就是 `None`**，
+            // 由装配期（真实/演练都算）按所选工作流的要求拦下。
+            nav_bar: mark_region(self, "nav_bar"),
+            main_search: mark_region(self, "main_search"),
+            search_dropdown: mark_region(self, "search_dropdown"),
+            contact_profile: mark_region(self, "contact_profile"),
+            profile_chat_entry_text: self.profile_chat_entry_text.clone(),
+            search_contact_group_label: self.search_contact_group_label.clone(),
+            // 资料页是一整块可滚动内容，正中一定落在内容上，所以**不给配置项**：
+            // 会话列表那个落点之所以可调，是因为要避开头像列与姓名列，
+            // 而这里没有需要避开的东西。多一个旋钮就多一处会被设错的地方。
+            profile_scroll_anchor: DEFAULT_PROFILE_SCROLL_ANCHOR,
         }
     }
 
@@ -417,6 +565,10 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
             wecom_exe: config.wecom_exe.as_ref().map(std::path::PathBuf::from),
             wecom_exe_sha256: config.wecom_exe_sha256.clone(),
             window_matcher: platform_windows::WindowMatcher::ClassName(config.window_class.clone()),
+            // 逐字输入的字符间隔：搜索框是联想式的，连珠炮式地灌进去会让联想
+            // 请求互相打断，而下拉列表只按第一个字符的结果定格——
+            // 现象是"搜出来的东西不对"，不会让人想到是**输入太快**。
+            typing_interval: Duration::from_millis(config.typing_interval_ms),
             // 其余取默认值：粘贴后清空剪贴板、600ms 剪贴板读取等待、4M 像素捕获上限。
             ..WindowsDesktopConfig::default()
         });
@@ -449,53 +601,154 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
     }
 }
 
-/// 载入导航图标模板。
+/// 载入一组导航图标模板：把配置里的**图标名**展开成它底下的**全部图**，再逐张读进来。
 ///
-/// **必须在任务登记之前调用**：模板文件不存在、尺寸不像图标，都要在
+/// `what` 是这组模板对应的目标名（「联系人」/「聊天历史」）。**必须传**：
+/// 两个目标各有各的模板组，报错时不说清是哪一个，人只会去改错的那一组。
+///
+/// **必须在任务登记之前调用**：图标不存在、尺寸不像图标，都要在
 /// "任务还没进列表"的时候就报出来。否则列表里会留下一条注定失败的记录，
 /// 看起来像是真的跑过——而它连第一步都没走完。
 ///
 /// 校验规则对两个模式**完全一致**。演练模式本来可以放宽（替身不读图片），
 /// 但那样就会出现"演练一路通过、切到真实模式立刻报错"，而报错的那一刻
 /// 任务已经登记了。宁可在演练模式也要求配一张真图片。
-pub(crate) fn load_nav_icon_templates(paths: &[String]) -> Result<Vec<IconTemplate>, String> {
-    let paths: Vec<&str> = paths
-        .iter()
-        .map(|path| path.trim())
-        .filter(|path| !path.is_empty())
-        .collect();
+pub(crate) fn load_nav_icon_templates(
+    icons_dir: &std::path::Path,
+    names: &[String],
+    what: &str,
+) -> Result<Vec<IconTemplate>, String> {
+    let paths = crate::icon_library::resolve_selection(icons_dir, names)?;
     if paths.is_empty() {
-        return Err(
-            "「先点击导航图标跳转」已经打开，但没有配置任何图标模板。\
-             请先用 screen_probe 的 template 子命令从目标窗口截一张图标 PNG，\
-             再把路径填进「导航图标模板」。"
-                .to_string(),
-        );
+        return Err(format!(
+            "没有配置「{what}」图标的模板，无法定位它。\
+             到「图标库」页对着那个图标截一张图、框出来存下来，\
+             再把它勾进这一组（当前图标库目录：{}）。",
+            icons_dir.display()
+        ));
     }
 
     let mut templates = Vec::with_capacity(paths.len());
-    for path in paths {
-        let path = std::path::PathBuf::from(path);
-        // label 取文件名：失败信息里要能一眼看出是**哪一张**模板出的问题。
-        // 用完整路径会让一行日志变得很长，而文件名在同一个目录下是唯一的。
+    for path in &paths {
+        // label 取**相对图标库目录**的路径（`聊天/2.png`）：失败信息里要能一眼看出
+        // 是哪个图标的哪一张出的问题。用完整路径会让一行日志变得很长。
         let label = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        let template =
-            vision::load_icon_template(&path, label).map_err(|err| format!("图标模板不可用：{err}"))?;
+            .strip_prefix(icons_dir)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let template = vision::load_icon_template(path, label)
+            .map_err(|err| format!("图标模板不可用：{err}"))?;
         templates.push(template);
     }
     Ok(templates)
 }
 
+/// 所选工作流**必须**标好的新增区域（键 = 标定清单里的 `key`）。
+///
+/// ## 为什么按工作流分别要求，而不是"一概全要"或"一概不要"
+///
+/// - 一概全要：只想跑列表扫描式的人也得去标搜索框、下拉、资料页——三块
+///   他根本不会走到的区域。多标一块就是多一次"框歪了"的机会。
+/// - 一概不要：搜索式会在走到那一块时才转人工，而那时任务**已经登记进列表**，
+///   看起来像是真跑过一遍。
+///
+/// ## 为什么 `NavigateOnly` 一个都不要
+///
+/// 它连人都不找，只用导航区与图标模板。但它在**真实模式**下仍然要求
+/// 标定窗口尺寸——那是 `build_runner` 开头那道与工作流无关的检查。
+fn required_marks(workflow: Workflow) -> &'static [&'static str] {
+    match workflow {
+        // 搜索式：点搜索框 → 在下拉里挑人 → 在资料页点「发消息」。
+        // 这三块各自对应一步点击，缺任何一块都走不下去。
+        Workflow::SearchContact => &["main_search", "search_dropdown", "contact_profile"],
+        // 列表扫描式只用 `regions.contact_panel`（必填、有默认值）。
+        Workflow::ScrollListContact | Workflow::NavigateOnly => &[],
+    }
+}
+
+/// 缺哪些区域、分别叫什么（给操作者看的名字取自标定清单，**不在这里另起一份**）。
+fn missing_marks(config: &RuntimeConfig) -> Vec<String> {
+    required_marks(config.workflow)
+        .iter()
+        .filter(|key| mark_region(config, key).is_none())
+        .map(|key| {
+            // 清单里的 `label` 才是界面上的说法（「搜索框区」「下拉列表区域」…）。
+            // 用 `key` 报错的话，人得自己把 `main_search` 翻译成界面上那一项。
+            calibration::find_item(key).map_or_else(|| (*key).to_string(), |item| {
+                format!("{}（{}）", item.label, item.key)
+            })
+        })
+        .collect()
+}
+
+/// 一项标定区域对某条工作流的必要性（下发给界面）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarkRequirement {
+    pub key: String,
+    /// 界面上的说法（标定清单里的 `label`）。
+    pub label: String,
+    /// 当前配置里标了没有。
+    pub marked: bool,
+}
+
+/// 一条工作流要用到哪些标定区域。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRequirement {
+    pub workflow: Workflow,
+    /// 工作流的名字，取自 `Workflow::describe`。
+    pub label: String,
+    /// 必须标好的区域；空表 = 这条工作流一块新增区域都不需要。
+    pub required: Vec<MarkRequirement>,
+}
+
+/// 列出每条工作流需要哪些区域，以及**这份配置里标了没有**。
+///
+/// ## 为什么由后端算，而不是界面自己列一张表
+///
+/// 「这条工作流需要哪几块」是一个**判据**——装配期就是按 [`required_marks`]
+/// 拒绝任务的。界面再写一份的话，两边不一致时的表现是
+/// 「界面说齐了、点开始却被拒」，而人只会去怀疑标定本身。
+/// 所以判据留在这一处，界面只负责渲染。
+///
+/// ## 为什么参数是配置、而不是读服务端那份
+///
+/// 界面是**草稿式**的：操作者刚把工作流改成搜索式、还没点保存时，
+/// 他要看的是"我现在这份配置还缺什么"。读服务端那份会答非所问。
+pub fn workflow_requirements(config: &RuntimeConfig) -> Vec<WorkflowRequirement> {
+    Workflow::ALL
+        .iter()
+        .map(|workflow| WorkflowRequirement {
+            workflow: *workflow,
+            label: workflow.describe().to_string(),
+            required: required_marks(*workflow)
+                .iter()
+                .map(|key| MarkRequirement {
+                    key: (*key).to_string(),
+                    label: calibration::find_item(key).map_or_else(
+                        || (*key).to_string(),
+                        |item| item.label.to_string(),
+                    ),
+                    marked: mark_region(config, key).is_some(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// 组装一个可运行的 [`WorkflowRunner`]。
+///
+/// `icons_dir` 是**图标库目录**（由调用方按 [`RuntimeConfig::icons_dir`] 解析好）。
+/// 之所以从外面传进来而不是在这里算：算它需要"配置没写时的兜底目录"，
+/// 那是应用状态才知道的事（见 `AppState::icons_dir`）。
 ///
 /// `confirmation` 由调用方注入：真实界面走 [`crate::confirmation::UiConfirmation`]，
 /// 因此"人工确认"不是被跳过的环节，而是真的会阻塞等待操作者。
 pub fn build_runner(
     config: &RuntimeConfig,
     task: &SendTask,
+    icons_dir: &std::path::Path,
     audit: Arc<dyn AuditSink>,
     ledger: Arc<dyn SendLedger>,
     confirmation: Arc<dyn HumanConfirmation>,
@@ -525,6 +778,48 @@ pub fn build_runner(
         ));
     }
 
+    // ── 所选工作流必须的标定区域 ────────────────────────────────
+    //
+    // 和上面两条同一个道理：**放在装配期**。装配失败**不会在任务列表里
+    // 留下记录**，装配成功才会登记。所以能提前判的一律提前判。
+    let missing = missing_marks(config);
+    if !missing.is_empty() {
+        return Err(format!(
+            "「{}」还缺 {} 块没标定的区域：{}。\
+             请到「界面标定」页按提示切到对应界面、截图、把这几块框出来，\
+             保存配置后再跑——否则会在走到那一步时转人工，\
+             而那时任务已经登记进列表了。",
+            config.workflow.describe(),
+            missing.len(),
+            missing.join("、")
+        ));
+    }
+
+    // ── 靶标文字不能是空的 ──────────────────────────────────────
+    //
+    // 空串在"包含"判断里**匹配一切**：空的分组标题会让下拉里的第一行
+    // 被当成「联系人」组的标题，于是后面整段判据全部错位——而任务照样跑完。
+    // 这属于"配置写错了"而不是"界面上没有"，所以在装配期拦。
+    for (value, label, key) in [
+        (
+            &config.profile_chat_entry_text,
+            "资料页进入聊天的入口文字",
+            "profile_chat_entry_text",
+        ),
+        (
+            &config.search_contact_group_label,
+            "搜索下拉里联系人分组的标题",
+            "search_contact_group_label",
+        ),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!(
+                "「{label}」（{key}）不能留空：空文字在「包含」判断里会匹配到任何一行，\
+                 结果不是「找不到」而是找错。填上客户端上实际显示的那几个字。"
+            ));
+        }
+    }
+
     let mut ports = match config.mode {
         RuntimeMode::DryRun => dry_run_ports(config, task),
         RuntimeMode::Live => live_ports(config)?,
@@ -534,12 +829,26 @@ pub fn build_runner(
 
     let mut runner_config = config.to_runner_config();
 
+    // ── 导航图标：这一次要跑哪几个目标 ──────────────────────────
+    //
+    // 「只做导航」那条路**导航就是任务本身**，所以不受 `navigate_before_search`
+    // 这个开关约束——那个开关说的是"查找之前要不要先切一次视图"。
+    // 另外两条路只会在开关打开时切一次，而且固定切到联系人视图
+    // （列表扫描式扫的就是联系人列表；搜索式的搜索框也在主界面上）。
+    let nav_targets: Vec<NavTarget> = match config.workflow {
+        Workflow::NavigateOnly => vec![config.nav_target],
+        _ if config.navigate_before_search => vec![NavTarget::Contact],
+        _ => Vec::new(),
+    };
+
     // 「先点导航图标切视图」这一组的校验与模板载入。
     //
-    // 和上面两条同一个道理：**全部放在装配期**。区域比例非法、模板文件读不出来、
+    // 和上面几条同一个道理：**全部放在装配期**。区域比例非法、模板文件读不出来、
     // 该配模板却没配——这些都会让任务注定失败，而装配失败**不会在任务列表里
     // 留下记录**，装配成功才会登记。所以能提前判的一律提前判。
-    if config.navigate_before_search {
+    if !nav_targets.is_empty() {
+        // 搜索区与阈值两个目标共用，所以只验一次——按目标各验一遍的话，
+        // 同一个错误会在第一个目标上报出来，第二个目标的那份配置就没人看了。
         let strip = runner_config.nav_strip;
         if let Err(err) = strip.validate() {
             return Err(format!(
@@ -551,11 +860,30 @@ pub fn build_runner(
         if !(0.0..=1.0).contains(&config.nav_icon_min_score) {
             return Err(format!(
                 "图标匹配最低分数必须在 0–1 之间（当前 {}）：\
-                 它是归一化互相关系数，1.0 表示完全一致。",
+                 它是归一化互相相关系数，1.0 表示完全一致。",
                 config.nav_icon_min_score
             ));
         }
-        runner_config.nav_icon_templates = load_nav_icon_templates(&config.nav_icon_templates)?;
+        if config.icon_prior_score_tolerance < 0.0 {
+            return Err(format!(
+                "位置先验的分数容差不能是负数（当前 {}）：\
+                 它是「最高分往下多少以内才允许用位置取舍」的幅度，\
+                 0 表示关掉先验。",
+                config.icon_prior_score_tolerance
+            ));
+        }
+
+        for target in &nav_targets {
+            let (names, what) = match target {
+                NavTarget::Contact => (&config.nav_icon_templates, NavTarget::Contact),
+                NavTarget::History => (&config.history_icon_templates, NavTarget::History),
+            };
+            let templates = load_nav_icon_templates(icons_dir, names, what.describe())?;
+            match target {
+                NavTarget::Contact => runner_config.nav_icon_templates = templates,
+                NavTarget::History => runner_config.history_icon_templates = templates,
+            }
+        }
     }
 
     Ok(WorkflowRunner::new(ports, runner_config)
@@ -564,371 +892,4 @@ pub fn build_runner(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use automation_core::{MemoryAudit, MemorySendLedger};
-
-    /// 造一张真的 PNG 当模板。
-    ///
-    /// 刻意**不引 `image` 这个依赖**：`vision::pixels` 已经能把 BGRA 缓冲编码成
-    /// PNG，而构造 BGRA 缓冲只需要一个 `Vec<u8>`。少一个依赖就少一处版本漂移
-    /// （`RgbaImage` 在两个 crate 里是两个不同的类型，版本不一致时很难看出原因）。
-    fn write_template_png(name: &str, width: u32, height: u32) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("rpa-llm-nav-template");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-        for y in 0..height {
-            for x in 0..width {
-                pixels.extend_from_slice(&[(x * 7) as u8, (y * 11) as u8, ((x + y) * 5) as u8, 255]);
-            }
-        }
-        let shot = automation_core::Screenshot {
-            pixels,
-            width,
-            height,
-            captured_at: std::time::SystemTime::now(),
-            fingerprint: String::new(),
-        };
-        let rgba = vision::pixels::to_rgba(&shot).unwrap();
-        std::fs::write(&path, vision::pixels::encode_png(&rgba).unwrap()).unwrap();
-        path
-    }
-
-    fn sample_task() -> SendTask {
-        SendTask {
-            id: uuid::Uuid::new_v4(),
-            external_contact_name: "外部测试联系人".into(),
-            text: "测试正文".into(),
-            created_by: "测试操作者".into(),
-        }
-    }
-
-    /// 走一遍真实的装配路径，只关心它成不成功、以及装配出来的运行器里有什么。
-    fn assemble(config: &RuntimeConfig) -> Result<WorkflowRunner, String> {
-        build_runner(
-            config,
-            &sample_task(),
-            Arc::new(MemoryAudit::new()),
-            Arc::new(MemorySendLedger::new()),
-            Arc::new(MockHumanConfirmation::default()),
-        )
-    }
-
-    /// 单步超时不能小于 OCR 超时，否则把 OCR 超时调大是白调的。
-    ///
-    /// 这两个超时是嵌套关系：一个步骤里就包含一次 `capture + 本地 OCR`。
-    /// 外层先到点的话，任务报的是 `Timeout`，使用者会误以为是 OCR 的问题。
-    #[test]
-    fn step_timeout_never_undercuts_the_ocr_timeout() {
-        let config = RuntimeConfig {
-            ocr_timeout_ms: 60_000,
-            // 故意配一个比 OCR 超时小得多的下限。
-            step_timeout_secs: 5,
-            ..RuntimeConfig::default()
-        };
-        let effective = config.to_runner_config().step_timeout;
-        assert!(
-            effective >= Duration::from_secs(65),
-            "单步超时应至少是 OCR 超时加余量，实际是 {effective:?}"
-        );
-    }
-
-    /// 反过来：单步下限配得很大时，不能被 OCR 超时压下去。
-    #[test]
-    fn a_large_step_floor_is_respected() {
-        let config = RuntimeConfig {
-            ocr_timeout_ms: 1_000,
-            step_timeout_secs: 120,
-            ..RuntimeConfig::default()
-        };
-        assert_eq!(
-            config.to_runner_config().step_timeout,
-            Duration::from_secs(120)
-        );
-    }
-
-    /// 默认值本身也要自洽：默认的单步超时必须容得下默认的 OCR 超时。
-    #[test]
-    fn the_defaults_are_self_consistent() {
-        let config = RuntimeConfig::default();
-        let effective = config.to_runner_config().step_timeout;
-        assert!(
-            effective > Duration::from_millis(config.ocr_timeout_ms),
-            "默认单步超时 {effective:?} 容不下默认 OCR 超时 {}ms",
-            config.ocr_timeout_ms
-        );
-    }
-
-    /// 界面标定用的默认值必须与核心层的出厂值逐字段一致。
-    ///
-    /// `RegionConfig` 用 `[f32; 4]`、核心层用 `RelativeRegion`，类型不同，
-    /// 以前是各写一份字面量——两边不一致时**不报任何错**，只是界面按一份画框、
-    /// 任务按另一份裁图，现场表现为「框明明画对了，却识别不到」。
-    /// 现在后者由前者派生，这条用例把它钉死。
-    #[test]
-    fn the_region_defaults_match_the_core_constants() {
-        let regions = RegionConfig::default();
-        let [panel, header, body, composer] = DEFAULT_REGIONS;
-        assert_eq!(regions.contact_panel, [panel.x, panel.y, panel.width, panel.height]);
-        assert_eq!(regions.chat_header, [header.x, header.y, header.width, header.height]);
-        assert_eq!(regions.chat_body, [body.x, body.y, body.width, body.height]);
-        assert_eq!(regions.composer, [composer.x, composer.y, composer.width, composer.height]);
-
-        // 顺带钉住「区域经过校验」：比例写错要到任务跑起来才发现就太晚了。
-        let runner = RuntimeConfig::default().to_runner_config();
-        for (label, region) in [
-            ("联系人候选区", runner.contact_panel),
-            ("聊天页标题区", runner.chat_header),
-            ("聊天正文区", runner.chat_body),
-            ("消息输入框区", runner.composer),
-        ] {
-            assert!(region.validate().is_ok(), "{label} 的默认比例不合法：{region:?}");
-        }
-    }
-
-    /// `contact_panel` 的左边界**不能是 0**，否则联系人姓名永远匹配不上。
-    ///
-    /// 会话列表左侧还有导航图标栏和头像列（头像右上角带未读红点），
-    /// 它们与姓名在同一行高度上，会被 OCR **并进同一个文字块**。
-    /// 实测（960x734）：左边界取 0 时读到 `《明月（美、加、欧洲）清库存`、
-    /// `0 丁俊`，取 0.14 时读到干净的 `明月（美、加、欧洲）清库存`、`丁俊`。
-    /// 而姓名匹配是逐字精确的（`docs/architecture.md` §6.4/§6.6），
-    /// 多一个前导字符就永远找不到人。
-    ///
-    /// 这条用例守的是「有人为了多看到点头像信息，顺手把左边界改回 0」。
-    #[test]
-    fn the_contact_panel_must_not_swallow_the_avatar_column() {
-        let regions = RegionConfig::default();
-        assert!(
-            regions.contact_panel[0] > 0.0,
-            "联系人候选区的左边界必须让开左侧图标栏与头像列，实际是 {}",
-            regions.contact_panel[0]
-        );
-        assert!(
-            regions.contact_panel[0] + regions.contact_panel[2] <= 1.0,
-            "联系人候选区右边界越出了窗口：{regions:?}"
-        );
-    }
-
-    /// 滚动落点默认是「上下居中、左右偏右一点」，并原样透传到核心层。
-    #[test]
-    fn scroll_anchor_defaults_to_slightly_right_of_center() {
-        let config = RuntimeConfig::default();
-        assert_eq!(config.scroll_anchor, ScrollAnchorConfig { x: 0.62, y: 0.5 });
-        let runner = config.to_runner_config();
-        assert_eq!(runner.scroll_anchor, RelativePoint::new(0.62, 0.5));
-        assert!(runner.scroll_anchor.validate().is_ok());
-    }
-
-    /// 落点比例**不在这里夹到 0–1**，非法值必须原样透传、由核心层报错。
-    ///
-    /// 夹边界会把「配置写错了」变成「滚了半天没反应」——
-    /// 后者是现场最难查的一类现象，所以宁可让任务直接失败并说清原因。
-    #[test]
-    fn an_out_of_range_scroll_anchor_is_passed_through_not_clamped() {
-        let config = RuntimeConfig {
-            scroll_anchor: ScrollAnchorConfig { x: 1.5, y: -0.2 },
-            ..RuntimeConfig::default()
-        };
-        assert!(!config.scroll_anchor.is_valid());
-        let runner = config.to_runner_config();
-        assert_eq!(runner.scroll_anchor, RelativePoint::new(1.5, -0.2));
-        assert!(runner.scroll_anchor.validate().is_err());
-    }
-
-    /// 「滚动停稳等待」的默认值必须是个**有限的上限**，而不是 0（0 = 不等，
-    /// 等于把缓动动画的中间帧直接喂给 OCR），也不是一个大到让每滚一步都要
-    /// 等上几秒的数——它是上限，正常开销只是多截一帧。
-    #[test]
-    fn scroll_settle_defaults_to_a_small_bounded_wait() {
-        let config = RuntimeConfig::default();
-        assert_eq!(config.scroll_settle_ms, 600);
-        let runner = config.to_runner_config();
-        assert_eq!(runner.scroll_settle_timeout, Duration::from_millis(600));
-        assert!(!runner.scroll_settle_timeout.is_zero());
-        assert!(runner.scroll_settle_timeout <= Duration::from_secs(2));
-    }
-
-    /// 毫秒值原样换算成 `Duration`，**不夹到某个区间**：
-    /// 操作者填 0 就是明确要求"不等"，不能替他改主意。
-    #[test]
-    fn scroll_settle_ms_is_converted_verbatim() {
-        let config = RuntimeConfig { scroll_settle_ms: 0, ..RuntimeConfig::default() };
-        assert!(config.to_runner_config().scroll_settle_timeout.is_zero());
-
-        let config = RuntimeConfig { scroll_settle_ms: 1500, ..RuntimeConfig::default() };
-        assert_eq!(
-            config.to_runner_config().scroll_settle_timeout,
-            Duration::from_millis(1500)
-        );
-    }
-
-    /// 默认要**记录识别结果**：排查"找不到联系人"时，没有这一项就分不清
-    /// 是 OCR 读错了还是名字根本不在这屏，两者的处置完全相反。
-    #[test]
-    fn reading_back_the_ocr_text_is_on_by_default() {
-        let config = RuntimeConfig::default();
-        assert!(config.log_ocr_candidates);
-        assert!(config.to_runner_config().log_ocr_candidates);
-
-        let config = RuntimeConfig { log_ocr_candidates: false, ..RuntimeConfig::default() };
-        assert!(!config.to_runner_config().log_ocr_candidates);
-    }
-
-    /// 「放宽姓名匹配」这个开关必须**真的**换掉匹配器，两个方向都要验。
-    ///
-    /// 为什么值得单独钉：选错匹配器**不报任何错**，只在现场表现为
-    /// 「它怎么点到别人身上去了」或者「明明在列表里却说找不到」。
-    /// 这里用实测过的那条数据（OCR 把头像红点并进了姓名行，读出 `0 丁俊`）。
-    #[test]
-    fn the_relaxed_switch_actually_selects_the_lenient_matcher() {
-        use automation_core::{Rect, TextBox};
-
-        let noisy = vec![TextBox {
-            text: "0 丁俊".into(),
-            bounds: Rect { x: 4, y: 29, width: 38, height: 19 },
-            confidence: 1.0,
-        }];
-
-        let lenient = build_matcher(true);
-        let found = lenient
-            .find_unique_exact_match("丁俊", &noisy, DEFAULT_MIN_CONFIDENCE)
-            .expect("放宽模式下应当认出「0 丁俊」里的「丁俊」");
-        assert_eq!(found.text, "0 丁俊");
-
-        let strict = build_matcher(false);
-        assert!(
-            strict.find_unique_exact_match("丁俊", &noisy, DEFAULT_MIN_CONFIDENCE).is_err(),
-            "关掉开关就必须回到架构要求的逐字精确匹配"
-        );
-    }
-
-    /// 默认**开**着放宽匹配——这是操作者当下要的「先把链路跑通」。
-    ///
-    /// 顺带把「它只是临时措施」这件事钉在用例里：将来收紧默认值时，
-    /// 这条用例会失败，逼着改的人回来读一遍 `ContainsNameMatcher` 的文档。
-    #[test]
-    fn relaxed_name_matching_is_on_by_default_for_now() {
-        assert!(RuntimeConfig::default().relaxed_name_match);
-    }
-
-    /// 导航图标这一组的默认值必须与核心层的常量逐字段一致，并且**默认关**。
-    ///
-    /// 默认关的理由要钉住：这一步需要操作者自己截一张图标模板，
-    /// 默认打开等于让每个还没准备模板的人都在点「开始任务」时撞上一次装配错误。
-    #[test]
-    fn navigation_defaults_come_from_the_core_constants_and_are_off() {
-        let config = RuntimeConfig::default();
-        assert!(!config.navigate_before_search);
-        assert!(config.nav_icon_templates.is_empty());
-        assert_eq!(config.nav_icon_min_score, DEFAULT_NAV_ICON_MIN_SCORE);
-        assert_eq!(config.nav_strip, flatten(DEFAULT_NAV_STRIP));
-
-        let runner = config.to_runner_config();
-        assert_eq!(runner.nav_strip, DEFAULT_NAV_STRIP);
-        assert_eq!(runner.nav_icon_min_score, DEFAULT_NAV_ICON_MIN_SCORE);
-        assert!(runner.nav_icon_templates.is_empty(), "模板由装配期载入，不在这个转换里");
-        assert!(!runner.navigate_before_search);
-    }
-
-    /// 打开开关却没配模板 ⇒ **装配期**就拒绝，而不是留一条跑到一半才失败的记录。
-    #[test]
-    fn turning_on_navigation_without_a_template_is_refused() {
-        let config = RuntimeConfig {
-            navigate_before_search: true,
-            ..RuntimeConfig::default()
-        };
-        let err = assemble(&config).err().expect("没有模板时必须拒绝装配");
-        assert!(err.contains("没有配置任何图标模板"), "{err}");
-
-        // 只填空白也算没配——不然会变成"文件名叫空字符串"这种更难查的错。
-        let config = RuntimeConfig {
-            navigate_before_search: true,
-            nav_icon_templates: vec!["   ".into(), String::new()],
-            ..RuntimeConfig::default()
-        };
-        assert!(assemble(&config).is_err());
-    }
-
-    /// 模板在装配期载入，并且真的被带进了运行器。
-    #[test]
-    fn templates_are_loaded_at_assembly_time() {
-        let path = write_template_png("nav-icon.png", 20, 18);
-        let config = RuntimeConfig {
-            navigate_before_search: true,
-            nav_icon_templates: vec![path.display().to_string(), "   ".into()],
-            ..RuntimeConfig::default()
-        };
-
-        let runner = assemble(&config).expect("应当装配成功");
-        let templates = &runner.config().nav_icon_templates;
-        assert_eq!(templates.len(), 1, "空白行要忽略，不然会变成一个空路径");
-        assert_eq!(
-            templates[0].label, "nav-icon.png",
-            "label 取文件名：失败信息里要能一眼看出是哪一张模板出的问题"
-        );
-        assert_eq!((templates[0].width, templates[0].height), (20, 18));
-    }
-
-    /// 模板本身不可用时也要在装配期报错。
-    ///
-    /// 关键在"什么时候报"：留到运行期的话，症状是"匹配分数很低"，
-    /// 而人只会去怀疑阈值，不会想到"这张图根本不是图标"。
-    #[test]
-    fn an_unusable_template_is_refused_at_assembly_time() {
-        let too_big = write_template_png("too-big.png", 300, 40);
-        let config = RuntimeConfig {
-            navigate_before_search: true,
-            nav_icon_templates: vec![too_big.display().to_string()],
-            ..RuntimeConfig::default()
-        };
-        let err = assemble(&config).err().expect("过大的模板必须被拒绝");
-        assert!(err.contains("太大"), "报错要说清是尺寸问题：{err}");
-
-        let missing = std::env::temp_dir().join("rpa-llm-nav-template/definitely-missing.png");
-        let config = RuntimeConfig {
-            navigate_before_search: true,
-            nav_icon_templates: vec![missing.display().to_string()],
-            ..RuntimeConfig::default()
-        };
-        assert!(assemble(&config).is_err(), "文件不存在也必须被拒绝");
-    }
-
-    /// 搜索区比例非法 / 阈值越界，同样在装配期拦下。
-    #[test]
-    fn an_illegal_nav_strip_or_threshold_is_refused() {
-        let path = write_template_png("nav-icon.png", 20, 18);
-
-        let config = RuntimeConfig {
-            navigate_before_search: true,
-            nav_icon_templates: vec![path.display().to_string()],
-            nav_strip: [0.0, 0.0, 1.5, 1.0],
-            ..RuntimeConfig::default()
-        };
-        let err = assemble(&config).err().expect("比例越界必须被拒绝");
-        assert!(err.contains("导航图标搜索区"), "{err}");
-
-        let config = RuntimeConfig {
-            navigate_before_search: true,
-            nav_icon_templates: vec![path.display().to_string()],
-            nav_icon_min_score: 1.4,
-            ..RuntimeConfig::default()
-        };
-        let err = assemble(&config).err().expect("阈值越界必须被拒绝");
-        assert!(err.contains("0–1"), "{err}");
-    }
-
-    /// 关着的时候不该去读模板：路径写错了也不该拦住任务。
-    #[test]
-    fn templates_are_not_touched_while_navigation_is_off() {
-        let config = RuntimeConfig {
-            navigate_before_search: false,
-            nav_icon_templates: vec!["Z:/definitely/missing.png".into()],
-            nav_strip: [0.0, 0.0, 9.0, 9.0],
-            ..RuntimeConfig::default()
-        };
-        let runner = assemble(&config).expect("关着的时候这些配置项都不该被读");
-        assert!(runner.config().nav_icon_templates.is_empty());
-    }
-}
+mod tests;

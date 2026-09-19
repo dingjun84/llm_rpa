@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use automation_core::{
     AuditEntry, CalibratedWindow, CancelToken, IconLocator, IconTemplate, MemoryAudit,
-    MemorySendLedger, ProgressSink, RunOutcome, RunnerConfig, RunnerPorts, SendTask, StateChange,
-    TaskState, WorkflowRunner, DEFAULT_NAV_STRIP,
+    MemorySendLedger, ProgressSink, Rect, RunOutcome, RunnerConfig, RunnerPorts, ScreenMetrics,
+    SendTask, StateChange, TaskState, Workflow, WorkflowRunner, DEFAULT_NAV_STRIP,
 };
 use platform_mock::{
     tb, ConfirmationOutcome, Fault, MockDesktop, MockHumanConfirmation, MockIconLocator, MockOcr,
@@ -18,6 +18,26 @@ use platform_mock::{
 
 const CONTACT: &str = "外部测试联系人";
 const MESSAGE: &str = "这是一条测试消息";
+
+/// 端到端用例的基线配置：**列表扫描式**。
+///
+/// ## 为什么在用例里显式选，而不是吃 `RunnerConfig::default()`
+///
+/// 应用层的默认值是**搜索式**（操作者当下要的那条路），而搜索式要三块
+/// 只有对着真实窗口框一次才知道在哪儿的区域（搜索框 / 下拉 / 资料页）。
+/// 下面这些用例演的是最早那条路——它在会话列表里滚着找人，只用
+/// `contact_panel` 一块区域。不显式选的话，它们会全部卡在
+/// 「搜索框区还没标定」上，而那条报错看起来像是流程坏了。
+///
+/// 搜索式那条路本身另有专门的用例，见文件末尾。
+fn list_config() -> RunnerConfig {
+    RunnerConfig {
+        platform_label: "test".into(),
+        retry_backoff: Duration::ZERO,
+        workflow: Workflow::ScrollListContact,
+        ..Default::default()
+    }
+}
 
 #[derive(Default)]
 struct RecordingProgress {
@@ -54,7 +74,7 @@ impl Fixture {
             RunnerConfig {
                 platform_label: "test".into(),
                 retry_backoff: Duration::ZERO,
-                ..Default::default()
+                ..list_config()
             },
         )
     }
@@ -319,7 +339,7 @@ fn the_relaxed_matcher_accepts_a_near_name_and_that_is_the_known_cost() {
     let fixture = Fixture::build_with_matcher(
         MockDesktop::new(),
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         scenario.script(),
         Arc::new(automation_core::ContainsNameMatcher::default()),
     );
@@ -382,7 +402,7 @@ fn rejected_confirmation_blocks_the_send() {
         &scenario,
         MockDesktop::new(),
         MockHumanConfirmation::new(ConfirmationOutcome::Reject("内容不对".into())),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
     let outcome = fixture.run(&fixture.task());
@@ -398,7 +418,7 @@ fn expired_confirmation_blocks_the_send() {
         &scenario,
         MockDesktop::new(),
         MockHumanConfirmation::new(ConfirmationOutcome::Expired),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
     let outcome = fixture.run(&fixture.task());
@@ -417,7 +437,7 @@ fn confirmation_is_requested_with_the_configured_ttl() {
         RunnerConfig {
             confirmation_ttl: Duration::from_secs(45),
             retry_backoff: Duration::ZERO,
-            ..Default::default()
+            ..list_config()
         },
     );
 
@@ -441,7 +461,7 @@ fn window_replaced_before_the_click_is_detected() {
         &scenario,
         desktop,
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
     let outcome = fixture.run(&fixture.task());
@@ -463,7 +483,7 @@ fn display_scale_change_is_detected_before_input() {
         &scenario,
         desktop,
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
     let outcome = fixture.run(&fixture.task());
@@ -495,7 +515,7 @@ fn unchanged_screen_after_send_is_not_reported_as_delivered() {
         &scenario,
         desktop,
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
     let outcome = fixture.run(&fixture.task());
@@ -521,7 +541,7 @@ fn the_same_task_cannot_be_sent_twice() {
             icons: Arc::new(MockIconLocator::new()),
             confirmation: Arc::new(MockHumanConfirmation::default()),
         },
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     )
     .with_audit(audit)
     .with_ledger(ledger);
@@ -568,7 +588,7 @@ fn transient_capture_failure_is_retried_and_recovers() {
         RunnerConfig {
             max_attempts: 3,
             retry_backoff: Duration::ZERO,
-            ..Default::default()
+            ..list_config()
         },
     );
 
@@ -599,7 +619,7 @@ fn persistent_capture_failure_gives_up_after_max_attempts() {
         RunnerConfig {
             max_attempts: 3,
             retry_backoff: Duration::ZERO,
-            ..Default::default()
+            ..list_config()
         },
     );
 
@@ -657,7 +677,7 @@ fn audit_never_contains_the_clipboard_payload_of_a_failed_send() {
         &scenario,
         desktop,
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
     let outcome = fixture.run(&fixture.task());
@@ -685,7 +705,7 @@ fn scrolling_finds_a_contact_that_is_not_on_the_first_screen() {
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         script,
     );
 
@@ -717,7 +737,7 @@ fn scrolling_happens_at_the_configured_anchor_not_the_panel_center() {
         ScriptedCall::Ok(scenario.body_before.clone()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
-    let config = RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() };
+    let config = RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() };
     // 期望值由配置**算出来**，不写死坐标：区域标定或落点比例一改，这里跟着走。
     let panel = config.contact_panel.resolve(DEFAULT_WINDOW);
     let expected = config.scroll_anchor.resolve(panel);
@@ -775,7 +795,7 @@ fn every_sweep_step_records_what_the_ocr_actually_read() {
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         script,
     );
 
@@ -811,7 +831,7 @@ fn recording_what_was_read_can_be_switched_off() {
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             log_ocr_candidates: false,
-            ..Default::default()
+            ..list_config()
         },
         script,
     );
@@ -846,7 +866,7 @@ fn the_log_records_where_the_cursor_will_go() {
         ScriptedCall::Ok(scenario.body_before.clone()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
-    let config = RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() };
+    let config = RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() };
     // 期望坐标由配置**算出来**，不写死像素：区域标定或落点比例一改，这里跟着走。
     let panel = config.contact_panel.resolve(DEFAULT_WINDOW);
     let anchor = config.scroll_anchor.resolve(panel);
@@ -906,7 +926,7 @@ fn a_dirty_name_still_finds_the_contact_under_relaxed_matching() {
         ScriptedCall::Ok(scenario.body_before.clone()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
-    let config = RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() };
+    let config = RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() };
     // 期望坐标由配置**算出来**，不写死像素：区域标定一改，这里跟着走。
     let panel = config.contact_panel.resolve(DEFAULT_WINDOW);
     // 姓名行那块的图像坐标：x/width 是替身 `tb()` 的固定形状，y 是本脚本给的。
@@ -965,7 +985,7 @@ fn scrolling_gives_up_at_the_attempt_limit_and_asks_for_a_human() {
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             max_scroll_attempts: 3,
-            ..Default::default()
+            ..list_config()
         },
         vec![ScriptedCall::boxes(vec![tb("别的联系人", 20, 0.99)])],
     );
@@ -1011,7 +1031,7 @@ fn a_list_that_cannot_scroll_stops_early_instead_of_burning_the_limit() {
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             max_scroll_attempts: 50,
-            ..Default::default()
+            ..list_config()
         },
         vec![ScriptedCall::boxes(vec![tb("别的联系人", 20, 0.99)])],
     );
@@ -1041,7 +1061,7 @@ fn a_frozen_client_is_reported_as_frozen_instead_of_scrolled_to_the_bottom() {
     let fixture = Fixture::build_with_script(
         desktop,
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         vec![ScriptedCall::boxes(vec![tb("别的联系人", 20, 0.99)])],
     );
 
@@ -1081,7 +1101,7 @@ fn a_contact_pushed_to_the_top_by_a_new_message_is_found_on_the_second_sweep() {
     let fixture = Fixture::build_with_script(
         desktop,
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         script,
     );
 
@@ -1126,7 +1146,7 @@ fn a_single_sweep_misses_a_contact_that_jumped_to_the_top() {
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             max_search_sweeps: 1,
-            ..Default::default()
+            ..list_config()
         },
         script,
     );
@@ -1166,7 +1186,7 @@ fn every_scroll_is_followed_by_a_fresh_recognition() {
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         script,
     );
 
@@ -1190,7 +1210,7 @@ fn a_frozen_client_stops_the_task_before_any_input() {
         &scenario,
         desktop,
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
     let outcome = fixture.run(&fixture.task());
@@ -1216,7 +1236,7 @@ fn a_click_that_changes_nothing_is_reported_as_ineffective_not_as_a_wrong_title(
         &scenario,
         desktop,
         MockHumanConfirmation::default(),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..Default::default() },
+        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
     let outcome = fixture.run(&fixture.task());
@@ -1240,7 +1260,7 @@ fn the_liveness_check_can_be_turned_off() {
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             liveness_check: false,
-            ..Default::default()
+            ..list_config()
         },
     );
 
@@ -1251,17 +1271,91 @@ fn the_liveness_check_can_be_turned_off() {
 
 // ── 标定尺寸 ────────────────────────────────────────────────────────────
 
-/// 窗口尺寸与标定记录不一致 —— 在动任何东西之前就停下。
+/// 窗口被拖成了别的尺寸 —— **先自动调回标定尺寸**，而不是停下让人手工拖。
 ///
-/// 区域标定是相对窗口的比例，而真实界面不是等比缩放的：尺寸一变四个区域整体偏移，
-/// 而点击落偏的后果是点到别的地方。
+/// 尺寸是程序完全能确定的量（标定记录里就写着目标值），调它是确定性的、可逆的，
+/// 不该推给操作者做。
 #[test]
-fn a_window_that_is_not_the_calibrated_size_is_refused_before_any_input() {
+fn a_window_that_is_not_the_calibrated_size_is_resized_back_before_any_input() {
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
-    // 替身窗口是 1280x720，标定记录里写的是别的尺寸。
+    let desktop = MockDesktop::new();
+    // 客户端被拖成了 900x600，而标定记录是 1280x720（= `DEFAULT_WINDOW`）。
+    desktop.set_window(Rect { x: 0, y: 0, width: 900, height: 600 });
+    let fixture = Fixture::build(
+        &scenario,
+        desktop,
+        MockHumanConfirmation::default(),
+        RunnerConfig {
+            retry_backoff: Duration::ZERO,
+            calibrated_window: Some(CalibratedWindow {
+                width: DEFAULT_WINDOW.width,
+                height: DEFAULT_WINDOW.height,
+                scale_factor: 1.0,
+            }),
+            ..list_config()
+        },
+    );
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(
+        fixture.desktop.resizes.lock().unwrap().as_slice(),
+        &[(DEFAULT_WINDOW.width, DEFAULT_WINDOW.height)],
+        "应请求把窗口调回标定尺寸"
+    );
+    assert_eq!(fixture.desktop.window().width, DEFAULT_WINDOW.width);
+    assert_eq!(fixture.desktop.window().height, DEFAULT_WINDOW.height);
+    assert_eq!(
+        outcome.state,
+        TaskState::Completed,
+        "调成之后应照常跑完：{:?}",
+        outcome.failure
+    );
+}
+
+/// 尺寸本来就对 —— **不许去动窗口**。
+///
+/// 这是上一条的反面：自动调整不能变成"每次运行都先把窗口设一遍"，
+/// 那会在操作者没要求的时候改变他的桌面。
+#[test]
+fn a_window_matching_the_calibrated_size_is_accepted_untouched() {
+    let scenario = MockScenario::happy(CONTACT, MESSAGE);
     let fixture = Fixture::build(
         &scenario,
         MockDesktop::new(),
+        MockHumanConfirmation::default(),
+        RunnerConfig {
+            retry_backoff: Duration::ZERO,
+            calibrated_window: Some(CalibratedWindow {
+                width: DEFAULT_WINDOW.width,
+                height: DEFAULT_WINDOW.height,
+                scale_factor: 1.0,
+            }),
+            ..list_config()
+        },
+    );
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
+    assert!(
+        fixture.desktop.resizes.lock().unwrap().is_empty(),
+        "尺寸本来就对，不该去动窗口"
+    );
+}
+
+/// 客户端调不动（有自己的最小尺寸）—— 转人工，且**不得**按偏了的区域去点击。
+///
+/// 关键在于：这时 `SetWindowPos` 是**报成功**的，只有重新量一遍才知道没调成。
+#[test]
+fn a_client_that_refuses_to_be_resized_is_refused_before_any_input() {
+    let scenario = MockScenario::happy(CONTACT, MESSAGE);
+    let desktop = MockDesktop::new();
+    // 客户端最小 1000x700：请求 900x600 会被夹住，而调用照样"成功"。
+    desktop.set_min_window_size((1000, 700));
+    let fixture = Fixture::build(
+        &scenario,
+        desktop,
         MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
@@ -1270,7 +1364,7 @@ fn a_window_that_is_not_the_calibrated_size_is_refused_before_any_input() {
                 height: 600,
                 scale_factor: 1.0,
             }),
-            ..Default::default()
+            ..list_config()
         },
     );
 
@@ -1281,30 +1375,41 @@ fn a_window_that_is_not_the_calibrated_size_is_refused_before_any_input() {
     assert_eq!(fixture.desktop.send_count(), 0);
     let reason = outcome.failure.expect("应有失败原因").reason;
     assert!(reason.contains("标定"), "应说明与标定不一致：{reason}");
+    assert!(reason.contains("夹"), "应说明是被客户端夹住了：{reason}");
 }
 
-/// 尺寸与标定一致时正常放行 —— 别把校验做成"永远失败"。
+/// 缩放对不上 —— **不靠调窗口尺寸糊过去**，直接转人工。
+///
+/// DPI 缩放是显示器/系统属性，不是窗口属性：缩放不同意味着同一物理尺寸下的
+/// 逻辑布局本来就不同，调物理像素解决不了，只会白动一次窗口。
 #[test]
-fn a_window_matching_the_calibrated_size_is_accepted() {
+fn a_scale_factor_mismatch_is_not_papered_over_by_resizing() {
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
+    let desktop = MockDesktop::new();
+    desktop.set_metrics(ScreenMetrics { width: 1920, height: 1080, scale_factor: 1.5 });
     let fixture = Fixture::build(
         &scenario,
-        MockDesktop::new(),
+        desktop,
         MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             calibrated_window: Some(CalibratedWindow {
-                width: 1280,
-                height: 720,
+                width: DEFAULT_WINDOW.width,
+                height: DEFAULT_WINDOW.height,
                 scale_factor: 1.0,
             }),
-            ..Default::default()
+            ..list_config()
         },
     );
 
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    assert!(
+        fixture.desktop.resizes.lock().unwrap().is_empty(),
+        "缩放对不上不是尺寸问题，不该去动窗口"
+    );
+    assert!(fixture.desktop.clicks.lock().unwrap().is_empty());
 }
 
 // ── 客户端由操作者启动 ──────────────────────────────────────────────────
@@ -1338,7 +1443,7 @@ fn stop_before_send_fills_the_box_and_never_sends() {
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             stop_before_send: true,
-            ..Default::default()
+            ..list_config()
         },
     );
 
@@ -1347,10 +1452,17 @@ fn stop_before_send_fills_the_box_and_never_sends() {
     assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
     assert!(outcome.stopped_before_send());
     assert!(!outcome.succeeded(), "只填不发不算发送成功");
+    // 逐字输入，不是粘贴：搜索框必须逐字敲才会触发联想，而消息正文与它
+    // 共用同一条输入路径——共用才不会出现"某条输入路径从没被验证过"。
     assert_eq!(
-        fixture.desktop.pasted_texts(),
+        fixture.desktop.typed_texts(),
         vec![MESSAGE.to_string()],
         "正文应当已经填进输入框"
+    );
+    assert!(
+        fixture.desktop.pasted_texts().is_empty(),
+        "这条路已经不走粘贴了：{:?}",
+        fixture.desktop.pasted_texts()
     );
     assert_eq!(fixture.desktop.send_count(), 0, "绝不能按发送");
     assert_eq!(
@@ -1372,7 +1484,7 @@ fn stop_before_send_never_reaches_the_sending_state() {
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             stop_before_send: true,
-            ..Default::default()
+            ..list_config()
         },
     );
     let task = fixture.task();
@@ -1403,7 +1515,7 @@ fn sending_still_happens_when_stop_before_send_is_off() {
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             stop_before_send: false,
-            ..Default::default()
+            ..list_config()
         },
     );
 
@@ -1429,7 +1541,7 @@ fn stop_before_send_works_together_with_scrolling() {
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             stop_before_send: true,
-            ..Default::default()
+            ..list_config()
         },
         script,
     );
@@ -1438,7 +1550,7 @@ fn stop_before_send_works_together_with_scrolling() {
 
     assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
     assert_eq!(fixture.desktop.scroll_count(), 1);
-    assert_eq!(fixture.desktop.pasted_texts(), vec![MESSAGE.to_string()]);
+    assert_eq!(fixture.desktop.typed_texts(), vec![MESSAGE.to_string()]);
     assert_eq!(fixture.desktop.send_count(), 0);
 }
 
@@ -1463,7 +1575,7 @@ fn navigation_config() -> RunnerConfig {
         retry_backoff: Duration::ZERO,
         navigate_before_search: true,
         nav_icon_templates: vec![nav_template()],
-        ..Default::default()
+        ..list_config()
     }
 }
 
@@ -1630,7 +1742,7 @@ fn navigation_is_off_unless_it_is_configured() {
         RunnerConfig {
             platform_label: "test".into(),
             retry_backoff: Duration::ZERO,
-            ..Default::default()
+            ..list_config()
         },
         scenario.script(),
         Arc::new(platform_mock::MockContactMatcher::new()),
@@ -1667,4 +1779,493 @@ fn the_navigation_defaults_are_off_and_the_strip_clears_the_avatar_column() {
         width_at_974 < 78,
         "导航条宽 {width_at_974}px 已经盖住头像列（从 78px 起）"
     );
+}
+
+// ── 搜索式工作流（工作流 3）─────────────────────────────────────────────
+//
+// 这条路的界面与列表扫描式完全不同：它看的是顶部搜索框的**联想下拉**、
+// 然后落在**联系人资料页**上，再从资料页点进聊天。所以它需要三块
+// 列表式用不到的标定区域（`main_search` / `search_dropdown` / `contact_profile`）。
+//
+// 编排器对 OCR 的调用顺序（与下面的脚本一一对应）：
+//   搜索下拉 → 资料页 → 资料页入口 → 聊天标题 → 发送前聊天正文
+
+/// 搜索式要用的 OCR 脚本。
+///
+/// 段数比预置场景多一段（资料页与它的入口要分别识别一次），
+/// 所以不能复用 `MockScenario::script()`，得自己排。
+fn search_script(contact: &str) -> Vec<ScriptedCall> {
+    vec![
+        // 1. 联想下拉：先一行「联系人」分组标题，标题**下面**才是人。
+        ScriptedCall::Ok(vec![tb("联系人", 10, 0.99), tb(contact, 40, 0.99)]),
+        // 2. 资料页上这个人自己的名字——用来核对"点的是不是他"。
+        ScriptedCall::Ok(vec![tb(contact, 20, 0.99)]),
+        // 3. 资料页滚到底之后找「发消息」入口。
+        ScriptedCall::Ok(vec![tb("发消息", 300, 0.99)]),
+        // 4. 聊天页标题。
+        ScriptedCall::Ok(vec![tb(contact, 16, 0.99)]),
+        // 5. 发送前的聊天正文（聚焦输入框之后截的那一帧）。
+        ScriptedCall::Ok(vec![tb("上一条历史消息", 40, 0.99)]),
+    ]
+}
+
+/// 搜索式的基线配置：三块区域都标好了，模板不涉及（这一步不点导航图标）。
+fn search_config() -> RunnerConfig {
+    let region = |x: f32, y: f32, w: f32, h: f32| {
+        automation_core::RelativeRegion::new(x, y, w, h)
+    };
+    RunnerConfig {
+        platform_label: "test".into(),
+        retry_backoff: Duration::ZERO,
+        workflow: Workflow::SearchContact,
+        main_search: Some(region(0.10, 0.02, 0.60, 0.05)),
+        search_dropdown: Some(region(0.10, 0.07, 0.60, 0.50)),
+        contact_profile: Some(region(0.72, 0.05, 0.27, 0.90)),
+        ..list_config()
+    }
+}
+
+fn search_fixture(script: Vec<ScriptedCall>) -> Fixture {
+    let desktop = MockDesktop::new();
+    // 资料页只滚几格就到底。
+    //
+    // 替身默认的"底"是 1000 格，而编排层最多滚 20 次、每次 3 格 —— 也就是说
+    // 按默认值它永远滚不到底，会以「向下滚动 21 次仍未让资料页画面稳定下来」
+    // 转人工。那是**替身的设置问题**，不是流程的问题：真实资料页几十格就到头了。
+    desktop.script_scroll_bottom(6);
+    Fixture::build_with_script(
+        desktop,
+        MockHumanConfirmation::default(),
+        search_config(),
+        script,
+    )
+}
+
+/// 搜索式主路径：一路走到 `Prepared`，而且**绝不发送**。
+///
+/// 这是操作者明确要求的那条验收线：
+/// 「发送动作先不要点，mock 上。全部测试通过了，我再加这个发送逻辑。」
+/// 所以这里不仅断言终态，还要断言**没有**任何发送痕迹——
+/// 发送次数为 0、没有申请过人工确认、审计里没有 Sending。
+#[test]
+fn the_search_workflow_reaches_prepared_and_stops_before_sending() {
+    let fixture = search_fixture(search_script(CONTACT));
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert!(outcome.stopped_before_send(), "Prepared 就是这条路的正常终态");
+    assert!(!outcome.succeeded(), "Prepared 是「填好了但没发」，不是完成");
+
+    // ── 没有发送痕迹 ────────────────────────────────────────────
+    assert_eq!(fixture.desktop.send_count(), 0, "搜索式工作流不该发送");
+    assert_eq!(
+        fixture.confirmation.call_count(),
+        0,
+        "没打算发送，就不该去打扰操作者做人工确认"
+    );
+    assert!(
+        !fixture.progress.states().contains(&TaskState::Sending),
+        "状态轨迹里不该出现 Sending：{:?}",
+        fixture.progress.states()
+    );
+    assert!(
+        fixture.entries().iter().all(|entry| entry.to != TaskState::Sending),
+        "审计里也不该出现 Sending"
+    );
+
+    // ── 两次输入都走的是**逐字输入**，不是粘贴 ──────────────────
+    //
+    // 搜索框必须逐字敲才会触发联想；用粘贴的话下拉根本不弹，
+    // 而现象看起来像"搜不到人"。
+    assert_eq!(
+        fixture.desktop.typed_texts(),
+        vec![CONTACT.to_string(), MESSAGE.to_string()],
+        "先逐字输入搜索词，再逐字输入正文"
+    );
+    assert!(
+        fixture.desktop.pasted_texts().is_empty(),
+        "搜索式全程不该用粘贴：{:?}",
+        fixture.desktop.pasted_texts()
+    );
+
+    // ── 状态轨迹必须经过资料页那两步 ────────────────────────────
+    let states = fixture.progress.states();
+    for expected in [
+        TaskState::SearchingContact,
+        TaskState::VerifyingCandidate,
+        TaskState::VerifyingProfile,
+        TaskState::OpeningChatFromProfile,
+        TaskState::VerifyingChatHeader,
+        TaskState::Prepared,
+    ] {
+        assert!(states.contains(&expected), "状态轨迹里缺 {expected:?}：{states:?}");
+    }
+}
+
+/// 点搜索框 → 点下拉里那一行 → 点资料页入口 → 点输入框：**四次**点击。
+///
+/// 为什么要数点击：少一次就少一个动作，而少的那一次**不一定报错**——
+/// 比如漏了点输入框，正文会敲进当时有焦点的控件里（最坏是搜索框，
+/// 把搜索结果本身改掉），现象只是"字没进去"。数一遍能把这类漏步钉住。
+#[test]
+fn the_search_workflow_clicks_every_control_it_needs() {
+    let fixture = search_fixture(search_script(CONTACT));
+    let outcome = fixture.run(&fixture.task());
+    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+
+    let clicks = fixture.desktop.clicks.lock().unwrap().clone();
+    assert_eq!(clicks.len(), 4, "点击序列：搜索框 / 下拉行 / 资料页入口 / 输入框");
+
+    // 每一次点击都要落在**它该落的区域**里——坐标本身取自标定，
+    // 但"取的是哪个区域"是编排层的选择，写错了区域就会点到别处。
+    let window = fixture.desktop.window();
+    let inside = |point: automation_core::Point, region: automation_core::RelativeRegion| {
+        let rect = region.resolve_within(window).expect("区域应当能换算");
+        point.x >= rect.x
+            && point.x <= rect.x + rect.width
+            && point.y >= rect.y
+            && point.y <= rect.y + rect.height
+    };
+    let config = search_config();
+    assert!(inside(clicks[0], config.main_search.unwrap()), "第一次点击应当在搜索框里");
+    assert!(
+        inside(clicks[1], config.search_dropdown.unwrap()),
+        "第二次点击应当在联想下拉里（点的是那一行文字）"
+    );
+    assert!(
+        inside(clicks[2], config.contact_profile.unwrap()),
+        "第三次点击应当在资料页里（点的是「发消息」入口）"
+    );
+    assert!(
+        inside(clicks[3], config.composer),
+        "第四次点击应当落在消息输入框里"
+    );
+}
+
+/// 下拉里的行按**分组标题下方**取，标题**上方**的行不算。
+///
+/// 这一条防的是"聊天记录冒充联系人"：下拉里的聊天记录行常常长成
+/// 「和 张三 的聊天」，它也含目标名。不按分组切的话，会点进一条聊天记录。
+#[test]
+fn a_row_above_the_contact_group_is_not_a_candidate() {
+    let mut script = search_script(CONTACT);
+    // 把第一段换成：聊天记录行在上、「联系人」分组标题在下、目标行在标题下方。
+    script[0] = ScriptedCall::Ok(vec![
+        tb("聊天记录", 5, 0.99),
+        tb(&format!("和{CONTACT}的聊天"), 30, 0.99),
+        tb("联系人", 200, 0.99),
+        tb(CONTACT, 240, 0.99),
+    ]);
+    let fixture = search_fixture(script);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    let clicks = fixture.desktop.clicks.lock().unwrap().clone();
+    // 第二次点击的 y 必须在标题**下方**（标题底边 = 200 + 28）。
+    let dropdown = search_config().search_dropdown.unwrap();
+    let rect = dropdown.resolve_within(fixture.desktop.window()).unwrap();
+    let clicked_y = clicks[1].y - rect.y;
+    assert!(
+        clicked_y >= 228,
+        "点到「联系人」标题上方去了（相对下拉区 y={clicked_y}）：那是聊天记录行"
+    );
+}
+
+/// 「联系人」标题**下方**匹配到多行 ⇒ 转人工，绝不猜。
+///
+/// 同名、或者备注里也带着这个名字时，点错人会把消息发错对象——
+/// 这是整条链路上后果最严重的一类错误，所以宁可不做。
+#[test]
+fn two_matching_rows_under_the_group_are_refused() {
+    let mut script = search_script(CONTACT);
+    script[0] = ScriptedCall::Ok(vec![
+        tb("联系人", 10, 0.99),
+        tb(CONTACT, 40, 0.99),
+        tb(&format!("{CONTACT}（备注）"), 80, 0.99),
+    ]);
+    let fixture = search_fixture(script);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    assert_eq!(fixture.desktop.clicks.lock().unwrap().len(), 1, "点完搜索框就该停下");
+    assert_eq!(fixture.desktop.send_count(), 0);
+}
+
+/// 下拉里根本没有「联系人」这一组 ⇒ 转人工，并说清读到的是什么。
+#[test]
+fn a_dropdown_without_the_contact_group_is_a_human_review() {
+    let mut script = search_script(CONTACT);
+    script[0] = ScriptedCall::Ok(vec![
+        tb("聊天记录", 10, 0.99),
+        tb(&format!("和{CONTACT}的聊天"), 40, 0.99),
+    ]);
+    let fixture = search_fixture(script);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
+    assert!(reason.contains("联系人"), "要说清缺的是哪一组：{reason}");
+}
+
+/// 点完搜索框之后**先清空、再输入**。
+///
+/// 客户端的搜索框保留上一次的输入：不清空的话，这一次的关键词会接在上一次的
+/// 后面（「张三」→「张三李四」），而它是联想式的——会拿这个混合词去查，
+/// 结果是一片与目标无关的内容。现象是"搜出来的东西不对"，
+/// 不会让人想到是**上一次的词还在**。
+///
+/// 这条用例断言的是**顺序**而不是"清空调用过没有"：清空晚于输入就等于没清。
+#[test]
+fn the_search_workflow_clears_the_box_before_typing() {
+    let fixture = search_fixture(search_script(CONTACT));
+    let outcome = fixture.run(&fixture.task());
+    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+
+    let operations = fixture.desktop.operations();
+    // 只看**输入动作**：编排层每次动作前都会重新确认前台窗口（序列里的 `focus`），
+    // 截图也夹在中间（`capture`）。把它们算进来，断言就变成了"数序列位置"，
+    // 而那些都不是这一步要守的东西。
+    let inputs: Vec<&str> = operations
+        .iter()
+        .map(String::as_str)
+        .filter(|op| matches!(*op, "click" | "clear" | "type" | "paste"))
+        .collect();
+    let head: Vec<&str> = inputs.iter().take(3).copied().collect();
+    assert_eq!(
+        head,
+        ["click", "clear", "type"],
+        "点搜索框之后必须先清空再输入。完整操作序列：{operations:?}"
+    );
+    // 第一次逐字输入必须是关键词（后面还有一次是消息正文——搜索式也走逐字输入）。
+    assert_eq!(
+        fixture.desktop.typed_texts().first().map(String::as_str),
+        Some(CONTACT),
+        "搜索框里逐字敲的应当是关键词本身，而不是「旧词 + 关键词」"
+    );
+}
+
+/// 下拉里找不到人时，失败信息要**把搜索框里的内容一并报出来**。
+///
+/// 这一条守的是「输入根本没落进搜索框」那种情况：那时下拉里是一片与关键词
+/// 无关的内容（甚至是刚点开搜索框时的默认列表），而过程证据里照样写着
+/// "已在搜索框逐字输入 N 个字符"——看起来像"确实没有这个人"，
+/// 于是排查方向会一路偏到关键词和客户端上。实测踩过一次：三次运行里有一次
+/// 输入没落进去，日志里看不出任何异常。
+///
+/// 把搜索框里的原文报出来，两种情况一眼就能分开。
+#[test]
+fn a_failed_search_reports_what_is_actually_in_the_search_box() {
+    let fixture = search_fixture(vec![
+        // 1. 联想下拉：有「联系人」标题，但标题下面没有目标。
+        ScriptedCall::Ok(vec![tb("联系人", 10, 0.99), tb("另一个联系人", 40, 0.99)]),
+        // 2. 失败之后补的那一次核对：搜索框里读到的是上一次留下的词。
+        ScriptedCall::Ok(vec![tb("上一次的词", 5, 0.99)]),
+    ]);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
+    assert!(reason.contains("核对"), "要说清核对过搜索框：{reason}");
+    assert!(
+        reason.contains("上一次的词"),
+        "要把搜索框里读到的东西原样报出来：{reason}"
+    );
+}
+
+/// 资料页里找不到「发消息」入口 ⇒ 转人工，并指向那两个可能的原因。
+#[test]
+fn a_profile_without_the_chat_entry_is_a_human_review() {
+    let mut script = search_script(CONTACT);
+    // 资料页滚到底之后读到的是别的东西，没有「发消息」。
+    script[2] = ScriptedCall::Ok(vec![tb("朋友圈", 300, 0.99)]);
+    let fixture = search_fixture(script);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
+    assert!(reason.contains("发消息"), "要说清找的是哪几个字：{reason}");
+    assert!(reason.contains("界面标定"), "要指出可能是区域标偏了：{reason}");
+    assert_eq!(fixture.desktop.send_count(), 0);
+}
+
+/// 资料页上读到的是别人 ⇒ 转人工（"可能点错了人"）。
+///
+/// 这一步存在的全部意义就是**重名**：下拉里那一行只是"文字包含关键词"，
+/// 资料页上才是这个人自己的名字，两处对上了才说明点对了人。
+#[test]
+fn a_profile_showing_someone_else_is_refused() {
+    let mut script = search_script(CONTACT);
+    script[1] = ScriptedCall::Ok(vec![tb("另一个联系人", 20, 0.99)]);
+    let fixture = search_fixture(script);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
+    assert!(reason.contains(CONTACT), "要把目标名报出来：{reason}");
+    // 判据归匹配器，**不在这里另写一份**（那正是 `verify_profile` 文档里
+    // 反复强调的那件事）。"到底读到了什么"走证据这条通道——
+    // 它在界面上也能看到，而且不掺进判据里。
+    let evidence: Vec<String> = fixture
+        .entries()
+        .iter()
+        .flat_map(|entry| entry.evidence.clone())
+        .collect();
+    assert!(
+        evidence.iter().any(|line| line.contains("另一个联系人")),
+        "证据里要能看到资料页实际读到的文字：{evidence:?}"
+    );
+    assert_eq!(fixture.desktop.send_count(), 0);
+}
+
+/// 搜索式少了必填区域 ⇒ 在**第一次点击之前**就转人工，而不是点空。
+///
+/// 没标的区域在编排层是 `None`，`resolve_extra` 会如实报错并说清去哪儿标。
+/// 这里刻意**不**在测试里补一个猜出来的区域：那正是要防的事。
+#[test]
+fn a_search_workflow_without_its_regions_stops_before_clicking() {
+    let config = RunnerConfig { search_dropdown: None, ..search_config() };
+    let fixture = Fixture::build_with_script(
+        MockDesktop::new(),
+        MockHumanConfirmation::default(),
+        config,
+        search_script(CONTACT),
+    );
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    assert_eq!(
+        fixture.desktop.clicks.lock().unwrap().len(),
+        1,
+        "搜索框还是点得到的，缺的是下拉区——点完搜索框就该停"
+    );
+    let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
+    assert!(reason.contains("搜索下拉列表"), "要说清缺的是哪一块：{reason}");
+    assert!(reason.contains("界面标定"), "要告诉人下一步去哪标：{reason}");
+}
+
+/// 点下拉那一行之后**画面一个像素都没变** ⇒ 报"点击可能没生效"，而不是
+/// 报"资料页上没有这个人"。
+///
+/// 这两种原因处置完全不同：前者要去查客户端是不是卡死/被挡住，后者要去查
+/// 是不是点错了人。把前者说成后者，会让人一路往"名字识别错了"上找。
+#[test]
+fn a_click_that_changes_nothing_is_reported_as_such() {
+    let desktop = MockDesktop::new();
+    desktop.script_scroll_bottom(6);
+    // 所有点击都不改变画面。
+    desktop.script_clicks_without_effect();
+    let mut script = search_script(CONTACT);
+    // 资料页上读到的不是目标本人——否则 `verify_profile` 会先判定通过，
+    // 根本走不到"点击没生效"那条分支。
+    script[1] = ScriptedCall::Ok(vec![tb("另一个联系人", 20, 0.99)]);
+    let fixture = Fixture::build_with_script(
+        desktop,
+        MockHumanConfirmation::default(),
+        search_config(),
+        script,
+    );
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
+    assert!(reason.contains("没有生效"), "要说清是点击没生效：{reason}");
+    assert!(
+        !reason.contains("逐字匹配"),
+        "不该把它说成「资料页上没找到人」——那是另一个方向：{reason}"
+    );
+    assert_eq!(fixture.desktop.send_count(), 0);
+}
+
+// ── 「只做导航」（工作流 1 / 2 的最小验证单元）──────────────────────────
+/// 只做导航：找到图标、点它、停在 `Navigated`，**不找任何人**。
+///
+/// 这条路的价值是把"图标匹配得准不准"从整条链路里单独拎出来验证——
+/// 混在完整流程里时，点错图标的症状会表现为"找不到联系人"，
+/// 排查方向会一路偏向 OCR。
+#[test]
+fn navigate_only_finds_the_icon_and_stops_at_navigated() {
+    let icons = Arc::new(MockIconLocator::new());
+    let config = RunnerConfig {
+        workflow: Workflow::NavigateOnly,
+        nav_target: automation_core::NavTarget::Contact,
+        nav_icon_templates: vec![nav_template()],
+        ..list_config()
+    };
+    let scenario = MockScenario::happy(CONTACT, MESSAGE);
+    let fixture = Fixture::build_full(
+        MockDesktop::new(),
+        MockHumanConfirmation::default(),
+        config,
+        scenario.script(),
+        Arc::new(platform_mock::MockContactMatcher::new()),
+        icons.clone(),
+    );
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Navigated, "失败原因：{:?}", outcome.failure);
+    // `succeeded()` 只认 `Completed`（真的发出去了）。`Navigated` 是这条路的
+    // 正常终态，但它**没有完成一次发送**——两者不能混。
+    assert!(!outcome.succeeded(), "只做导航没有发送任何消息");
+    assert_eq!(icons.call_count(), 1, "只找一次图标");
+
+    // 关键：**一次 OCR 都没有**。它不找人，所以不该去识别任何文字。
+    assert_eq!(fixture.ocr.call_count(), 0, "只做导航不该做任何文字识别");
+    assert_eq!(fixture.desktop.clicks.lock().unwrap().len(), 1, "只点图标那一下");
+
+    let states = fixture.progress.states();
+    assert!(states.contains(&TaskState::NavigatingToView), "{states:?}");
+    assert!(
+        !states.contains(&TaskState::SearchingContact),
+        "只做导航不该进入查找：{states:?}"
+    );
+}
+
+/// 「只做导航」在**真实模式**下同样要走标定尺寸这一关——那是与工作流无关的前置条件。
+///
+/// 这条用例守的是"把 `NavigateOnly` 做成免检捷径"这种改法：尺寸对不上时区域会整体
+/// 偏移，点下去就是点到别的地方。尺寸不符时**同样会自动调回标定尺寸**，
+/// 这条前置条件不会因为工作流更简单就被跳过。
+#[test]
+fn navigate_only_still_requires_a_calibrated_window_in_live_mode() {
+    let config = RunnerConfig {
+        workflow: Workflow::NavigateOnly,
+        nav_icon_templates: vec![nav_template()],
+        calibrated_window: Some(CalibratedWindow {
+            width: 960,
+            height: 734,
+            scale_factor: 1.0,
+        }),
+        ..list_config()
+    };
+    let scenario = MockScenario::happy(CONTACT, MESSAGE);
+    let desktop = MockDesktop::new();
+    desktop.set_window(automation_core::Rect { x: 0, y: 0, width: 800, height: 600 });
+    let fixture = Fixture::build_full(
+        desktop,
+        MockHumanConfirmation::default(),
+        config,
+        scenario.script(),
+        Arc::new(platform_mock::MockContactMatcher::new()),
+        Arc::new(MockIconLocator::new()),
+    );
+
+    let _ = fixture.run(&fixture.task());
+
+    // 尺寸对不上 ⇒ 先把窗口调回标定尺寸，之后才允许动作。
+    assert_eq!(
+        fixture.desktop.resizes.lock().unwrap().as_slice(),
+        &[(960, 734)],
+        "只做导航也要先把窗口调回标定尺寸"
+    );
+    assert_eq!(fixture.desktop.window().width, 960);
+    assert_eq!(fixture.desktop.window().height, 734);
 }

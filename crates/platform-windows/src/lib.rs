@@ -14,6 +14,9 @@ pub mod config;
 pub mod desktop;
 
 #[cfg(windows)]
+pub mod hotkey;
+
+#[cfg(windows)]
 pub mod winapi;
 
 pub use config::{WindowMatcher, WindowsDesktopConfig};

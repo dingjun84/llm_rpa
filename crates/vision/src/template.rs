@@ -46,7 +46,9 @@
 
 use std::path::Path;
 
-use automation_core::{AutomationError, IconLocator, IconMatch, IconTemplate, Rect, Screenshot};
+use automation_core::{
+    AutomationError, IconLocator, IconMatch, IconQuery, IconTemplate, Point, Rect, Screenshot,
+};
 
 use crate::{VisionError, VisionResult};
 
@@ -170,16 +172,76 @@ fn numerator(hay: &Plane, tpl_zero: &[f64], x: usize, y: usize, tpl_w: usize, tp
 /// 返回 `None` 表示**这个模板根本放不下**（画面比模板小），或者模板是纯色的
 /// （没有任何图案可匹配）——两种情况都不是"找到了 0 分的位置"。
 fn best_match(hay: &[Plane], tpl: &[Plane]) -> Option<(Rect, f32)> {
-    let tpl_w = tpl[0].width;
-    let tpl_h = tpl[0].height;
-    if tpl_w == 0 || tpl_h == 0 || hay[0].width < tpl_w || hay[0].height < tpl_h {
+    let prepared = prepare(hay, tpl)?;
+    let rows = hay[0].height - prepared.height + 1;
+    let found = scan_rows_parallel(
+        rows,
+        |range| scan_rows(hay, &prepared, range),
+        |current, candidate| {
+            if is_better(current, candidate.2, candidate.0, candidate.1) {
+                Some(candidate)
+            } else {
+                current
+            }
+        },
+    )?;
+    Some((hit_rect(found.0, found.1, &prepared), found.2 as f32))
+}
+
+/// 在**分数已经够格**的位置里，找离 `prior` 最近的那个。
+///
+/// 与 [`best_match`] 的分工是刻意的：那个回答"最像的位置在哪"，
+/// 这个回答"在像到可以接受的位置里，哪一个离期望位置最近"。
+/// 合成一遍写会让"分数够不够"与"位置合不合适"两条判据纠缠在一处，
+/// 而它们必须能被**分开验证**——先验绝不能把低分命中抬上来。
+///
+/// 它要**再扫一遍**（第一次扫描只带回最高分，没带回"有哪些位置够格"）。
+/// 代价是匹配耗时翻倍，但这只在配了位置先验时发生，且这一步每次任务只跑一次。
+fn best_match_near(
+    hay: &[Plane],
+    prepared: &Prepared,
+    prior: Point,
+    min_score: f64,
+) -> Option<(Rect, f32)> {
+    let rows = hay[0].height - prepared.height + 1;
+    let target = (prior.x as f64, prior.y as f64);
+    let found = scan_rows_parallel(
+        rows,
+        |range| scan_rows_near(hay, prepared, range, target, min_score),
+        |current, candidate| {
+            if is_nearer(current, candidate, target) {
+                Some(candidate)
+            } else {
+                current
+            }
+        },
+    )?;
+    Some((hit_rect(found.0, found.1, prepared), found.2 as f32))
+}
+
+/// 模板的预处理结果：去均值后的三个通道 + 各自的方差。
+///
+/// 单独拿出来是因为"取最高分"与"取离先验最近"两次扫描吃的是**同一份**
+/// 预处理结果——分开算两遍等于把模板的均值与方差算两次。
+struct Prepared {
+    width: usize,
+    height: usize,
+    zero: Vec<Vec<f64>>,
+    variance: [f64; CHANNELS],
+}
+
+/// 给模板做去均值与方差；`None` 表示它**没有判别力**。
+fn prepare(hay: &[Plane], tpl: &[Plane]) -> Option<Prepared> {
+    let width = tpl[0].width;
+    let height = tpl[0].height;
+    if width == 0 || height == 0 || hay[0].width < width || hay[0].height < height {
         return None;
     }
-    let count = (tpl_w * tpl_h) as f64;
+    let count = (width * height) as f64;
 
     // 模板去均值 + 方差。方差为 0 表示这个通道是纯色的，没有判别力。
-    let mut tpl_zero: Vec<Vec<f64>> = Vec::with_capacity(CHANNELS);
-    let mut tpl_var = [0.0f64; CHANNELS];
+    let mut zero: Vec<Vec<f64>> = Vec::with_capacity(CHANNELS);
+    let mut variance = [0.0f64; CHANNELS];
     for (channel, plane) in tpl.iter().enumerate() {
         let sum: f64 = plane.values.iter().map(|v| *v as f64).sum();
         let sq: f64 = plane
@@ -191,85 +253,91 @@ fn best_match(hay: &[Plane], tpl: &[Plane]) -> Option<(Rect, f32)> {
             })
             .sum();
         let mean = sum / count;
-        tpl_var[channel] = (sq - count * mean * mean).max(0.0);
+        variance[channel] = (sq - count * mean * mean).max(0.0);
         // 去均值后**保留 f64**：这里降到 f32 会让分数带上约 1e-7 的相对误差，
         // 而阈值判定（默认 0.8）虽然不在乎这点误差，用例却在乎——
         // 「与定义式逐位置一致」这条用例正是靠它才盯得住积分图那套等价变形。
-        tpl_zero.push(plane.values.iter().map(|v| *v as f64 - mean).collect());
+        zero.push(plane.values.iter().map(|v| *v as f64 - mean).collect());
     }
     // 三个通道全是纯色 ⇒ 模板上没有任何图案，匹配结果没有意义。
-    if tpl_var.iter().all(|variance| *variance <= FLAT_VARIANCE) {
+    if variance.iter().all(|v| *v <= FLAT_VARIANCE) {
         return None;
     }
+    Some(Prepared { width, height, zero, variance })
+}
 
-    let max_y = hay[0].height - tpl_h;
+/// 把内部的位置元组还原成对外的矩形。
+fn hit_rect(x: usize, y: usize, prepared: &Prepared) -> Rect {
+    Rect {
+        x: x as i32,
+        y: y as i32,
+        width: prepared.width as i32,
+        height: prepared.height as i32,
+    }
+}
 
-    // 按**行**分块并行：每个块的结果互不影响，最后按同一个比较规则合并。
-    // 线程数由机器决定（`available_parallelism`），不写死——单核机器上
-    // 这条分支自然退化成顺序执行，不需要额外的开关。
-    let rows = max_y + 1;
+/// 「按行分块 + 并行 + 按给定规则合并」这段骨架。
+///
+/// 两次扫描（取最高分 / 取离先验最近）共用它：并行策略只有一处，
+/// 改分块方式不会只改到其中一条——那会让两个结果在不同机器上分叉。
+///
+/// 线程数由机器决定（`available_parallelism`），不写死——单核机器上
+/// 这条分支自然退化成顺序执行，不需要额外的开关。
+fn scan_rows_parallel<T, S, C>(rows: usize, scan: S, combine: C) -> Option<T>
+where
+    T: Copy + Send,
+    S: Fn(std::ops::Range<usize>) -> Option<T> + Sync,
+    C: Fn(Option<T>, T) -> Option<T>,
+{
+    if rows == 0 {
+        return None;
+    }
     let workers = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
         .clamp(1, rows);
-
-    let mut best: Option<(usize, usize, f64)> = None;
     if workers == 1 {
-        best = scan_rows(hay, &tpl_zero, &tpl_var, tpl_w, tpl_h, 0..rows);
-    } else {
-        let chunk = rows.div_ceil(workers);
-        let mut partial: Vec<Option<(usize, usize, f64)>> = Vec::with_capacity(workers);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..workers)
-                .map(|worker| {
-                    let start = worker * chunk;
-                    let end = ((worker + 1) * chunk).min(rows);
-                    let hay = &hay;
-                    let tpl_zero = &tpl_zero;
-                    let tpl_var = &tpl_var;
-                    scope.spawn(move || {
-                        if start >= end {
-                            return None;
-                        }
-                        scan_rows(hay, tpl_zero, tpl_var, tpl_w, tpl_h, start..end)
-                    })
-                })
-                .collect();
-            for handle in handles {
-                partial.push(handle.join().unwrap_or(None));
-            }
-        });
-        for candidate in partial {
-            if let Some((x, y, score)) = candidate {
-                if is_better(best, score, x, y) {
-                    best = Some((x, y, score));
-                }
+        return scan(0..rows);
+    }
+    let chunk = rows.div_ceil(workers);
+    let mut best: Option<T> = None;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let start = worker * chunk;
+                let end = ((worker + 1) * chunk).min(rows);
+                let scan = &scan;
+                scope.spawn(move || if start >= end { None } else { scan(start..end) })
+            })
+            .collect();
+        for handle in handles {
+            if let Some(value) = handle.join().unwrap_or(None) {
+                best = combine(best, value);
             }
         }
-    }
-
-    best.map(|(x, y, score)| {
-        (
-            Rect { x: x as i32, y: y as i32, width: tpl_w as i32, height: tpl_h as i32 },
-            score as f32,
-        )
-    })
+    });
+    best
 }
 
 /// 在 `rows` 这段行区间里逐位置求分数，返回其中最好的一个。
 fn scan_rows(
     hay: &[Plane],
-    tpl_zero: &[Vec<f64>],
-    tpl_var: &[f64; CHANNELS],
-    tpl_w: usize,
-    tpl_h: usize,
+    prepared: &Prepared,
     rows: std::ops::Range<usize>,
 ) -> Option<(usize, usize, f64)> {
-    let max_x = hay[0].width - tpl_w;
+    let max_x = hay[0].width - prepared.width;
     let mut best: Option<(usize, usize, f64)> = None;
     for y in rows {
         for x in 0..=max_x {
-            let Some(score) = position_score(hay, tpl_zero, tpl_var, x, y, tpl_w, tpl_h) else {
+            let Some(score) = position_score(
+                hay,
+                &prepared.zero,
+                &prepared.variance,
+                x,
+                y,
+                prepared.width,
+                prepared.height,
+            ) else {
                 continue;
             };
             if is_better(best, score, x, y) {
@@ -278,6 +346,73 @@ fn scan_rows(
         }
     }
     best
+}
+
+/// 同 [`scan_rows`]，但只接受 `score >= min_score` 的位置，并在其中挑离 `prior` 最近的。
+fn scan_rows_near(
+    hay: &[Plane],
+    prepared: &Prepared,
+    rows: std::ops::Range<usize>,
+    prior: (f64, f64),
+    min_score: f64,
+) -> Option<(usize, usize, f64)> {
+    let max_x = hay[0].width - prepared.width;
+    let mut best: Option<(usize, usize, f64)> = None;
+    for y in rows {
+        for x in 0..=max_x {
+            let Some(score) = position_score(
+                hay,
+                &prepared.zero,
+                &prepared.variance,
+                x,
+                y,
+                prepared.width,
+                prepared.height,
+            ) else {
+                continue;
+            };
+            if score < min_score {
+                continue;
+            }
+            if is_nearer(best, (x, y, score), prior) {
+                best = Some((x, y, score));
+            }
+        }
+    }
+    best
+}
+
+/// 位置到先验点的距离**平方**。这里只需要比大小，开方是白花的钱。
+fn distance_sq(x: usize, y: usize, prior: (f64, f64)) -> f64 {
+    let dx = x as f64 - prior.0;
+    let dy = y as f64 - prior.1;
+    dx * dx + dy * dy
+}
+
+/// 候选是否比当前的更靠近先验点。
+///
+/// 平局规则和 [`is_better`] 一样是**确定性**的：距离相同比分数，分数相同比
+/// `(y, x)`。并行扫描之后"谁先被扫到"取决于线程调度，平局若按到达顺序决定，
+/// 同一份输入在不同机器上会给出不同位置——而位置直接决定点哪儿。
+fn is_nearer(
+    current: Option<(usize, usize, f64)>,
+    candidate: (usize, usize, f64),
+    prior: (f64, f64),
+) -> bool {
+    match current {
+        None => true,
+        Some((best_x, best_y, best_score)) => {
+            let best_distance = distance_sq(best_x, best_y, prior);
+            let distance = distance_sq(candidate.0, candidate.1, prior);
+            if distance != best_distance {
+                distance < best_distance
+            } else if candidate.2 != best_score {
+                candidate.2 > best_score
+            } else {
+                (candidate.1, candidate.0) < (best_y, best_x)
+            }
+        }
+    }
 }
 
 /// 候选 `(x, y, score)` 是否比当前的更好。
@@ -357,7 +492,14 @@ pub fn match_template(
 /// 那时人只会去怀疑阈值，不会想到"模板根本不是图标"。
 pub fn load_icon_template(path: &Path, label: impl Into<String>) -> VisionResult<IconTemplate> {
     let label = label.into();
-    let rgba = image::open(path)?.to_rgba8();
+    // 读不进来时**带上标签**：一个图标名底下可以有多张图，只说"图像编解码失败"
+    // 没法告诉人是哪一张坏了——而修的时候正是要精确到那一张。
+    let rgba = image::open(path)
+        .map_err(|err| VisionError::TemplateUnreadable {
+            label: label.clone(),
+            reason: err.to_string(),
+        })?
+        .to_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
     if width < MIN_TEMPLATE_SIDE || height < MIN_TEMPLATE_SIDE {
         return Err(VisionError::TemplateTooSmall { label, width, height });
@@ -417,10 +559,9 @@ impl IconLocator for TemplateLocator {
     fn locate(
         &self,
         frame: &Screenshot,
-        templates: &[IconTemplate],
-        min_score: f32,
+        query: &IconQuery<'_>,
     ) -> Result<IconMatch, AutomationError> {
-        if templates.is_empty() {
+        if query.templates.is_empty() {
             // 与"没匹配上"是两回事：这是配置缺失，不能静默当成"这里没有图标"。
             return Err(AutomationError::NeedsHumanReview(
                 "没有配置任何图标模板，无法定位图标。".into(),
@@ -428,39 +569,79 @@ impl IconLocator for TemplateLocator {
         }
         let hay = planes_from_bgra(&frame.pixels, frame.width, frame.height)?;
 
-        let mut best: Option<IconMatch> = None;
-        for (index, template) in templates.iter().enumerate() {
+        // 逐张模板取最高分，并**留住胜出那张的预处理结果**：位置先验只在
+        // 同一张模板的候选位置之间比较——换一张模板比位置没有意义，
+        // 不同变体本来就落在图标框内的不同像素上。
+        let mut best: Option<(IconMatch, Prepared)> = None;
+        for (index, template) in query.templates.iter().enumerate() {
             let needle = planes_from_bgra(&template.pixels, template.width, template.height)?;
-            let Some((bounds, score)) = best_match(&hay, &needle) else {
+            let Some(prepared) = prepare(&hay, &needle) else {
                 continue;
             };
-            if best.as_ref().map(|current| score > current.score).unwrap_or(true) {
-                best = Some(IconMatch {
-                    bounds,
-                    score,
-                    template_index: index,
-                    template_label: template.label.clone(),
-                });
+            let rows = hay[0].height - prepared.height + 1;
+            let Some(found) = scan_rows_parallel(
+                rows,
+                |range| scan_rows(&hay, &prepared, range),
+                |current, candidate| {
+                    if is_better(current, candidate.2, candidate.0, candidate.1) {
+                        Some(candidate)
+                    } else {
+                        current
+                    }
+                },
+            ) else {
+                continue;
+            };
+            let score = found.2 as f32;
+            if best.as_ref().map(|(current, _)| score > current.score).unwrap_or(true) {
+                best = Some((
+                    IconMatch {
+                        bounds: hit_rect(found.0, found.1, &prepared),
+                        score,
+                        template_index: index,
+                        template_label: template.label.clone(),
+                    },
+                    prepared,
+                ));
             }
         }
 
-        match best {
-            // 分数不够 ⇒ 转人工，**不**把"最高分那个"先拿去用。
-            // 点错图标的后果是后面每一步都作用在错误的界面上，比直接失败严重得多。
-            Some(found) if found.score < min_score => Err(AutomationError::AmbiguousVision(format!(
-                "图标模板匹配不确定：最高分 {:.3}（模板「{}」，位置 ({}, {})），低于阈值 {:.3}。\
-                 请确认模板确实截自这个图标，且它此刻在搜索区域内可见。",
-                found.score, found.template_label, found.bounds.x, found.bounds.y, min_score
-            ))),
-            Some(found) => Ok(found),
-            None => Err(AutomationError::AmbiguousVision(format!(
+        let Some((mut found, prepared)) = best else {
+            return Err(AutomationError::AmbiguousVision(format!(
                 "在 {}x{} 的搜索区域里，没有一个模板放得下（最小模板 {}x{}）",
                 frame.width,
                 frame.height,
-                templates.iter().map(|t| t.width).min().unwrap_or(0),
-                templates.iter().map(|t| t.height).min().unwrap_or(0)
-            ))),
+                query.templates.iter().map(|t| t.width).min().unwrap_or(0),
+                query.templates.iter().map(|t| t.height).min().unwrap_or(0)
+            )));
+        };
+
+        // 分数不够 ⇒ 转人工，**不**把"最高分那个"先拿去用。
+        // 点错图标的后果是后面每一步都作用在错误的界面上，比直接失败严重得多。
+        //
+        // 注意这一步在位置先验**之前**：先验只回答"够格的几个里挑哪个"，
+        // 绝不能把本来不及格的命中抬上来。顺序反了，"分数不够"就会表现为
+        // "点到了别的地方"。
+        if found.score < query.min_score {
+            return Err(AutomationError::AmbiguousVision(format!(
+                "图标模板匹配不确定：最高分 {:.3}（模板「{}」，位置 ({}, {})），低于阈值 {:.3}。\
+                 请确认模板确实截自这个图标，且它此刻在搜索区域内可见。",
+                found.score, found.template_label, found.bounds.x, found.bounds.y, query.min_score
+            )));
         }
+
+        // 位置先验：在分数不低于「最高分 − 容差」的候选里，挑离期望位置最近的那个。
+        if let Some(prior) = query.prior {
+            if prior.score_tolerance > 0.0 {
+                let floor = (found.score - prior.score_tolerance) as f64;
+                if let Some((bounds, score)) = best_match_near(&hay, &prepared, prior.at, floor) {
+                    found.bounds = bounds;
+                    found.score = score;
+                }
+            }
+        }
+
+        Ok(found)
     }
 }
 
@@ -483,386 +664,4 @@ pub fn frame_of(width: u32, height: u32, paint: impl Fn(u32, u32) -> [u8; 4]) ->
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 确定性的伪随机图案。用固定种子的 LCG，避免测试依赖随机数实现。
-    fn noise(x: u32, y: u32, seed: u32) -> u8 {
-        let mut value = x
-            .wrapping_mul(73_856_093)
-            .wrapping_add(y.wrapping_mul(19_349_663))
-            .wrapping_add(seed.wrapping_mul(83_492_791));
-        value ^= value >> 13;
-        value = value.wrapping_mul(1_274_126_177);
-        (value >> 8) as u8
-    }
-
-    fn pattern(x: u32, y: u32) -> [u8; 4] {
-        let v = noise(x, y, 7);
-        [v, v.wrapping_add(40), v.wrapping_add(90), 255]
-    }
-
-    fn template_at(frame: &Screenshot, x: i32, y: i32, w: i32, h: i32) -> IconTemplate {
-        crop_template(frame, Rect { x, y, width: w, height: h }, "测试模板").unwrap()
-    }
-
-    /// 朴素版 NCC：直接用定义式，每个位置老老实实重算 w×h 次乘法。
-    ///
-    /// 它存在的唯一目的是给生产实现当**参照物**。生产实现用了积分图求均值与方差、
-    /// 用了"分子 = Σ(T-T̄)·I"这个等价变形；这些一旦写错，分数只会悄悄偏一点点，
-    /// 而"看起来还挺高"是看不出偏了的。
-    fn naive_score(frame: &Screenshot, tpl: &IconTemplate, x: usize, y: usize) -> Option<f64> {
-        let count = (tpl.width * tpl.height) as f64;
-        let mut total = 0.0f64;
-        let mut usable = 0usize;
-        for channel in 0..CHANNELS {
-            let mut t = Vec::new();
-            let mut i = Vec::new();
-            for ty in 0..tpl.height {
-                for tx in 0..tpl.width {
-                    t.push(tpl.pixels[((ty * tpl.width + tx) * 4) as usize + channel] as f64);
-                    i.push(
-                        frame.pixels[(((y as u32 + ty) * frame.width + x as u32 + tx) * 4) as usize
-                            + channel] as f64,
-                    );
-                }
-            }
-            let t_mean = t.iter().sum::<f64>() / count;
-            let i_mean = i.iter().sum::<f64>() / count;
-            let t_var: f64 = t.iter().map(|v| (v - t_mean).powi(2)).sum();
-            let i_var: f64 = i.iter().map(|v| (v - i_mean).powi(2)).sum();
-            if t_var <= FLAT_VARIANCE || i_var <= FLAT_VARIANCE {
-                continue;
-            }
-            let numer: f64 = t
-                .iter()
-                .zip(i.iter())
-                .map(|(a, b)| (a - t_mean) * (b - i_mean))
-                .sum();
-            total += numer / (t_var * i_var).sqrt();
-            usable += 1;
-        }
-        if usable == 0 {
-            None
-        } else {
-            Some(total / usable as f64)
-        }
-    }
-
-    /// 把一帧与一张模板都拆成平面，供直接调用内部函数。
-    fn planes(frame: &Screenshot, template: &IconTemplate) -> (Vec<Plane>, Vec<Plane>) {
-        (
-            planes_from_bgra(&frame.pixels, frame.width, frame.height).unwrap(),
-            planes_from_bgra(&template.pixels, template.width, template.height).unwrap(),
-        )
-    }
-
-    #[test]
-    fn finds_the_exact_position_of_a_pasted_patch() {
-        let frame = frame_of(120, 80, pattern);
-        let template = template_at(&frame, 37, 22, 16, 12);
-
-        let (bounds, score) = match_template(&frame, &template).unwrap().unwrap();
-        assert_eq!((bounds.x, bounds.y), (37, 22));
-        assert_eq!((bounds.width, bounds.height), (16, 12));
-        assert!(score > 0.999, "同一块像素自比应当接近 1.0，实际 {score}");
-    }
-
-    #[test]
-    fn normalised_correlation_survives_brightness_and_contrast_changes() {
-        let base = frame_of(120, 80, pattern);
-        let template = template_at(&base, 37, 22, 16, 12);
-
-        // 整体压暗并降低对比度：模拟窗口失去焦点 / 半透明主题。
-        // 差值型度量（TM_SQDIFF）在这里会掉到不及格，NCC 不应该。
-        let dimmed = frame_of(120, 80, |x, y| {
-            let p = pattern(x, y);
-            let f = |v: u8| ((v as f32 * 0.7) as u8).wrapping_add(20);
-            [f(p[0]), f(p[1]), f(p[2]), 255]
-        });
-
-        let (bounds, score) = match_template(&dimmed, &template).unwrap().unwrap();
-        assert_eq!((bounds.x, bounds.y), (37, 22), "亮度变化不该挪动命中位置");
-        assert!(score > 0.99, "NCC 应当对亮度/对比度变化免疫，实际 {score}");
-    }
-
-    /// 生产实现（积分图 + 等价变形）必须与**定义式**逐位置一致。
-    ///
-    /// 用一幅 40×30 的小画面 + 9×7 的模板，把每个候选位置都比一遍：
-    /// 这样"积分图边界差一列""方差用了错的窗口"这类错误无处可藏。
-    #[test]
-    fn the_production_score_matches_the_ncc_definition_at_every_position() {
-        let frame = frame_of(40, 30, pattern);
-        let template = template_at(&frame, 11, 9, 9, 7);
-        let (hay, needle) = planes(&frame, &template);
-
-        let tpl_w = needle[0].width;
-        let tpl_h = needle[0].height;
-        let count = (tpl_w * tpl_h) as f64;
-        let mut tpl_zero = Vec::new();
-        let mut tpl_var = [0.0f64; CHANNELS];
-        for (channel, plane) in needle.iter().enumerate() {
-            let sum: f64 = plane.values.iter().map(|v| *v as f64).sum();
-            let mean = sum / count;
-            tpl_var[channel] = plane
-                .values
-                .iter()
-                .map(|v| (*v as f64 - mean).powi(2))
-                .sum();
-            tpl_zero.push(
-                plane
-                    .values
-                    .iter()
-                    .map(|v| *v as f64 - mean)
-                    .collect::<Vec<f64>>(),
-            );
-        }
-
-        let mut compared = 0usize;
-        for y in 0..=(frame.height - template.height) as usize {
-            for x in 0..=(frame.width - template.width) as usize {
-                let expected = naive_score(&frame, &template, x, y);
-                let actual =
-                    position_score(&hay, &tpl_zero, &tpl_var, x, y, tpl_w, tpl_h);
-                match (expected, actual) {
-                    (Some(e), Some(a)) => {
-                        assert!(
-                            (e - a).abs() < 1e-9,
-                            "位置 ({x}, {y})：定义式给 {e}，生产实现给 {a}"
-                        );
-                        compared += 1;
-                    }
-                    (None, None) => {}
-                    _ => panic!(
-                        "位置 ({x}, {y}) 上「没定义」的判定不一致：定义式 {expected:?}，生产实现 {actual:?}"
-                    ),
-                }
-            }
-        }
-        assert!(compared > 500, "比较的位置太少（{compared}），这条用例没起到作用");
-    }
-
-    /// `best_match` 必须等于"逐位置求分数后取最大值"。
-    ///
-    /// 它钉住的是"取最大值"这一步：起点、终点、以及最大值的位置。
-    /// 上一条用例钉的是分数本身对不对，两条合起来才覆盖整条路径。
-    #[test]
-    fn best_match_is_the_maximum_over_every_position() {
-        let frame = frame_of(48, 36, pattern);
-        let template = template_at(&frame, 13, 7, 10, 9);
-        let (hay, needle) = planes(&frame, &template);
-        let (bounds, score) = best_match(&hay, &needle).unwrap();
-
-        let mut expected: Option<(usize, usize, f64)> = None;
-        for y in 0..=(frame.height - template.height) as usize {
-            for x in 0..=(frame.width - template.width) as usize {
-                let value = naive_score(&frame, &template, x, y).unwrap();
-                if expected.map(|(_, _, best)| value > best).unwrap_or(true) {
-                    expected = Some((x, y, value));
-                }
-            }
-        }
-        let (ex, ey, ev) = expected.unwrap();
-        assert_eq!((bounds.x, bounds.y), (ex as i32, ey as i32));
-        assert!((score as f64 - ev).abs() < 1e-6, "分数应当与逐位置最大值一致");
-        assert_eq!((bounds.width, bounds.height), (10, 9));
-    }
-
-    /// 颜色必须参与判断，不能只比亮度。
-    ///
-    /// 构造两块**通道均值完全相同、只有色相不同**的图案（B 与 R 互换）。
-    /// 只算灰度的话两者一模一样，实现会在两个位置之间随便挑一个；
-    /// 三个通道各算一遍再平均，才能分辨出哪一块才是模板那一块。
-    #[test]
-    fn colour_is_used_not_only_luminance() {
-        let frame = frame_of(60, 20, |x, y| {
-            let in_a = (10..22).contains(&x);
-            let in_b = (40..52).contains(&x);
-            if !in_a && !in_b {
-                return [30, 30, 30, 255];
-            }
-            let local_x = if in_a { x - 10 } else { x - 40 };
-            let v = noise(local_x, y, 3);
-            let w = noise(local_x, y, 5);
-            // A: B=v, G=w, R=w   B: B=w, G=w, R=v —— 均值都是 (v+2w)/3。
-            if in_a {
-                [v, w, w, 255]
-            } else {
-                [w, w, v, 255]
-            }
-        });
-
-        let a = template_at(&frame, 10, 4, 12, 12);
-        let b = template_at(&frame, 40, 4, 12, 12);
-
-        let (bounds, score) = match_template(&frame, &a).unwrap().unwrap();
-        assert_eq!((bounds.x, bounds.y), (10, 4));
-        assert!(score > 0.99);
-
-        // 关键的一半：模板 B 必须命中右边那块。只比亮度的实现会在
-        // 左边先撞见一个"完全相同"的位置，于是选错。
-        let (bounds, score) = match_template(&frame, &b).unwrap().unwrap();
-        assert_eq!((bounds.x, bounds.y), (40, 4), "颜色不同就该区分得开");
-        assert!(score > 0.99);
-    }
-
-    #[test]
-    fn a_flat_template_is_not_a_match() {
-        let frame = frame_of(60, 40, pattern);
-        let flat = IconTemplate {
-            label: "纯色".into(),
-            pixels: [128u8, 128, 128, 255].repeat(100),
-            width: 10,
-            height: 10,
-        };
-        assert!(match_template(&frame, &flat).unwrap().is_none());
-    }
-
-    #[test]
-    fn a_template_larger_than_the_frame_is_not_a_match() {
-        let frame = frame_of(20, 20, pattern);
-        let big = IconTemplate {
-            label: "比画面还大".into(),
-            pixels: vec![0; 40 * 40 * 4],
-            width: 40,
-            height: 40,
-        };
-        assert!(match_template(&frame, &big).unwrap().is_none());
-    }
-
-    #[test]
-    fn the_locator_refuses_to_guess_below_the_threshold() {
-        let frame = frame_of(80, 40, pattern);
-        // 模板取自另一张完全无关的图 ⇒ 分数必然很低。
-        let other = frame_of(80, 40, |x, y| {
-            let v = noise(x, y, 991);
-            [v, v, v, 255]
-        });
-        let template = template_at(&other, 5, 5, 12, 12);
-
-        let err = TemplateLocator.locate(&frame, &[template], 0.8).unwrap_err();
-        assert!(
-            matches!(err, AutomationError::AmbiguousVision(_)),
-            "低分必须转人工而不是硬用，实际是 {err:?}"
-        );
-        assert!(err.requires_human_review());
-    }
-
-    #[test]
-    fn the_locator_picks_the_best_of_several_templates() {
-        let frame = frame_of(80, 40, pattern);
-        let wrong = {
-            let other = frame_of(80, 40, |x, y| [noise(x, y, 991), 0, 0, 255]);
-            template_at(&other, 5, 5, 12, 12)
-        };
-        let right = template_at(&frame, 44, 12, 12, 12);
-
-        let found = TemplateLocator.locate(&frame, &[wrong, right], 0.9).unwrap();
-        assert_eq!(found.template_index, 1, "应当选中真正对得上的那一张");
-        assert_eq!((found.bounds.x, found.bounds.y), (44, 12));
-        assert!(found.score > 0.99);
-    }
-
-    #[test]
-    fn the_locator_refuses_an_empty_template_list() {
-        let frame = frame_of(40, 40, pattern);
-        let err = TemplateLocator.locate(&frame, &[], 0.8).unwrap_err();
-        // 配置缺失必须报错，不能当成"这里没有图标"静默跳过。
-        assert!(matches!(err, AutomationError::NeedsHumanReview(_)), "实际是 {err:?}");
-    }
-
-    /// 真机尺寸下的一次匹配耗时（只打印，不断言）。
-    ///
-    /// 为什么要量：默认导航条是"窗口宽 7.5% × 整高"，模板 26×26 时
-    /// 位置数约 3.4 万、每个位置 676 次乘加。这个量级在 debug 构建下
-    /// 是"几十毫秒"还是"几秒"，直接决定了这一步能不能放在任务主路径上。
-    #[test]
-    fn measure_a_realistic_navigation_strip() {
-        // 974x734 窗口下实测的导航条：73 宽、整高。
-        let frame = frame_of(73, 734, pattern);
-        let template = template_at(&frame, 8, 40, 26, 26);
-
-        let started = std::time::Instant::now();
-        let found = match_template(&frame, &template).unwrap().unwrap();
-        let elapsed = started.elapsed();
-
-        assert_eq!((found.0.x, found.0.y), (8, 40));
-        println!(
-            "导航条 73x734 + 26x26 模板：{elapsed:?}（分数 {:.4}）",
-            found.1
-        );
-    }
-
-    #[test]
-    fn crop_template_reads_the_requested_pixels() {
-        let frame = frame_of(20, 10, pattern);
-        let template = crop_template(&frame, Rect { x: 3, y: 2, width: 4, height: 3 }, "t").unwrap();
-        assert_eq!((template.width, template.height), (4, 3));
-        assert_eq!(template.pixels.len(), 4 * 3 * 4);
-        assert_eq!(template.pixels[0], frame.pixels[((2 * 20 + 3) * 4) as usize]);
-    }
-
-    #[test]
-    fn crop_template_refuses_to_leave_the_frame() {
-        let frame = frame_of(20, 10, pattern);
-        assert!(matches!(
-            crop_template(&frame, Rect { x: 18, y: 0, width: 4, height: 4 }, "t"),
-            Err(VisionError::CropOutOfBounds)
-        ));
-        assert!(matches!(
-            crop_template(&frame, Rect { x: 0, y: 0, width: 0, height: 4 }, "t"),
-            Err(VisionError::CropOutOfBounds)
-        ));
-    }
-
-    #[test]
-    fn load_icon_template_round_trips_a_png_and_guards_the_size() {
-        let frame = frame_of(200, 60, pattern);
-        let dir = std::env::temp_dir().join("rpa-llm-template-test");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // 正常尺寸：载入后像素与裁出来的完全一致（BGRA 顺序也要对）。
-        let source = template_at(&frame, 30, 10, 16, 14);
-        let path = dir.join("icon.png");
-        let rgba = crate::pixels::to_rgba(&Screenshot {
-            pixels: source.pixels.clone(),
-            width: source.width,
-            height: source.height,
-            captured_at: std::time::SystemTime::now(),
-            fingerprint: String::new(),
-        })
-        .unwrap();
-        std::fs::write(&path, crate::pixels::encode_png(&rgba).unwrap()).unwrap();
-
-        let loaded = load_icon_template(&path, "图标").unwrap();
-        assert_eq!(loaded.label, "图标");
-        assert_eq!((loaded.width, loaded.height), (source.width, source.height));
-        assert_eq!(loaded.pixels, source.pixels, "载入后必须与原始 BGRA 逐字节一致");
-
-        // 太小 / 太大都必须**当场报错**，而不是留到任务里表现为"分数很低"。
-        let small = dir.join("small.png");
-        std::fs::write(
-            &small,
-            crate::pixels::encode_png(&image::RgbaImage::new(2, 2)).unwrap(),
-        )
-        .unwrap();
-        assert!(matches!(
-            load_icon_template(&small, "太小"),
-            Err(VisionError::TemplateTooSmall { .. })
-        ));
-
-        let huge = dir.join("huge.png");
-        std::fs::write(
-            &huge,
-            crate::pixels::encode_png(&image::RgbaImage::new(200, 40)).unwrap(),
-        )
-        .unwrap();
-        assert!(matches!(
-            load_icon_template(&huge, "太大"),
-            Err(VisionError::TemplateTooLarge { .. })
-        ));
-
-        // 文件不存在时要报 IO/解码错误，而不是当成"空模板"。
-        assert!(load_icon_template(&dir.join("missing.png"), "缺失").is_err());
-    }
-}
+mod tests;

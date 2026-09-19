@@ -23,6 +23,19 @@ pub enum TaskState {
     NavigatingToView,
     SearchingContact,
     VerifyingCandidate,
+    /// 在**联系人资料页**上核验姓名。
+    ///
+    /// 搜索式查找的落点不是聊天页，而是资料页——它是"选中这个人"与
+    /// "进入与他的聊天"之间的一个独立界面。单独设一个状态，是因为后面所有动作
+    /// （滚到资料页底部、找「发消息」入口、点它）都建立在
+    /// "资料页上显示的就是要找的那个人"之上；混在 `VerifyingCandidate` 里的话，
+    /// 出问题时看不出到底是"选错了人"还是"资料页根本没打开"。
+    VerifyingProfile,
+    /// 在资料页里找到进入聊天的入口并点击它。
+    ///
+    /// 和 [`TaskState::NavigatingToView`] 同类：它是一个**会改变界面内容**的动作
+    /// （资料页 → 聊天页），点完之后所有的截图与识别都必须建立在**新画面**上。
+    OpeningChatFromProfile,
     VerifyingChatHeader,
     PreparingMessage,
     AwaitingHumanConfirmation,
@@ -35,6 +48,12 @@ pub enum TaskState {
     /// 它与 `Completed` 一样是正常结束，不是失败：没有发生任何意外，
     /// 只是流程按配置在发送前停下了。
     Prepared,
+    /// 终态：只完成了"找到导航图标并点击它"，没有打开任何会话、也没有发消息。
+    ///
+    /// 用于**单独验证导航那一步**（找联系人图标 / 聊天历史图标）。
+    /// 它和 [`TaskState::Prepared`] 一样是**正常结束**，不是失败：
+    /// 流程按配置在该停的地方停下了，没有发生任何意外。
+    Navigated,
     NeedsHumanReview,
     Failed,
     Cancelled,
@@ -58,13 +77,15 @@ impl TaskState {
     /// **新增状态时必须同时加进这张表。** 这一点编译器不会替我们盯着
     /// （数组长度是字面量），所以下面 `all_variants_round_trip` 那条用例
     /// 是唯一的兜底——表里没有的状态，它就测不到。
-    pub const ALL: [TaskState; 16] = [
+    pub const ALL: [TaskState; 19] = [
         Self::Draft,
         Self::LaunchingClient,
         Self::WaitingForClient,
         Self::NavigatingToView,
         Self::SearchingContact,
         Self::VerifyingCandidate,
+        Self::VerifyingProfile,
+        Self::OpeningChatFromProfile,
         Self::VerifyingChatHeader,
         Self::PreparingMessage,
         Self::AwaitingHumanConfirmation,
@@ -72,6 +93,7 @@ impl TaskState {
         Self::VerifyingDelivery,
         Self::Completed,
         Self::Prepared,
+        Self::Navigated,
         Self::NeedsHumanReview,
         Self::Failed,
         Self::Cancelled,
@@ -80,7 +102,12 @@ impl TaskState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Prepared | Self::NeedsHumanReview | Self::Failed | Self::Cancelled
+            Self::Completed
+                | Self::Prepared
+                | Self::Navigated
+                | Self::NeedsHumanReview
+                | Self::Failed
+                | Self::Cancelled
         )
     }
 
@@ -93,6 +120,8 @@ impl TaskState {
             Self::NavigatingToView => "NavigatingToView",
             Self::SearchingContact => "SearchingContact",
             Self::VerifyingCandidate => "VerifyingCandidate",
+            Self::VerifyingProfile => "VerifyingProfile",
+            Self::OpeningChatFromProfile => "OpeningChatFromProfile",
             Self::VerifyingChatHeader => "VerifyingChatHeader",
             Self::PreparingMessage => "PreparingMessage",
             Self::AwaitingHumanConfirmation => "AwaitingHumanConfirmation",
@@ -100,6 +129,7 @@ impl TaskState {
             Self::VerifyingDelivery => "VerifyingDelivery",
             Self::Completed => "Completed",
             Self::Prepared => "Prepared",
+            Self::Navigated => "Navigated",
             Self::NeedsHumanReview => "NeedsHumanReview",
             Self::Failed => "Failed",
             Self::Cancelled => "Cancelled",
@@ -115,6 +145,8 @@ impl TaskState {
             "NavigatingToView" => Self::NavigatingToView,
             "SearchingContact" => Self::SearchingContact,
             "VerifyingCandidate" => Self::VerifyingCandidate,
+            "VerifyingProfile" => Self::VerifyingProfile,
+            "OpeningChatFromProfile" => Self::OpeningChatFromProfile,
             "VerifyingChatHeader" => Self::VerifyingChatHeader,
             "PreparingMessage" => Self::PreparingMessage,
             "AwaitingHumanConfirmation" => Self::AwaitingHumanConfirmation,
@@ -122,6 +154,7 @@ impl TaskState {
             "VerifyingDelivery" => Self::VerifyingDelivery,
             "Completed" => Self::Completed,
             "Prepared" => Self::Prepared,
+            "Navigated" => Self::Navigated,
             "NeedsHumanReview" => Self::NeedsHumanReview,
             "Failed" => Self::Failed,
             "Cancelled" => Self::Cancelled,
@@ -138,6 +171,8 @@ impl TaskState {
             Self::NavigatingToView => "正在切换视图",
             Self::SearchingContact => "正在查找联系人",
             Self::VerifyingCandidate => "正在核验联系人",
+            Self::VerifyingProfile => "正在核验联系人资料",
+            Self::OpeningChatFromProfile => "正在从资料页打开聊天",
             Self::VerifyingChatHeader => "正在核验聊天页标题",
             Self::PreparingMessage => "正在准备消息",
             Self::AwaitingHumanConfirmation => "等待人工确认",
@@ -145,6 +180,7 @@ impl TaskState {
             Self::VerifyingDelivery => "正在核验送达",
             Self::Completed => "已完成",
             Self::Prepared => "已填入正文，未发送",
+            Self::Navigated => "已切换视图，未打开会话",
             Self::NeedsHumanReview => "需要人工处理",
             Self::Failed => "已失败",
             Self::Cancelled => "已取消",
@@ -195,8 +231,17 @@ impl TaskMachine {
                 | (TaskState::WaitingForClient, TaskState::NavigatingToView)
                 | (TaskState::WaitingForClient, TaskState::SearchingContact)
                 | (TaskState::NavigatingToView, TaskState::SearchingContact)
+                // 「只做导航」这一条路：点完图标就结束，不查找任何人。
+                | (TaskState::NavigatingToView, TaskState::Navigated)
                 | (TaskState::SearchingContact, TaskState::VerifyingCandidate)
+                // 两条查找路径在这里分叉，两条边都必须允许：
+                //   - 列表扫描式：候选之后直接核验聊天标题（选中即打开会话）；
+                //   - 搜索框式：候选之后先落在**资料页**，再从那儿的入口进聊天。
+                // 只留一条会把另一种查找方式变成一次非法转换。
                 | (TaskState::VerifyingCandidate, TaskState::VerifyingChatHeader)
+                | (TaskState::VerifyingCandidate, TaskState::VerifyingProfile)
+                | (TaskState::VerifyingProfile, TaskState::OpeningChatFromProfile)
+                | (TaskState::OpeningChatFromProfile, TaskState::VerifyingChatHeader)
                 | (TaskState::VerifyingChatHeader, TaskState::PreparingMessage)
                 | (TaskState::PreparingMessage, TaskState::AwaitingHumanConfirmation)
                 | (TaskState::PreparingMessage, TaskState::Prepared)
@@ -213,193 +258,4 @@ impl TaskMachine {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_the_full_verified_path_can_complete() {
-        let mut task = TaskMachine::default();
-        for state in [
-            TaskState::LaunchingClient,
-            TaskState::WaitingForClient,
-            TaskState::SearchingContact,
-            TaskState::VerifyingCandidate,
-            TaskState::VerifyingChatHeader,
-            TaskState::PreparingMessage,
-            TaskState::AwaitingHumanConfirmation,
-            TaskState::Sending,
-            TaskState::VerifyingDelivery,
-            TaskState::Completed,
-        ] {
-            task.transition(state).unwrap();
-        }
-        assert_eq!(task.state(), TaskState::Completed);
-    }
-
-    /// 「先点导航图标切视图」这一步是**可选**的，两条边都必须放行。
-    ///
-    /// 只留其中一条都会坏：删掉直连边 ⇒ 关掉这个功能之后每次任务都在这里报非法转换；
-    /// 删掉经 `NavigatingToView` 的边 ⇒ 打开这个功能就再也跑不起来。
-    /// 这两种失败都发生在任务刚开始的时候，看起来都像"程序坏了"。
-    #[test]
-    fn navigating_to_view_is_an_optional_step() {
-        let mut direct = TaskMachine::default();
-        for state in [TaskState::LaunchingClient, TaskState::WaitingForClient] {
-            direct.transition(state).unwrap();
-        }
-        direct.transition(TaskState::SearchingContact).unwrap();
-        assert_eq!(direct.state(), TaskState::SearchingContact);
-
-        let mut via_icon = TaskMachine::default();
-        for state in [
-            TaskState::LaunchingClient,
-            TaskState::WaitingForClient,
-            TaskState::NavigatingToView,
-            TaskState::SearchingContact,
-        ] {
-            via_icon.transition(state).unwrap();
-        }
-        assert_eq!(via_icon.state(), TaskState::SearchingContact);
-    }
-
-    /// 每个状态都必须能从自己的标识**读回来**，并且有非空的说明文案。
-    ///
-    /// 遍历 [`TaskState::ALL`] 而不是逐个手写：漏了哪个状态，这条用例就会点名报出来。
-    /// （实测过它的价值：`NavigatingToView` 曾经漏在 `from_str_name` 之外，
-    /// 症状是审计库里这一条记录的 `state` 列还原不出来。）
-    #[test]
-    fn all_variants_round_trip_through_their_identifier() {
-        // 先钉住表本身没被漏改：长度与去重后的数量必须一致。
-        assert_eq!(
-            TaskState::ALL.len(),
-            16,
-            "状态数量变了——请同时更新 ALL 的长度与内容"
-        );
-        let mut names: Vec<&str> = TaskState::ALL.iter().map(|s| s.as_str()).collect();
-        names.sort_unstable();
-        let unique = names.len();
-        names.dedup();
-        assert_eq!(names.len(), unique, "两个状态用了同一个标识：{names:?}");
-
-        for state in TaskState::ALL {
-            let name = state.as_str();
-            assert_eq!(
-                TaskState::from_str_name(name),
-                Some(state),
-                "{name} 读不回来 —— `from_str_name` 里漏了这个分支"
-            );
-            assert!(
-                !state.describe().is_empty(),
-                "{name} 没有说明文案 —— `describe` 里漏了这个分支"
-            );
-        }
-
-        // 未知标识必须返回 None，不能悄悄落到某个默认状态上。
-        assert_eq!(TaskState::from_str_name("NoSuchState"), None);
-        assert_eq!(TaskState::from_str_name(""), None);
-    }
-
-    /// 终态集合必须与 `is_terminal` 一致，且**恰好**是那五个。
-    ///
-    /// 写成遍历而不是 `assert!(X.is_terminal())`：后者只能证明"多算了一个"，
-    /// 证明不了"少算了一个"——而少算一个的后果是任务已经结束了、
-    /// 界面却还在转圈等下一步。
-    #[test]
-    fn exactly_five_states_are_terminal() {
-        let terminal: Vec<&str> = TaskState::ALL
-            .iter()
-            .filter(|state| state.is_terminal())
-            .map(|state| state.as_str())
-            .collect();
-        assert_eq!(
-            terminal,
-            vec!["Completed", "Prepared", "NeedsHumanReview", "Failed", "Cancelled"],
-            "终态集合变了——先想清楚「界面该不该停止等待」，再改这条断言"
-        );
-    }
-
-    #[test]
-    fn sending_cannot_skip_human_confirmation() {
-        let mut task = TaskMachine::default();
-        assert_eq!(
-            task.transition(TaskState::Sending),
-            Err(StateError::InvalidTransition { from: TaskState::Draft, to: TaskState::Sending })
-        );
-    }
-
-    #[test]
-    fn prepared_is_a_terminal_state() {
-        assert!(TaskState::Prepared.is_terminal());
-        assert_eq!(TaskState::Prepared.as_str(), "Prepared");
-        assert_eq!(TaskState::from_str_name("Prepared"), Some(TaskState::Prepared));
-    }
-
-    /// `Prepared` 只能从 `PreparingMessage` 到达。
-    ///
-    /// 它和 `Completed` 一样表示"某一步正常走完"，**不是**那种任意状态都能跳过去的
-    /// 失败终态。如果哪天有人把它并进 `NeedsHumanReview | Failed | Cancelled` 那一组，
-    /// `Draft → Prepared` 这种毫无意义的跳转就会被放行。
-    #[test]
-    fn prepared_cannot_be_reached_from_an_unrelated_state() {
-        let mut task = TaskMachine::default();
-        assert_eq!(
-            task.transition(TaskState::Prepared),
-            Err(StateError::InvalidTransition { from: TaskState::Draft, to: TaskState::Prepared })
-        );
-    }
-
-    #[test]
-    fn preparing_message_may_end_at_prepared() {
-        let mut task = TaskMachine::default();
-        for state in [
-            TaskState::LaunchingClient,
-            TaskState::WaitingForClient,
-            TaskState::SearchingContact,
-            TaskState::VerifyingCandidate,
-            TaskState::VerifyingChatHeader,
-            TaskState::PreparingMessage,
-        ] {
-            task.transition(state).unwrap();
-        }
-        task.transition(TaskState::Prepared).unwrap();
-        assert_eq!(task.state(), TaskState::Prepared);
-
-        // 已经是终态，再想转去 Sending 必须被拒绝。
-        assert_eq!(
-            task.transition(TaskState::Sending),
-            Err(StateError::TerminalState { from: TaskState::Prepared })
-        );
-    }
-
-    /// 从 `Prepared` 出发再也发不出消息——这是「只填不发」的安全底线。
-    #[test]
-    fn prepared_can_never_be_followed_by_sending() {
-        let mut task = TaskMachine::default();
-        for state in [
-            TaskState::LaunchingClient,
-            TaskState::WaitingForClient,
-            TaskState::SearchingContact,
-            TaskState::VerifyingCandidate,
-            TaskState::VerifyingChatHeader,
-            TaskState::PreparingMessage,
-        ] {
-            task.transition(state).unwrap();
-        }
-        task.transition(TaskState::Prepared).unwrap();
-
-        // 从 Prepared 出发，无论想去哪一步都不行——它是终态。
-        for next in [
-            TaskState::Sending,
-            TaskState::VerifyingDelivery,
-            TaskState::Completed,
-            TaskState::AwaitingHumanConfirmation,
-        ] {
-            assert_eq!(
-                task.transition(next),
-                Err(StateError::TerminalState { from: TaskState::Prepared }),
-                "Prepared 之后不该还能转到 {next:?}"
-            );
-        }
-        assert_eq!(task.state(), TaskState::Prepared);
-    }
-}
+mod tests;

@@ -1,0 +1,470 @@
+/*
+ * 「界面标定」页与区域画布的样式。
+ *
+ * 单独一个文件而不是并进 `styles.css`：这一页是一块自成一体的东西——
+ * 左边是标定项清单，右边是画布，画布上还有框和八个手柄，
+ * 跟任务页、图标库页没有任何共用部分。混在一起改的时候要在两千行里找。
+ *
+ * 颜色一律用 `styles.css` 里的 CSS 变量，不另起一套：
+ * 同一种"边框"在两个文件里写成两个色值，换主题时就会只换一半。
+ */
+
+.calibration-guide {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.guide-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.guide-head h2 {
+  margin-bottom: 6px;
+}
+
+.guide-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.guide-progress {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.guide-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .guide-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.guide-steps {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  max-height: 72vh;
+  overflow: auto;
+}
+
+.guide-scene + .guide-scene {
+  border-top: 1px solid var(--border);
+}
+
+.guide-scene-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  background: transparent;
+  border: 0;
+  border-left: 3px solid transparent;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.guide-scene-head.is-active {
+  border-left-color: var(--accent);
+  background: #eef2ff;
+}
+
+.guide-scene-count {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.guide-item-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 8px;
+}
+
+.guide-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 12px 6px 18px;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.guide-item.is-active {
+  background: #f0f4ff;
+}
+
+/*
+ * 编号色块：颜色与画布上那个框是同一个（同一个函数取的色，见 `colorByKey`），
+ * 上面的字是**清单编号**（`1.3`），不是 `screen_probe annotate` 的探针编号。
+ */
+.guide-swatch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  /* 不再是固定 18px：编号是 `1.1` 这种三个字符，写死宽度会把字挤出来。 */
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  /* 等宽数字：`1.1` 与 `1.10` 不会因为字宽不同而把色块撑成两种宽度。 */
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * 失效标定的提示条。
+ *
+ * 放在最上面，因为它挡着的正是「保存配置」——不显眼的话，
+ * 用户只会看到"保存失败"，然后不知道该动哪里（那几项在下面的列表里根本不存在）。
+ */
+.guide-stale {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid #fbd5d1;
+  border-radius: 8px;
+  background: #fef3f2;
+}
+
+.guide-stale > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.guide-stale .field-hint {
+  margin: 4px 0 0;
+}
+
+.guide-stale button {
+  flex: none;
+}
+
+/*
+ * 探针编号（`screen_probe annotate` 画在截图上的 1~4）。
+ *
+ * 与 `.guide-required` 同一套尺寸，但颜色是中性的：它是个**编号**，
+ * 不是"必填"那种警示。`cursor: help` 是因为这两个编号容易混，
+ * 必须让人能停下来看一眼解释。
+ */
+.guide-probe {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: help;
+}
+
+.guide-item-label {
+  flex: 1;
+  font-size: 13px;
+}
+
+.guide-state {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.guide-state.is-done {
+  color: var(--ok);
+}
+
+.guide-stage {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.guide-stage h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.guide-stage-actions {
+  display: flex;
+  gap: 10px;
+  margin: 12px 0;
+}
+
+/*
+ * 「本次运行的截图」状态条。
+ *
+ * 它的存在是为了回答一个反复被问到的问题：「我切过去怎么没有截图」。
+ * 所以每个界面的状态要**一眼可辨**：有图的用绿色边框 + 截图时刻，
+ * 没图的写「还没截」。颜色只做辅助，文字本身已经把话说清楚了——
+ * 只靠颜色区分的话，色弱的人看到的就是一排一样的按钮。
+ */
+.guide-shots {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fafbfc;
+}
+
+.guide-shots-head {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.guide-shots-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.guide-shot {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.guide-shot.is-done {
+  border-color: #639922;
+  color: #3f5f16;
+}
+
+.guide-shot:disabled {
+  cursor: default;
+}
+
+.guide-shot-time {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+.guide-placeholder {
+  margin: 12px 0 0;
+  padding: 32px 16px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.guide-current {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fafbfc;
+}
+
+.guide-current-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.guide-current-head strong {
+  font-size: 13px;
+}
+
+.guide-current-head .ghost {
+  margin-left: auto;
+}
+
+.guide-required {
+  padding: 1px 6px;
+  border: 1px solid #fbd5d1;
+  border-radius: 999px;
+  background: #fef3f2;
+  color: var(--bad);
+  font-size: 11px;
+}
+
+/* ---------- 截图触发方式 ---------- */
+
+/*
+ * 三种触发方式（立刻 / 延时 / 热键）合成一块。
+ *
+ * 不把说明散在各个按钮旁边：「为什么我一点截图下拉框就没了」这个问题的答案
+ * 就在这里，散开写等于没写。
+ */
+.capture-trigger {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.capture-trigger .guide-stage-actions {
+  margin-top: 0;
+}
+
+/*
+ * 热键设置块。
+ *
+ * 视觉上比主按钮弱一档（灰底、不加强调边框）：它是可选项，不该跟主按钮抢注意力。
+ */
+.capture-hotkey {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fafbfc;
+}
+
+.capture-hotkey .field-hint {
+  margin: 4px 0 8px;
+}
+
+.capture-hotkey-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.capture-hotkey-mod {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.capture-hotkey-mod input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
+.capture-hotkey-plus {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/*
+ * 主键输入框宽度**固定像素**，不随窗口缩放：它装的是 1–3 个字符，
+ * 按比例缩放的话窄窗口上会看不见、宽窗口上会拉成一条。
+ */
+.capture-hotkey-key {
+  width: 64px;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.capture-hotkey-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.capture-hotkey-state {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.capture-hotkey-state.is-on {
+  color: var(--ok);
+}
+
+/* ---------- 画布 ---------- */
+
+.region-canvas {
+  position: relative;
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  /* 拖框时别把图片拖走、别选中文字、别让浏览器接管触摸手势——
+     这三件事任意一件发生，都会表现成"拖不动"或者"框乱跳"。 */
+  user-select: none;
+  touch-action: none;
+  background: var(--bg);
+}
+
+.region-canvas img {
+  display: block;
+  width: 100%;
+  height: auto;
+  -webkit-user-drag: none;
+}
+
+/* 框的位置用百分比写在行内样式里，这里只管长相。 */
+.region-box {
+  position: absolute;
+  box-sizing: border-box;
+  border: 2px solid;
+  cursor: move;
+}
+
+.region-box.is-active {
+  border-width: 3px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.65);
+}
+
+.region-box-label {
+  position: absolute;
+  left: 0;
+  top: -18px;
+  padding: 1px 6px;
+  border-radius: 3px 3px 0 0;
+  color: #fff;
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  /* 标签不能吃掉指针事件：它压在框的上边上，否则那一小段拖不动。 */
+  pointer-events: none;
+}
+
+/*
+ * 手柄尺寸是**固定像素**，不随窗口缩放。
+ * 它对应的是鼠标的命中面积，跟画面内容无关——按比例缩放的话，
+ * 小窗口上手柄会小到点不中，大窗口上又大得盖住框。
+ */
+.region-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border: 1px solid #fff;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.region-handle.is-nw { left: 0; top: 0; cursor: nwse-resize; }
+.region-handle.is-n { left: 50%; top: 0; cursor: ns-resize; }
+.region-handle.is-ne { left: 100%; top: 0; cursor: nesw-resize; }
+.region-handle.is-e { left: 100%; top: 50%; cursor: ew-resize; }
+.region-handle.is-se { left: 100%; top: 100%; cursor: nwse-resize; }
+.region-handle.is-s { left: 50%; top: 100%; cursor: ns-resize; }
+.region-handle.is-sw { left: 0; top: 100%; cursor: nesw-resize; }
+.region-handle.is-w { left: 0; top: 50%; cursor: ew-resize; }

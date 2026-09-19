@@ -108,6 +108,15 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
 }
 
+/// 图标库目录。
+///
+/// 这些用例**不开**「先点击导航图标跳转」，用不到图标库；但装配函数要求传它。
+/// 按生产代码的默认位置给（项目根下的 `data/icons/`）——写死一个假路径的话，
+/// 哪天顺手把开关打开，报错信息会指向一个根本不存在的地方。
+fn icons_dir() -> PathBuf {
+    desktop_lib::icon_library::default_dir().expect("这个 crate 就在 workspace 里")
+}
+
 fn winocr_path() -> PathBuf {
     workspace_root().join("target").join("debug").join("winocr.exe")
 }
@@ -297,6 +306,7 @@ fn live_run_against_a_stand_in_window() {
     let runner = desktop_lib::runtime::build_runner(
         &config,
         &task,
+        &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
         ledger.clone() as Arc<dyn SendLedger>,
         Arc::new(AutoApprove),
@@ -364,6 +374,7 @@ fn live_run_refuses_to_send_when_the_contact_is_absent() {
     let runner = desktop_lib::runtime::build_runner(
         &config,
         &task,
+        &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
         ledger.clone() as Arc<dyn SendLedger>,
         Arc::new(AutoApprove),

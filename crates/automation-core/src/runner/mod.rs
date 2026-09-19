@@ -11,6 +11,11 @@
 //! 端口是同步的，因此超时是**协作式**的：每个步骤返回后校验是否超期。
 //! 阻塞在端口内部的调用无法被抢占，平台层需要为自己的阻塞操作设置内部超时。
 
+mod list;
+mod message;
+mod navigate;
+mod search;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -18,8 +23,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::audit::{AuditEntry, AuditSink, MemorySendLedger, MessageDigest, NoopAudit, SendLedger};
 use crate::ports::{
     AutomationError, ContactMatcher, DesktopPlatform, EvidenceRecorder, HumanConfirmation,
-    IconLocator, IconTemplate, LocalOcr, Point, Rect, ScreenMetrics, Screenshot, SendTask, TaskId,
-    TextBox,
+    IconLocator, IconPrior, IconQuery, IconTemplate, LocalOcr, Point, Rect, ScreenMetrics,
+    Screenshot, SendTask, TaskId, TextBox,
 };
 use crate::regions::{RelativePoint, RelativeRegion};
 use crate::state::{TaskMachine, TaskState};
@@ -177,6 +182,132 @@ pub const DEFAULT_NAV_ICON_MIN_SCORE: f32 = 0.80;
 /// 匹配开销与搜索面积成正比，高度减半就快一倍。
 pub const DEFAULT_NAV_STRIP: RelativeRegion = RelativeRegion::new(0.0, 0.0, 0.075, 1.0);
 
+/// 位置先验的默认分数容差。
+///
+/// 取 0.05 的依据：同一图标在选中 / 未选中 / 带气泡几种状态之间，
+/// 实测分数差通常在这个量级以内；而"旁边那个图标"与目标的分数差要大得多。
+/// 容差定大了会把低分命中抬上来（等于用位置替代了识别），
+/// 定小了先验基本不生效——两种偏差的方向相反，取一个中间值并留在这里可调。
+pub const DEFAULT_ICON_PRIOR_SCORE_TOLERANCE: f32 = 0.05;
+
+/// 资料页里"进入聊天"入口上的默认文字。
+///
+/// 微信 4.x 的联系人资料页上，进入会话的按钮写着「发消息」。
+/// 换成别的靶标（企业微信）时改这一项即可，不用改代码。
+pub const DEFAULT_PROFILE_CHAT_ENTRY_TEXT: &str = "发消息";
+
+/// 搜索下拉列表里"联系人"那一组的标题文字。
+///
+/// 下拉是**分组**的（联系人 / 聊天记录 / 群聊…），而只有"联系人"这一组
+/// 下面才是人。这个标题是靶标相关的文字，所以做成配置而不是写死——
+/// 写死的话，换一个客户端就会表现为"下拉里找不到联系人"。
+pub const DEFAULT_SEARCH_CONTACT_GROUP_LABEL: &str = "联系人";
+
+/// 会话列表滚动时的默认落点：**上下居中、左右偏右一点**。
+///
+/// 偏右而不是取正中心（`Rect::center`）：[`DEFAULT_CONTACT_PANEL`] 的左边界
+/// 0.14 已经落在姓名文字那一列上，于是区域中心会压住姓名与消息预览的交界处。
+/// 往右一点稳稳落在列表内容里，同时也离右边框的滚动条还有余量。
+///
+/// ⚠️ 这是相对**当前** `contact_panel` 的比例，改区域宽度就要重新想这个值。
+///
+/// 定义成常量而不是在 `Default` 里写字面量：桌面层的配置结构（`ScrollAnchorConfig`）
+/// 也要拿它当默认值，各写一份的话，两边不一致时**不报任何错**——
+/// 只表现为「界面上显示 0.62、任务用的是另一个数」。
+pub const DEFAULT_SCROLL_ANCHOR: RelativePoint = RelativePoint::new(0.62, 0.5);
+
+/// 资料页滚动时的默认落点：**几何正中**。
+///
+/// 与 [`DEFAULT_SCROLL_ANCHOR`]（会话列表那个 `(0.62, 0.5)`）不同，这里不需要
+/// 往右偏：资料页是一整块可滚动内容，不存在"左边是头像列、右边是名字"
+/// 这种要避开的列，正中一定落在内容上。
+///
+/// 定义成常量而不是在 `Default` 里写字面量：桌面层要拿它填 `RunnerConfig`
+/// （那里的结构体字面量必须写全每一项），各写一份的话，
+/// 「界面显示一个落点、任务用另一个」这种事就迟早会发生。
+pub const DEFAULT_PROFILE_SCROLL_ANCHOR: RelativePoint = RelativePoint::new(0.5, 0.5);
+
+/// 本次任务跑到哪一步。
+///
+/// ## 为什么要把它显式说出来
+///
+/// "找联系人"这件事有**两条完全不同的路**：一条是在顶部搜索框里打字、
+/// 从联想下拉里挑人；另一条是在会话列表里往下滚、用 OCR 一行行认名字。
+/// 两者适用的界面不同（前者要求搜索框能用，后者要求列表里滚得到人），
+/// 而它们的失败现象都是"找不到联系人"——不把路分开，现场就分不清
+/// 到底是搜索没生效还是列表里真的没有这个人。
+///
+/// 第三条路 `NavigateOnly` 是**只做导航**：它不查找任何人，
+/// 用来单独验证"找图标 → 点它"这一步（找联系人图标 / 找聊天历史图标）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Workflow {
+    /// 只做「找到导航图标并点击」：点完停在 [`TaskState::Navigated`]。
+    NavigateOnly,
+    /// 用顶部搜索框查找联系人，打开与他的聊天，把正文填进输入框后停下。
+    ///
+    /// 完整链路：点导航图标切视图 → 点搜索框 → 逐字输入姓名 →
+    /// 在下拉列表的「联系人」分组里找到他并点击 → 核验资料页 →
+    /// 资料页滚到底 → 点「发消息」→ 核验聊天标题 → 聚焦输入框 →
+    /// 逐字输入正文 → 停在 [`TaskState::Prepared`]。
+    SearchContact,
+    /// 在**会话列表**里滚动扫描查找联系人，然后打开聊天、准备消息。
+    ///
+    /// 这是本项目最早实现的那条路，保留它是因为它和搜索式互补：
+    /// 列表扫描不依赖搜索框能不能触发联想，而搜索式不依赖列表里滚得到人。
+    ScrollListContact,
+}
+
+impl Workflow {
+    /// 全部工作流，**顺序即界面上的顺序**。
+    ///
+    /// 与 [`TaskState::ALL`] 同一个道理：给界面用的枚举要有一个稳定的清单，
+    /// 让界面遍历它而不是自己再列一遍——两边各列一份，加了新变体时
+    /// 界面那一份不会报错，只会**少一个选项**，而少掉的那个没人会发现。
+    pub const ALL: [Workflow; 3] = [
+        Workflow::SearchContact,
+        Workflow::ScrollListContact,
+        Workflow::NavigateOnly,
+    ];
+
+    /// 面向操作者的名字，用于界面下拉与失败信息。
+    ///
+    /// 必须能**区分**三条路：它们的失败现象都是"找不到联系人"，
+    /// 而处置方向完全不同（搜索没生效 / 列表里真没有 / 图标点错了）。
+    /// 名字里带上区分点，比只写"查找联系人"有用得多。
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::NavigateOnly => "只做导航（找到图标并点击）",
+            Self::SearchContact => "搜索式查找联系人",
+            Self::ScrollListContact => "列表扫描式查找联系人",
+        }
+    }
+}
+
+/// [`Workflow::NavigateOnly`] 要点的是哪一个导航图标。
+///
+/// 两个目标各有一组模板：它们在界面上长得不一样，模板不能通用。
+/// 分组而不是塞进一个列表里，是因为"用错了哪一组"不会报错——
+/// 只会拿聊天历史的模板去匹配联系人图标，然后转人工。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavTarget {
+    /// 联系人（通讯录）视图。
+    Contact,
+    /// 聊天历史（会话列表）视图。
+    History,
+}
+
+impl NavTarget {
+    /// 面向操作者的名字，用于失败信息与证据。
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Contact => "联系人",
+            Self::History => "聊天历史",
+        }
+    }
+}
+
 /// 运行参数。
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
@@ -226,7 +357,9 @@ pub struct RunnerConfig {
     ///
     /// `None` = 不校验（演练模式，或者还没记录过）。
     /// 真实模式下由命令层保证它一定被填上：客户端由操作者手动启动并登录，
-    /// 任务只在**标定时的那个尺寸**下工作，尺寸对不上就转人工，绝不按错的尺寸去点。
+    /// 任务只在**标定时的那个尺寸**下工作——尺寸对不上会先自动把窗口调回标定尺寸，
+    /// 调不动（客户端有最小尺寸限制）才转人工，绝不按错的尺寸去点。
+    /// 见 [`Run::ensure_calibrated_size`]。
     pub calibrated_window: Option<CalibratedWindow>,
     /// 联系人列表最多**完整**扫描几轮（每轮 = 从列表顶部一路向下扫到底）。
     ///
@@ -293,6 +426,43 @@ pub struct RunnerConfig {
     pub nav_icon_min_score: f32,
     /// 在窗口的哪个区域里找导航图标。见 [`DEFAULT_NAV_STRIP`]。
     pub nav_strip: RelativeRegion,
+    /// 本次任务跑到哪一步。见 [`Workflow`]。
+    pub workflow: Workflow,
+    /// [`Workflow::NavigateOnly`] 要点的是哪一个图标。
+    pub nav_target: NavTarget,
+    /// **聊天历史**视图那个导航图标的模板。
+    ///
+    /// 与 [`Self::nav_icon_templates`]（联系人图标）分开：两个图标长得不一样，
+    /// 混成一个列表会让"用错了哪一组"退化成一次分数不高的匹配，
+    /// 而不是一个能一眼看出来的配置错误。
+    pub history_icon_templates: Vec<IconTemplate>,
+    /// 位置先验的分数容差，`0` = 关掉先验。见 [`IconPrior`]。
+    ///
+    /// 导航栏是一列纵向排列、彼此长得很像的图标，逐张模板取最高分时偶尔会出现
+    /// "旁边那个图标分数略高一点"。而这件事有先验可用：**越靠近导航区中心的
+    /// 命中越可信**。容差决定"分数差多少以内才允许用位置来取舍"。
+    pub icon_prior_score_tolerance: f32,
+    /// 导航区（左侧那一列图标）的标定区域。
+    ///
+    /// 只用来**算位置先验的中心**，不用于裁图——真正的搜索范围是 [`Self::nav_strip`]。
+    /// `None` 时退回 `nav_strip` 的中心：它更宽，但中心仍在图标那一列上。
+    pub nav_bar: Option<RelativeRegion>,
+    /// 主界面顶部的搜索框（相对窗口）。搜索式查找的第一步就点它。
+    pub main_search: Option<RelativeRegion>,
+    /// 搜索框下面弹出的下拉列表（相对窗口）。
+    pub search_dropdown: Option<RelativeRegion>,
+    /// 联系人资料面板（相对窗口）。
+    pub contact_profile: Option<RelativeRegion>,
+    /// 资料页里"进入聊天"那个入口上的文字。见 [`DEFAULT_PROFILE_CHAT_ENTRY_TEXT`]。
+    pub profile_chat_entry_text: String,
+    /// 搜索下拉列表里"联系人"那一组的标题文字。
+    /// 见 [`DEFAULT_SEARCH_CONTACT_GROUP_LABEL`]。
+    pub search_contact_group_label: String,
+    /// 资料页滚动时的落点（相对资料区）。默认正中。
+    ///
+    /// 与联系人列表的 `scroll_anchor` 不同：资料页是一整块可滚动内容，
+    /// 不存在"左边是头像列、右边是名字"这种要避开的列，取几何中心即可。
+    pub profile_scroll_anchor: RelativePoint,
 }
 
 impl Default for RunnerConfig {
@@ -311,7 +481,7 @@ impl Default for RunnerConfig {
             stop_before_send: false,
             max_scroll_attempts: 20,
             scroll_notches_per_step: 3,
-            scroll_anchor: RelativePoint::new(0.62, 0.5),
+            scroll_anchor: DEFAULT_SCROLL_ANCHOR,
             calibrated_window: None,
             // 两轮：一轮从当前位置扫到底，一轮回顶重扫。第二轮专门兜
             // "扫描期间新消息把目标顶到列表最上面"这种情况。
@@ -327,6 +497,23 @@ impl Default for RunnerConfig {
             nav_icon_templates: Vec::new(),
             nav_icon_min_score: DEFAULT_NAV_ICON_MIN_SCORE,
             nav_strip: DEFAULT_NAV_STRIP,
+            // 默认走**搜索式**：它是操作者当下要的那条路，也是不依赖
+            // "列表里滚得到人"的那条路。列表扫描式仍然可用，改这一项即可。
+            workflow: Workflow::SearchContact,
+            nav_target: NavTarget::Contact,
+            history_icon_templates: Vec::new(),
+            icon_prior_score_tolerance: DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
+            nav_bar: None,
+            // 下面这些新增区域**没有默认值**：它们对应的界面元素在哪儿，
+            // 只有对着真实窗口框一次才知道。给一个猜出来的默认值，
+            // 症状会是"任务照常跑完，只是点到了别的地方"。
+            main_search: None,
+            search_dropdown: None,
+            contact_profile: None,
+            profile_chat_entry_text: DEFAULT_PROFILE_CHAT_ENTRY_TEXT.to_string(),
+            search_contact_group_label: DEFAULT_SEARCH_CONTACT_GROUP_LABEL.to_string(),
+            // 资料页是一整块可滚动内容，几何中心一定落在内容上。
+            profile_scroll_anchor: DEFAULT_PROFILE_SCROLL_ANCHOR,
         }
     }
 }
@@ -390,6 +577,7 @@ fn describe_candidates(candidates: &[TextBox]) -> String {
     }
     parts.join(" / ")
 }
+
 
 /// 注入的端口集合。
 pub struct RunnerPorts {
@@ -502,6 +690,12 @@ struct Run<'a> {
     message_digest: Option<MessageDigest>,
     /// 最近一次成功捕获的画面与其识别结果，仅在失败时用于生成脱敏证据。
     last_frame: Option<(Screenshot, Vec<TextBox>)>,
+    /// 最近一次"会改变界面"的点击之后，画面到底变没变。
+    ///
+    /// 它回答的是一个**只能靠对比两帧**才知道的问题：点击是发出去了，
+    /// 但它生效了吗？核验聊天标题失败时，这个标志决定失败信息指向
+    /// "点错了人"还是"这次点击根本没落到界面上"——两者的处置完全相反。
+    last_click_reacted: Option<bool>,
     evidence: Vec<String>,
     failure: Option<Failure>,
 }
@@ -526,6 +720,7 @@ impl<'a> Run<'a> {
             confirmation_at: None,
             message_digest: None,
             last_frame: None,
+            last_click_reacted: None,
             evidence: Vec::new(),
             failure: None,
         }
@@ -653,6 +848,8 @@ impl<'a> Run<'a> {
         })
     }
 
+
+
     /// 点击前守卫：重新确认前台窗口与显示器指标仍与标定一致。
     fn ensure_calibrated(&self) -> Result<Rect, AutomationError> {
         let expected = self.window.ok_or(AutomationError::ClientNotReady)?;
@@ -667,295 +864,11 @@ impl<'a> Run<'a> {
         Ok(expected)
     }
 
-    /// 用模板匹配找到左侧导航图标，点它一下，把视图切到"能查到联系人"的那个页面。
-    ///
-    /// ## 这一步和"点击联系人"是同一类动作
-    ///
-    /// 它**不是只读的**：点下去之后界面会重绘。所以和点击联系人一样，
-    /// 动作前要确认客户端还活着、前台窗口与标定一致；动作后要确认画面真的变了。
-    ///
-    /// ## 为什么"点完必须看到画面变化"
-    ///
-    /// 因为"点到了图标"和"点击生效了"是两件事。图标可能被别的窗口挡住、
-    /// 客户端可能正好卡了一下、坐标可能因为某种原因落在图标边缘的空白上——
-    /// 这些情况下 `guarded_click` 会正常返回（鼠标确实点下去了），
-    /// 而视图**根本没切**。不校验的话，后面整条查找流程都作用在一个
-    /// 没切换成功的界面上，失败原因会表现为"找不到联系人"——那是错的方向。
-    fn navigate_to_view(&mut self) -> Result<(), AutomationError> {
-        let (strip, min_score, panel) = {
-            let cfg = self.cfg();
-            (
-                self.resolve(cfg.nav_strip, "导航图标搜索区")?,
-                cfg.nav_icon_min_score,
-                self.resolve(cfg.contact_panel, "联系人候选区")?,
-            )
-        };
 
-        // 用**联系人候选区**当"视图变了没有"的参照物：切换成功的话，
-        // 这一块的内容必然整体换掉。用它而不是整窗，是因为整窗里有闪烁的光标、
-        // 未读红点之类会自己变的东西，"变了"就不再是"切换成功了"的证据。
-        let before = self.capture_frame(panel, "切换视图前")?.fingerprint;
 
-        let frame = self.capture_frame(strip, "导航图标搜索区")?;
-        self.evidence.push(format!(
-            "nav_strip#{}   搜索区 屏幕 ({}, {}) {}x{}",
-            frame.fingerprint, strip.x, strip.y, strip.width, strip.height
-        ));
 
-        // 只借用 `self.runner`（它是一个共享引用），不碰 `self` 的可变部分——
-        // 否则下面 `self.evidence.push` 会和这次调用打架。
-        let runner = self.runner;
-        let found = runner
-            .ports
-            .icons
-            .locate(&frame, &runner.config().nav_icon_templates, min_score)?;
 
-        let hit_screen = found.bounds.to_screen(Point { x: strip.x, y: strip.y });
-        let target = hit_screen.center();
-        // 记下"点的是哪儿、分数多少"。图标匹配不像文字识别那样有天然的可读结果，
-        // 这一行是事后唯一能回答"它到底认成了什么"的地方。
-        self.evidence.push(format!(
-            "导航图标 : 模板「{}」分数 {:.3}   命中框 屏幕 ({}, {}) {}x{}   点击 屏幕 ({}, {})",
-            found.template_label,
-            found.score,
-            hit_screen.x,
-            hit_screen.y,
-            hit_screen.width,
-            hit_screen.height,
-            target.x,
-            target.y
-        ));
 
-        self.ensure_not_frozen("已取消切换视图")?;
-        let expected_window = self.ensure_calibrated()?;
-        self.runner
-            .ports
-            .platform
-            .guarded_click(target, expected_window)?;
-        self.check_deadline("点击导航图标")?;
-
-        // 视图切换是重绘，同样要等停稳再比指纹——否则会截到动画中间帧，
-        // 与"切换前"偶然相同，于是把一次成功的切换误判成"没生效"。
-        self.wait_for_settle(panel)?;
-        let after = self.capture_frame(panel, "切换视图后")?.fingerprint;
-        if after == before {
-            // ── 为什么这里只记警告，**不**转人工 ──────────────────────────
-            //
-            // "点下去画面没变"有两种成因，而它们在画面上**无法区分**：
-            //
-            // 1. 界面本来就已经停在这个视图上（上一次运行点完就留在这里了）
-            //    ⇒ 点击无效是**正确**行为，一切正常；
-            // 2. 客户端卡死 / 图标被别的窗口挡住 / 匹配到了一个不响应点击的位置
-            //    ⇒ 点击真的没生效。
-            //
-            // 如果在这里直接转人工，第 1 种情况就会变成"第二次跑必然失败"——
-            // 一个正常操作被判成故障，而且报错文案（"点击可能没有生效"）
-            // 会把人引向排查客户端，方向完全错了。
-            //
-            // 那为什么不等一等再判、或者重试一次？因为"点击没生效"不是**时机**问题，
-            // 重试与等待都解决不了（见 `REFERENCE.md` §15 的同型教训）。
-            //
-            // 于是把判定交给**下一步**：`locate_contact` 是纯只读的，
-            // 视图不对它就在候选区里找不到目标，照样转人工。判据落在能真正
-            // 决断的地方，而不是在这里猜。这一行警告的作用是——真出问题时，
-            // 日志里已经写明了"视图可能根本没切过去"，不必再从"找不到联系人"倒推。
-            self.evidence.push(format!(
-                "⚠️ 点击导航图标后联系人候选区画面未变化（模板「{}」分数 {:.3}，点击 屏幕 ({}, {})）。\
-                 若界面本来就停在这个视图上，这属于正常；否则说明这次点击没有生效，\
-                 后面若报「找不到联系人」，先从这里查。",
-                found.template_label, found.score, target.x, target.y
-            ));
-        }
-        Ok(())
-    }
-
-    /// 在联系人候选区里找到目标。
-    ///
-    /// ## 为什么是"回顶 + 多轮扫描"
-    ///
-    /// 列表按**最近有消息**排序：任何一条新消息都会把对应的会话顶到最上面。
-    /// 如果从上一次遗留的滚动位置一路向下找，目标可能**已经在身后**了——
-    /// 这正是"下拉查找会错过"的成因。所以每一轮都先回到列表顶部（一个确定的起点），
-    /// 一轮扫不到就回顶再扫一轮，把"扫描期间被新消息顶上去"这件事兜住。
-    ///
-    /// ## 三重设限（每一层都不能省）
-    ///
-    /// - 单轮的滚动次数上限（`max_scroll_attempts`）；
-    /// - 完整扫描的轮数上限（`max_search_sweeps`）；
-    /// - 取消令牌每一步都检查。
-    ///
-    /// **歧义不滚动重试**：滚动改变的是"现在能看到谁"，不改变"这个名字是否唯一"。
-    /// 出现多个逐字匹配时滚下去只会把同一个歧义重复 N 次，所以立刻失败。
-    fn locate_contact(&mut self, panel: Rect) -> Result<TextBox, AutomationError> {
-        let sweeps = self.cfg().max_search_sweeps.max(1);
-        // 把**鼠标会被放到哪儿**写进日志。
-        //
-        // 为什么值得单独记一行：`scroll_anchor` 是相对比例，而候选区一改宽度，
-        // 同一个比例就落到完全不同的像素上（实测：区域从 0.28 改到 0.46，
-        // 落点从 x=178 跳到 x=273）。操作者看到"鼠标没动到列表上"时，
-        // 日志里原来只有"读到几块"，**根本无从对照**——只能靠猜。
-        // 有了这一行，"鼠标到底去了哪里"就变成可核对的事实。
-        //
-        // 而且这一行现在是**可信的落点**，不只是"打算放到哪"：平台层的 `scroll`
-        // 在真正发滚轮之前会用 `GetCursorPos` 核对光标确实停在这里（对不上就报错
-        // 退出，不会继续滚）。所以任务能走到下一行，就说明光标真的到过这个坐标。
-        let anchor = self.scroll_anchor(panel)?;
-        self.evidence.push(format!(
-            "滚动落点 : 屏幕 ({}, {})   候选区 : 屏幕 ({}, {}) {}x{}",
-            anchor.x, anchor.y, panel.x, panel.y, panel.width, panel.height
-        ));
-        for sweep in 1..=sweeps {
-            // 第二轮开始之前先回顶。第一轮刻意**不**回顶：从当前位置往下扫是最省的，
-            // 而"目标在当前位置上方"这种情况由第二轮（从顶部重扫）兜住——
-            // 两轮合起来的覆盖范围就是整个列表，不需要额外那一次回顶。
-            //
-            // 所以 `max_search_sweeps` 配成 1 就等于退回"只往下扫一遍"的老行为。
-            if sweep > 1 {
-                self.scroll_to_top(panel)?;
-            }
-            if let Some(matched) = self.sweep_contact_list(panel)? {
-                return Ok(matched);
-            }
-            self.evidence.push(format!("contact_sweep#{sweep}"));
-        }
-        Err(AutomationError::NeedsHumanReview(format!(
-            "已把联系人列表从头到尾完整扫描 {sweeps} 轮，仍未找到「{}」。\
-             请确认该联系人确实存在，且列表没有被搜索框或筛选条件限制。",
-            self.task.external_contact_name.trim()
-        )))
-    }
-
-    /// 把配置里的滚动落点换算到屏幕坐标。
-    ///
-    /// 配置不合法就**报错**，而不是夹到边界上凑合：夹边界会让「比例写错了」
-    /// 表现为「滚了半天没反应」，那是本项目最难查的一类现象。
-    fn scroll_anchor(&self, panel: Rect) -> Result<Point, AutomationError> {
-        let anchor = self.cfg().scroll_anchor;
-        anchor.validate().map_err(|err| {
-            AutomationError::NeedsHumanReview(format!("滚动落点配置不合法：{err}"))
-        })?;
-        Ok(anchor.resolve(panel))
-    }
-
-    /// 把联系人列表滚回顶部，为一次确定性的扫描定好起点。
-    ///
-    /// 判据是"向上滚之后画面不再变化"，而**不是**某个固定的滚动次数：
-    /// 列表长度随联系人数量变化，写死次数换台机器、换个账号就不对了。
-    ///
-    /// 这里只截屏算指纹、**不做 OCR**——判断"画面动没动"不需要读字，
-    /// 而 OCR 在真实模式下是一次几百毫秒的独立进程调用。
-    fn scroll_to_top(&mut self, panel: Rect) -> Result<(), AutomationError> {
-        let mut previous: Option<String> = None;
-        // 上滚次数比下扫上限**多一次**，不是随手加的：
-        // 最后一次是"空滚"——只有再滚一下、看到画面不再变化，才能确认已经到顶。
-        // 恰好用满下扫上限的那种情况（列表正好那么长），少这一次就会误报失败。
-        let limit = self.cfg().max_scroll_attempts.max(1) + 1;
-        // 落点只算一次：配置错了要在**滚动之前**就失败，而不是滚了几轮才发现。
-        let anchor = self.scroll_anchor(panel)?;
-        for _ in 0..=limit {
-            self.check_cancel()?;
-            let fingerprint = self.capture_frame(panel, "联系人列表")?.fingerprint;
-            if previous.as_deref() == Some(fingerprint.as_str()) {
-                // 向上滚了一格画面没动 ⇒ 已经在顶部（或者这个列表根本滚不动）。
-                return Ok(());
-            }
-            previous = Some(fingerprint);
-
-            let expected_window = self.ensure_calibrated()?;
-            self.runner.ports.platform.scroll(
-                anchor,
-                -self.cfg().scroll_notches_per_step,
-                expected_window,
-            )?;
-            // 等停稳再进入下一轮：截到缓动动画的中间帧，指纹会跟"真的到顶了"
-            // 长得一样，于是把"还在动"误判成"到顶了"，回顶这一步就白做了。
-            self.wait_for_settle(panel)?;
-            self.step_started = Instant::now();
-        }
-        Err(AutomationError::NeedsHumanReview(format!(
-            "向上滚动 {limit} 次仍未回到联系人列表顶部，拒绝继续猜测扫描起点。"
-        )))
-    }
-
-    /// 从当前位置向下扫描一遍联系人列表。
-    ///
-    /// 返回 `Ok(None)` 表示"这一遍扫到底了、没找到"——**不是失败**，
-    /// 调用方可以回顶再扫一轮。
-    fn sweep_contact_list(&mut self, panel: Rect) -> Result<Option<TextBox>, AutomationError> {
-        let mut previous_fingerprint: Option<String> = None;
-        let mut scrolled: u32 = 0;
-        let step = self.cfg().scroll_notches_per_step;
-        // 同 `scroll_to_top`：落点先算一次，配置错了立刻失败。
-        let anchor = self.scroll_anchor(panel)?;
-
-        loop {
-            self.check_cancel()?;
-            let (shot, candidates) = self.capture_and_recognize(panel, "联系人识别")?;
-            self.evidence.push(format!("contact_panel#{}", shot.fingerprint));
-            // 把这一帧**读成了什么**记下来。只记指纹的话，「找不到联系人」永远
-            // 分不清两种原因：① OCR 读错了（要调放大倍数或把窗口调大）；
-            // ② 名字根本不在这屏（要换列表或重做区域标定）。
-            // 这两件事的处置完全相反，而原来在现场只能靠猜。
-            let log_candidates = self.cfg().log_ocr_candidates;
-            if log_candidates {
-                self.evidence.push(format!(
-                    "  读到 {} 块：{}",
-                    candidates.len(),
-                    describe_candidates(&candidates)
-                ));
-            }
-
-            match self.runner.ports.matcher.find_unique_exact_match(
-                &self.task.external_contact_name,
-                &candidates,
-                self.cfg().min_confidence,
-            ) {
-                Ok(matched) => return Ok(Some(matched)),
-                // 歧义：滚动解决不了，立刻停下。
-                Err(err @ AutomationError::AmbiguousVision(_)) => return Err(err),
-                Err(_) => {
-                    if scrolled >= self.cfg().max_scroll_attempts {
-                        return Ok(None);
-                    }
-                    if previous_fingerprint.as_deref() == Some(shot.fingerprint.as_str()) {
-                        // 向下滚了一格，画面没动。两种可能，必须区分开：
-                        //   1) 已经到底了 —— 正常的收工条件；
-                        //   2) 客户端卡死了 —— 必须立刻转人工，绝不能继续点。
-                        // 唯一的区分办法是**往反方向滚一下**，看画面动不动。
-                        if self.view_moves_when_scrolling(panel, -step)? {
-                            return Ok(None);
-                        }
-                        self.ensure_not_frozen(
-                            "向下滚动与向上滚动都无法改变联系人列表画面",
-                        )?;
-                        // 系统说它还活着 ⇒ 这个列表本来就没得滚（只有一屏），
-                        // 按"这一遍扫到底了"处理，不要误报卡死。
-                        return Ok(None);
-                    }
-                    previous_fingerprint = Some(shot.fingerprint.clone());
-
-                    let expected_window = self.ensure_calibrated()?;
-                    self.runner
-                        .ports
-                        .platform
-                        .scroll(anchor, step, expected_window)?;
-                    scrolled += 1;
-                    // 等画面停稳再进入下一轮截图。不等的话，下一轮截到的是
-                    // 缓动动画的中间帧：文字糊、行错位，OCR 读出来是乱的；
-                    // 而且"上一帧和这一帧一样 ⇒ 到底了"这个判断也会被带偏。
-                    self.wait_for_settle(panel)?;
-
-                    // 滚动会让列表内容整体移动，上一轮的文字框位置全部作废，
-                    // 下一轮必须重新截图识别——绝不能拿滚动前的结果去点击。
-                    //
-                    // 也正因为如此，每轮都把单步计时重置：滚动 N 次是 N 次独立尝试，
-                    // 不重置的话滚动 20 次必然撑爆一次 `step_timeout`，
-                    // 变成"搜到一半被判超时"。
-                    self.step_started = Instant::now();
-                }
-            }
-        }
-    }
 
     /// 等到联系人列表画面**连续两帧一致**，最多等 `scroll_settle_timeout`。
     ///
@@ -986,24 +899,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// 滚一下，看画面有没有变化。只回答"这个方向的滚动还有没有效果"，不做 OCR。
-    fn view_moves_when_scrolling(
-        &mut self,
-        panel: Rect,
-        notches: i32,
-    ) -> Result<bool, AutomationError> {
-        let anchor = self.scroll_anchor(panel)?;
-        let before = self.capture_frame(panel, "联系人列表")?.fingerprint;
-        let expected_window = self.ensure_calibrated()?;
-        self.runner.ports.platform.scroll(anchor, notches, expected_window)?;
-        // **必须先等停稳再截"滚动之后"这一帧**：截早了，重绘还没发生，
-        // `before` 与 `after` 相同 ⇒ 这一句会回答"滚不动"，而它的结论正是
-        // "到底了没有"。判错的代价是整段列表被跳过，且完全不报错。
-        self.wait_for_settle(panel)?;
-        self.step_started = Instant::now();
-        let after = self.capture_frame(panel, "联系人列表")?.fingerprint;
-        Ok(before != after)
-    }
 
     /// 对可重试的瞬时错误重试，最多 `max_attempts` 次。
     ///
@@ -1093,38 +988,97 @@ impl<'a> Run<'a> {
         )))
     }
 
-    /// 校验当前窗口尺寸与标定记录一致。
+    /// 当前窗口尺寸与缩放是否与标定记录一致。
     ///
-    /// 这是"按标定尺寸工作"这条约定的落地点：标定是相对窗口的比例，
-    /// 而真实界面不是等比缩放的，尺寸变了四个区域就会整体偏移。
-    /// 与其按偏了的区域去点击，不如停在原地让人把窗口恢复回去。
-    fn verify_calibrated_size(
-        &self,
+    /// **只比尺寸与缩放，不比位置**：标定记的是相对窗口的比例，窗口挪到哪儿
+    /// 都不影响换算；而尺寸一变，同一个比例就落到不同的实际像素上——
+    /// 真实界面不是等比缩放的（会话列表宽度、输入框高度都是固定像素）。
+    fn size_matches(window: Rect, metrics: ScreenMetrics, expected: &CalibratedWindow) -> bool {
+        (window.width - expected.width).abs() <= WINDOW_SIZE_TOLERANCE_PX
+            && (window.height - expected.height).abs() <= WINDOW_SIZE_TOLERANCE_PX
+            && (metrics.scale_factor - expected.scale_factor).abs() <= SCALE_FACTOR_TOLERANCE
+    }
+
+    /// 把窗口弄回标定时的尺寸；实在弄不回去才转人工。返回本次运行的窗口基准。
+    ///
+    /// 这是"按标定尺寸工作"这条约定的落地点。
+    ///
+    /// ## 为什么先自动调，而不是像以前那样直接停下
+    ///
+    /// 窗口尺寸是程序**完全能确定**的一件事——标定记录里就写着目标值。
+    /// 把它调回去是确定性的、可逆的，不涉及任何对业务内容的猜测，
+    /// 所以不属于"不确定即失败"要拦的那一类。停下来让操作者手工拖窗口，
+    /// 只是把一件机器能做的事推给人做。
+    ///
+    /// ## 为什么调完还要再量一遍
+    ///
+    /// 客户端有自己的最小尺寸限制：请求值可能被应用自己夹住，
+    /// `SetWindowPos` 会报成功而窗口并没有变成你要的尺寸。
+    /// 所以判据是**量出来的**尺寸，不是请求值——量不中就转人工，
+    /// 绝不"按偏了的区域"往下走。
+    ///
+    /// ## 缩放不一致时不尝试调整
+    ///
+    /// DPI 缩放是**显示器/系统**属性，不是窗口属性。缩放不同意味着同一物理尺寸下
+    /// 的逻辑布局本来就不同，调物理像素解决不了——调完照样偏，只是白动一次窗口。
+    fn ensure_calibrated_size(
+        &mut self,
         window: Rect,
         metrics: ScreenMetrics,
-    ) -> Result<(), AutomationError> {
+    ) -> Result<Rect, AutomationError> {
         let Some(expected) = self.cfg().calibrated_window else {
-            return Ok(());
+            return Ok(window);
         };
-        let size_ok = (window.width - expected.width).abs() <= WINDOW_SIZE_TOLERANCE_PX
-            && (window.height - expected.height).abs() <= WINDOW_SIZE_TOLERANCE_PX;
+        if Self::size_matches(window, metrics, &expected) {
+            return Ok(window);
+        }
+
         let scale_ok =
             (metrics.scale_factor - expected.scale_factor).abs() <= SCALE_FACTOR_TOLERANCE;
-        if size_ok && scale_ok {
-            return Ok(());
+        if !scale_ok {
+            return Err(AutomationError::NeedsHumanReview(format!(
+                "显示器缩放与标定记录不一致：记录 {:.2}，当前 {:.2}。\
+                 缩放不同意味着同一物理尺寸下的界面布局本来就不同，\
+                 调整窗口尺寸解决不了——请把窗口移回标定时那块显示器，\
+                 或重新点「记录窗口尺寸」并保存配置。",
+                expected.scale_factor, metrics.scale_factor
+            )));
         }
+
+        // 尺寸不符、缩放一致 ⇒ 把窗口调回标定尺寸。成不成看**量出来的**结果。
+        let adjusted = self
+            .runner
+            .ports
+            .platform
+            .resize_wecom(expected.width, expected.height)?;
+        if Self::size_matches(adjusted, metrics, &expected) {
+            self.evidence.push(format!(
+                "自动调整窗口尺寸 : {}x{} → {}x{}（标定值）",
+                window.width, window.height, adjusted.width, adjusted.height
+            ));
+            return Ok(adjusted);
+        }
+
         Err(AutomationError::NeedsHumanReview(format!(
-            "窗口尺寸与标定记录不一致：记录 {}×{}（缩放 {:.2}），当前 {}×{}（缩放 {:.2}）。\
-             区域标定是相对窗口的比例，但真实界面不是等比缩放的，尺寸变了就会点偏。\
-             请把窗口恢复到标定时的尺寸，或重新点「记录窗口尺寸」并保存配置。",
-            expected.width, expected.height, expected.scale_factor,
-            window.width, window.height, metrics.scale_factor
+            "窗口尺寸与标定记录不一致，且自动调整没有生效：\
+             标定 {}×{}，调整前 {}×{}，调整后 {}×{}。\
+             客户端通常会限制最小窗口尺寸，标定值比它小时就会被夹住。\
+             请把窗口手工调到 {}×{}，或重新点「记录窗口尺寸」并保存配置。",
+            expected.width,
+            expected.height,
+            window.width,
+            window.height,
+            adjusted.width,
+            adjusted.height,
+            expected.width,
+            expected.height
         )))
     }
 
-    fn execute(&mut self) -> Result<(), AutomationError> {
-        self.check_cancel()?;
-
+    /// 接入客户端：接管操作者已经启动并登录的那个窗口，并把它记成本次运行的基准。
+    ///
+    /// 抽成独立方法是因为它和"跑到哪一步"无关——三条工作流都要先过这一关。
+    fn enter_client(&mut self) -> Result<(), AutomationError> {
         // ── 接入客户端 ──────────────────────────────────────────────
         //
         // 客户端由操作者**自己启动并登录**，这里只负责接管已经就绪的窗口。
@@ -1162,16 +1116,55 @@ impl<'a> Run<'a> {
         }
         let metrics = self.runner.ports.platform.screen_metrics()?;
         // 先校验尺寸、再把它当成本次运行的基准：基准错了，后面每一次换算都错。
-        self.verify_calibrated_size(window, metrics)?;
+        // 尺寸不符时这里会**先尝试自动调回去**，调成了就用调完的尺寸当基准。
+        let original = window;
+        let window = self.ensure_calibrated_size(original, metrics)?;
         self.window = Some(window);
         self.metrics = Some(metrics);
+        // 调整过就明说：窗口被程序动过，操作者有权知道动了多少。
+        let adjusted_note = if window.width != original.width || window.height != original.height {
+            format!(
+                "（已自动从 {}x{} 调整到标定尺寸）",
+                original.width, original.height
+            )
+        } else {
+            String::new()
+        };
         self.advance(
             TaskState::WaitingForClient,
             Some(format!(
-                "窗口 {}x{} @({},{})，缩放 {}",
-                window.width, window.height, window.x, window.y, metrics.scale_factor
+                "窗口 {}x{} @({},{})，缩放 {}{}",
+                window.width, window.height, window.x, window.y, metrics.scale_factor, adjusted_note
             )),
         )?;
+        Ok(())
+    }
+
+    fn execute(&mut self) -> Result<(), AutomationError> {
+        self.check_cancel()?;
+        self.enter_client()?;
+
+        let workflow = self.cfg().workflow;
+
+        // ── 只做导航 ────────────────────────────────────────────────
+        //
+        // 这条路**不查找任何人**：找到指定图标、点它、结束。
+        // 它的价值是把"图标匹配得准不准"从整条链路里单独拎出来验证——
+        // 混在完整流程里时，点错图标的症状会表现为"找不到联系人"，
+        // 而排查方向会一路偏向 OCR。
+        if workflow == Workflow::NavigateOnly {
+            let nav_target = self.cfg().nav_target;
+            self.advance(
+                TaskState::NavigatingToView,
+                Some(format!("目标：{}图标", nav_target.describe())),
+            )?;
+            self.navigate_to_view(nav_target)?;
+            self.advance(
+                TaskState::Navigated,
+                Some(format!("已找到并点击「{}」图标", nav_target.describe())),
+            )?;
+            return Ok(());
+        }
 
         // ── 切换视图（可选）────────────────────────────────────────
         //
@@ -1179,26 +1172,69 @@ impl<'a> Run<'a> {
         // 模板匹配。它必须在查找之前——查找假定"现在看的就是目标视图"。
         if self.cfg().navigate_before_search {
             self.advance(TaskState::NavigatingToView, None)?;
-            self.navigate_to_view()?;
+            self.navigate_to_view(NavTarget::Contact)?;
         }
 
         // ── 查找联系人 ──────────────────────────────────────────────
+        //
+        // 两条路在状态机上同为 `SearchingContact`，但**看的是完全不同的界面**：
+        // 搜索式看顶部的联想下拉，列表扫描式看左侧的会话列表。
+        // 正因为界面不同，它们的失败原因也完全不同，所以走之前必须分开。
         self.advance(TaskState::SearchingContact, None)?;
-        let panel = self.resolve(self.cfg().contact_panel, "联系人候选区")?;
-        // 列表一屏放不下时向下滚动继续找，找不到就转人工，绝不猜。
-        let matched = self.locate_contact(panel)?;
+        let matched = match workflow {
+            Workflow::SearchContact => self.search_contact_by_keyword()?,
+            _ => {
+                let panel = self.resolve(self.cfg().contact_panel, "联系人候选区")?;
+                // 列表一屏放不下时向下滚动继续找，找不到就转人工，绝不猜。
+                self.locate_contact(panel)?
+            }
+        };
 
         // ── 核验候选人 ──────────────────────────────────────────────
         self.advance(
             TaskState::VerifyingCandidate,
             Some(format!("候选文字：{}", matched.text.trim())),
         )?;
-        // 判据必须问**匹配器**，不能在这里自己写「文字是否等于目标名」。
-        // 这里曾经写的是 `matched.text.trim() != task.external_contact_name.trim()`：
-        // 于是「联系人匹配器」换成放宽策略之后，任务照样在这个复检处转人工，
-        // 而失败文案（"不完全一致"）看起来像是 OCR 认不准 —— 排查会一路往
-        // 识别精度上找，永远找不到「两道关卡各写了一套判据」这个真原因。
-        if !self.runner.ports.matcher.accepts(&self.task.external_contact_name, &matched) {
+        self.verify_candidate(&matched)?;
+
+        // ── 打开与他的聊天 ──────────────────────────────────────────
+        //
+        // 两条路的落点不同，所以这一步必须分开：
+        //   - 搜索式：点下拉里那一行之后落在**资料页**，还要从那儿点「发消息」；
+        //   - 列表扫描式：点一下候选人就直接进了聊天页。
+        match workflow {
+            Workflow::SearchContact => {
+                self.click_dropdown_row(&matched)?;
+                self.verify_profile()?;
+                self.open_chat_from_profile()?;
+            }
+            _ => self.open_chat_from_list(&matched)?,
+        }
+
+        // ── 核验聊天页标题 ──────────────────────────────────────────
+        self.advance(TaskState::VerifyingChatHeader, None)?;
+        self.verify_chat_header()?;
+
+        // ── 准备消息 ────────────────────────────────────────────────
+        self.advance(TaskState::PreparingMessage, None)?;
+        self.prepare_message(workflow)
+    }
+
+
+
+
+
+
+
+    /// 核验候选人：文字与置信度两道都要过。
+    ///
+    /// **判据一律问匹配器**，不能在这里自己写「文字是否等于目标名」。
+    /// 这里曾经写的是 `matched.text.trim() != task.external_contact_name.trim()`：
+    /// 于是「联系人匹配器」换成放宽策略之后，任务照样在这个复检处转人工，
+    /// 而失败文案（"不完全一致"）看起来像是 OCR 认不准 —— 排查会一路往
+    /// 识别精度上找，永远找不到「两道关卡各写了一套判据」这个真原因。
+    fn verify_candidate(&self, matched: &TextBox) -> Result<(), AutomationError> {
+        if !self.runner.ports.matcher.accepts(&self.task.external_contact_name, matched) {
             return Err(AutomationError::AmbiguousVision(format!(
                 "候选人文字「{}」不被当前的姓名匹配策略接受（目标「{}」）",
                 matched.text.trim(),
@@ -1212,41 +1248,15 @@ impl<'a> Run<'a> {
                 self.cfg().min_confidence
             )));
         }
+        Ok(())
+    }
 
-        // ── 点击候选人并核验聊天页标题 ──────────────────────────────
-        // 先记下点击**之前**对话区的画面：一次生效的点击应该让它变化。
-        // 这条指纹用来区分"点错了人"和"点击根本没生效"——两者的处置完全不同。
-        let body = self.resolve(self.cfg().chat_body, "聊天正文区")?;
-        let body_before_click = self.capture_frame(body, "点击前聊天区")?.fingerprint;
 
-        // 点击之前先确认客户端还活着：往一个卡死的窗口里点击，什么都查不出来，
-        // 只会让后面每一步都建立在"没生效的动作"上。
-        self.ensure_not_frozen("已取消点击联系人")?;
-        let expected_window = self.ensure_calibrated()?;
-        let contact_screen_rect = matched.bounds.to_screen(Point { x: panel.x, y: panel.y });
-        // 记下"点了哪儿"。这是"准备给联系人发消息"的第一步，也是整个流程里
-        // 唯一一个真的把光标放到某个联系人身上的动作——出问题时必须能核对坐标。
-        let target = contact_screen_rect.center();
-        self.evidence.push(format!(
-            "点击联系人 : 屏幕 ({}, {})   命中文字「{}」框 ({}, {}) {}x{}   置信度 {:.2}",
-            target.x,
-            target.y,
-            matched.text.trim(),
-            contact_screen_rect.x,
-            contact_screen_rect.y,
-            contact_screen_rect.width,
-            contact_screen_rect.height,
-            matched.confidence
-        ));
-        self.runner
-            .ports
-            .platform
-            .guarded_click(target, expected_window)?;
-        self.check_deadline("点击联系人")?;
-        let chat_reacted = self.capture_frame(body, "点击后聊天区")?.fingerprint
-            != body_before_click;
-
-        self.advance(TaskState::VerifyingChatHeader, None)?;
+    /// 核验聊天页标题：标题上写的人必须与目标一致。
+    ///
+    /// 失败时要分清两件事——"点错了人"和"那次点击根本没生效"。
+    /// 后者用 `last_click_reacted` 判断：上一步点完画面一个像素都没变。
+    fn verify_chat_header(&mut self) -> Result<(), AutomationError> {
         let header = self.resolve(self.cfg().chat_header, "聊天标题区")?;
         let (header_shot, header_boxes) = self.capture_and_recognize(header, "聊天标题识别")?;
         self.evidence.push(format!("chat_header#{}", header_shot.fingerprint));
@@ -1255,141 +1265,31 @@ impl<'a> Run<'a> {
             &header_boxes,
             self.cfg().min_confidence,
         );
-        // 同「核验候选人」：判据一律问匹配器。这里原来写死了逐字相等，
-        // 于是放宽匹配能选中联系人，却在标题核验处被判「不一致」——
-        // 明明点对了人，任务还是转人工。
+        // 判据一律问匹配器。这里原来写死了逐字相等，于是放宽匹配能选中联系人、
+        // 却在标题核验处被判「不一致」——明明点对了人，任务还是转人工。
         let header_matched = header_result
             .as_ref()
             .map(|found| self.runner.ports.matcher.accepts(&self.task.external_contact_name, found))
             .unwrap_or(false);
-        if !header_matched {
-            if !chat_reacted {
-                // 点完之后对话区一个像素都没变 ⇒ 这次点击很可能根本没落到界面上。
-                // 常见原因：客户端卡死、窗口被别的窗口或弹窗挡住、点到了列表空白处。
-                // 此时报"标题不符"会把人引到错的方向，所以单独说清楚。
-                return Err(AutomationError::NeedsHumanReview(format!(
-                    "点击联系人「{}」之后，对话区画面没有任何变化——这次点击可能没有生效。\
-                     请检查客户端是否卡死、是否被其它窗口遮挡，然后重试。",
-                    self.task.external_contact_name.trim()
-                )));
-            }
-            let found = header_result?;
-            return Err(AutomationError::AmbiguousVision(format!(
-                "聊天页标题「{}」与目标「{}」不一致",
-                found.text.trim(),
+        if header_matched {
+            return Ok(());
+        }
+        if self.last_click_reacted == Some(false) {
+            // 上一步点完之后画面一个像素都没变 ⇒ 那次点击很可能根本没落到界面上。
+            // 常见原因：客户端卡死、窗口被别的窗口或弹窗挡住、点到了空白处。
+            // 此时报"标题不符"会把人引到错的方向，所以单独说清楚。
+            return Err(AutomationError::NeedsHumanReview(format!(
+                "为「{}」打开聊天的那个点击之后，画面没有任何变化——这次点击可能没有生效。\
+                 请检查客户端是否卡死、是否被其它窗口遮挡，然后重试。",
                 self.task.external_contact_name.trim()
             )));
         }
-
-        // ── 准备消息：聚焦输入框并记录发送前聊天区基线 ──────────────
-        self.advance(TaskState::PreparingMessage, None)?;
-        // 选中联系人之后，焦点仍在会话列表（甚至搜索框）上，**不在消息输入框**里。
-        // 不先点进输入框的话，后面那次粘贴会落到错误的位置——最坏情况是粘进
-        // 搜索框，把搜索结果本身改掉。所以这里必须先做一次受守卫的点击。
-        let expected_window = self.ensure_calibrated()?;
-        let composer = self.resolve(self.cfg().composer, "消息输入框区")?;
-        // 同样记下坐标：这一步点错地方，后面那次粘贴就会落到别的控件里
-        // （最坏是落到搜索框，把搜索结果本身改掉），而现象只是"字没进去"。
-        self.evidence.push(format!(
-            "聚焦输入框 : 屏幕 ({}, {})   输入框区 : 屏幕 ({}, {}) {}x{}",
-            composer.center().x,
-            composer.center().y,
-            composer.x,
-            composer.y,
-            composer.width,
-            composer.height
-        ));
-        self.runner
-            .ports
-            .platform
-            .guarded_click(composer.center(), expected_window)?;
-        self.check_deadline("聚焦消息输入框")?;
-
-        let (before_shot, _) = self.capture_and_recognize(body, "发送前聊天区识别")?;
-        self.baseline_fingerprint = Some(before_shot.fingerprint.clone());
-        self.evidence.push(format!("chat_before#{}", before_shot.fingerprint));
-
-        // ── 「只填不发」：正文入框后就地结束 ────────────────────────
-        //
-        // 这条分支必须在人工确认**之前**，而且不能复用下面的发送路径：
-        // 它存在的全部意义就是"绝不发送"，所以这里既不申请发送台账，
-        // 也不写消息摘要——审计里不该留下任何"像发过了"的痕迹。
-        if self.cfg().stop_before_send {
-            let expected_window = self.ensure_calibrated()?;
-            self.ensure_not_frozen("已取消填入消息正文")?;
-            self.runner
-                .ports
-                .platform
-                .paste_text(&self.task.text, expected_window)?;
-            self.check_deadline("填入消息正文")?;
-            self.advance(
-                TaskState::Prepared,
-                Some(format!(
-                    "已把 {} 个字符填入输入框，按配置未发送",
-                    self.task.text.chars().count()
-                )),
-            )?;
-            return Ok(());
-        }
-
-        // ── 人工确认 ────────────────────────────────────────────────
-        self.advance(TaskState::AwaitingHumanConfirmation, None)?;
-        self.runner
-            .ports
-            .confirmation
-            .confirm_send(self.task, self.cfg().confirmation_ttl)?;
-        self.confirmation_at = Some(SystemTime::now());
-
-        // ── 发送 ────────────────────────────────────────────────────
-        self.check_cancel()?;
-        self.runner.ledger.claim(self.task.id)?;
-        // 摘要先于状态转换写入，确保 Sending 的审计记录已带上摘要。
-        self.message_digest = Some(MessageDigest::of(&self.task.text));
-        self.advance(TaskState::Sending, None)?;
-        let expected_window = self.ensure_calibrated()?;
-        // 发送前最后一次确认客户端还活着。往一个卡死的窗口里粘贴 + 回车，
-        // 结果是"看起来发出去了，其实什么都没发生"——比失败更糟。
-        self.ensure_not_frozen("已取消发送")?;
-        self.runner
-            .ports
-            .platform
-            .paste_text(&self.task.text, expected_window)?;
-        self.runner
-            .ports
-            .platform
-            .send_message_shortcut(expected_window)?;
-        self.check_deadline("发送消息")?;
-
-        // ── 核验送达 ────────────────────────────────────────────────
-        self.advance(TaskState::VerifyingDelivery, None)?;
-        let (after_shot, after_boxes) = self.capture_and_recognize(body, "送达核验识别")?;
-        self.evidence.push(format!("chat_after#{}", after_shot.fingerprint));
-        if Some(&after_shot.fingerprint) == self.baseline_fingerprint.as_ref() {
-            // 画面没变有两种成因：消息真的没出现，或者客户端已经卡死。
-            // 系统判定读得出来就带上这句；读不出来（Err）就不加——
-            // 这只是诊断提示，不该因为诊断本身失败而改变结论。
-            let frozen_hint = match self.runner.ports.platform.is_responsive() {
-                Ok(false) => "（且系统判定客户端未响应，疑似卡死）",
-                _ => "",
-            };
-            return Err(AutomationError::NeedsHumanReview(format!(
-                "发送后聊天区截图未发生变化{frozen_hint}，无法确认消息已出现"
-            )));
-        }
-        let wanted = self.task.text.trim();
-        if wanted.is_empty() {
-            return Err(AutomationError::NeedsHumanReview("消息正文为空".into()));
-        }
-        let appeared = after_boxes.iter().any(|b| {
-            b.confidence >= self.cfg().min_confidence && b.text.contains(wanted)
-        });
-        if !appeared {
-            return Err(AutomationError::NeedsHumanReview(
-                "聊天区未识别到本条消息，拒绝判定为已送达".into(),
-            ));
-        }
-
-        self.advance(TaskState::Completed, None)?;
-        Ok(())
+        let found = header_result?;
+        Err(AutomationError::AmbiguousVision(format!(
+            "聊天页标题「{}」与目标「{}」不一致",
+            found.text.trim(),
+            self.task.external_contact_name.trim()
+        )))
     }
+
 }
