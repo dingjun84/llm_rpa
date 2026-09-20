@@ -1,0 +1,77 @@
+# ============================================================
+# 只提交源代码与文档；一切构建产物、依赖、运行期数据都不入库
+# ============================================================
+
+# ---------- Rust / Cargo 构建产物 ----------
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+*.ilk
+*.exp
+
+# ---------- Node / 前端依赖与产物 ----------
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+dist-ssr/
+# `vite build --outDir dist-verify` 的产物：沙箱的批量删除保护会拦住 Vite
+# 清空 dist 的动作（见项目记忆第 8 条），所以验证打包时改用这个全新目录。
+dist-verify/
+**/dist-verify/
+# Vite 读配置时写的临时文件（`vite.config.ts.timestamp-*.mjs`）。
+# 构建**失败**或被中断时不会自己清掉，于是每次 `git status` 都冒出来一批。
+vite.config.ts.timestamp-*
+
+# ---------- 沙箱改写受阻时的过渡目录 ----------
+# 助手在沙箱里改不动工作区已存在的文件（`ModifyBackup failed: path index collision`），
+# 只能把新版文件写到这里、再由用户手动移到位。属于工具链的临时产物，不入库。
+/_patch/
+.vite/
+*.tsbuildinfo
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- Tauri 自动生成的 ACL / schema 快照 ----------
+# 通配写法：每加一个 Tauri 应用就多一个 gen/schemas，逐个列举必然漏
+# （探针 apps/webview-probe 就是这么漏掉的）。
+**/src-tauri/gen/schemas/
+**/gen/schemas/
+
+# ---------- 运行期数据：审计库 / 证据截图 / 日志 ----------
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+/data/
+/evidence/
+/logs/
+*.log
+
+# mem-diag 每次跑都生成一份带时间戳的报告，不进版本库
+tools/mem-diag-*.txt
+
+# ---------- 环境变量与密钥 ----------
+.env
+.env.*
+!.env.example
+
+# ---------- 编辑器 / 系统垃圾 ----------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 本地 AI 工具链数据（非项目源码）----------
+.workbuddy-ai/

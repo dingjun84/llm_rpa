@@ -1,0 +1,10 @@
+[package]
+name = "macosocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "用 macOS Vision 离线 OCR 实现 rpa_llm 的本地 OCR 契约（PNG stdin → JSON stdout）"
+
+[[bin]]
+name = "macosocr"
+path = "src/main.rs"

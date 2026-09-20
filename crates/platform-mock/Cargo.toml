@@ -1,0 +1,11 @@
+[package]
+name = "platform-mock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+automation-core = { path = "../automation-core" }
+
+[dev-dependencies]
+uuid.workspace = true

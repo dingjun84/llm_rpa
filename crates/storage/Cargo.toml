@@ -1,0 +1,15 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+automation-core = { path = "../automation-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

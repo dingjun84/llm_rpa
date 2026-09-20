@@ -1,0 +1,39 @@
+[workspace]
+members = [
+  "crates/automation-core",
+  "crates/platform-mock",
+  "crates/platform-windows",
+  "crates/platform-macos",
+  "crates/storage",
+  "crates/vision",
+  "apps/desktop/src-tauri",
+  # 独立的 WebView 渲染探针：只用来判断"界面出不来"是环境问题还是主应用前端栈的问题。
+  # 与主应用没有任何代码依赖，删掉它（连同这一行）不影响主应用。
+  "apps/webview-probe",
+  "tools/winocr",
+  "tools/macosocr",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+thiserror = "2.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+# 本机（MSVC 14.44 + Windows SDK 10.0.26100）反复出现**依赖 rlib 的调试信息损坏**：
+# 链接期报 LNK1103 / LNK1143 / LNK1223，报错点名的却是 `libsyn` / `libweb_atoms`
+# / `libwindows` 这类第三方 crate，且它们的字节数与时间戳都正常，只有 `cmp`
+# 才看得出内容不同——典型的"PDB 并发写入被打断"。
+#
+# 依赖的调试信息对本项目没有价值（我们不调试第三方库），
+# 关掉它既省下大量磁盘，也把 PDB 写入压力降到最低。
+# 自己写的 crate 仍然保留完整调试信息。
+[profile.dev.package."*"]
+debug = false

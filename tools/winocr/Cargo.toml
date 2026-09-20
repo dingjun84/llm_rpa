@@ -1,0 +1,24 @@
+[package]
+name = "winocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "用 Windows 内置离线 OCR 引擎实现 rpa_llm 的本地 OCR 契约（PNG stdin → JSON stdout）"
+
+[[bin]]
+name = "winocr"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Foundation",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
+] }

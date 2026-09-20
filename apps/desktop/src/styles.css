@@ -1,0 +1,1023 @@
+:root {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --border: #e3e5e9;
+  --text: #1f2328;
+  --muted: #6b7280;
+  --accent: #2f6feb;
+  --ok: #1a7f4b;
+  --warn: #a16207;
+  --bad: #b42318;
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+h1 {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0;
+}
+
+h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+
+.app {
+  min-height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 28px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.app-subtitle {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.mode-pill {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: var(--accent);
+  border: 1px solid #d5deff;
+  white-space: nowrap;
+}
+
+.mode-pill.is-live {
+  background: #fef3f2;
+  color: var(--bad);
+  border-color: #fbd5d1;
+}
+
+.app-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(340px, 1.1fr) minmax(280px, 0.9fr);
+  gap: 16px;
+  padding: 20px 28px 40px;
+  align-items: start;
+}
+
+@media (max-width: 1180px) {
+  .app-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+}
+
+.panel-danger {
+  border-color: #fbd5d1;
+  background: #fffbfa;
+}
+
+.field {
+  display: block;
+  margin-bottom: 14px;
+}
+
+.field-label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.field-hint {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+input,
+textarea,
+select {
+  width: 100%;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+textarea {
+  resize: vertical;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+button {
+  font: inherit;
+  font-size: 13px;
+  border-radius: 8px;
+  padding: 9px 16px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+button.ghost {
+  background: #fff;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.error-line {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--bad);
+}
+
+.muted-line {
+  font-size: 13px;
+  color: var(--muted);
+  margin: 0;
+}
+
+.notice {
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f0f5ff;
+  color: #1e3a8a;
+  margin: 0 0 14px;
+}
+
+.notice-live {
+  background: #fef3f2;
+  color: #7a271a;
+}
+
+/* 「改了还没保存」这类提醒。
+   刻意不用 notice-live 的红色：红色在这个界面里已经专门表示"真实模式会动真窗口"，
+   再拿它表示"未保存"会让人分不清哪个才是危险信号。 */
+.notice-warn {
+  background: #fffbeb;
+  color: var(--warn);
+  border: 1px solid #fde68a;
+}
+
+/* 「这一块还没标定」。
+   它不是错误（还没标是**如实**的状态），但必须在"点开始之前"被看见——
+   装配期会拒绝，而那时人已经点过一次了。所以用告警色加重，不用报错红。 */
+.missing-mark {
+  color: var(--warn);
+  text-decoration: underline dotted;
+}
+
+.meta-list {
+  display: grid;
+  grid-template-columns: 84px 1fr;
+  gap: 6px 12px;
+  margin: 0 0 12px;
+  font-size: 13px;
+}
+
+.meta-list dt {
+  color: var(--muted);
+}
+
+.meta-list dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.strong {
+  font-weight: 600;
+}
+
+.mono {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.message-preview {
+  white-space: pre-wrap;
+  background: #f7f8fa;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 4px;
+}
+
+.timeline-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+  font-size: 13px;
+  color: var(--muted);
+  position: relative;
+}
+
+.timeline-step::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+
+.timeline-step:first-child::before {
+  top: 50%;
+}
+
+.timeline-step:last-child::before {
+  bottom: 50%;
+}
+
+.timeline-marker {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid var(--border);
+  z-index: 1;
+  flex: none;
+  margin-left: 0;
+}
+
+.timeline-step.is-done .timeline-marker {
+  background: var(--ok);
+  border-color: var(--ok);
+}
+
+.timeline-step.is-done {
+  color: var(--text);
+}
+
+.timeline-step.is-active .timeline-marker {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px #2f6feb22;
+}
+
+.timeline-step.is-active {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.timeline-step.is-stopped .timeline-marker {
+  background: var(--bad);
+  border-color: var(--bad);
+}
+
+.timeline-step.is-stopped {
+  color: var(--bad);
+  font-weight: 600;
+}
+
+.outcome {
+  margin: 12px 0 0;
+  font-size: 13px;
+}
+
+.outcome-stop {
+  color: var(--bad);
+}
+
+/* 「只填不发」不是失败，用中性的强调色，不要用报错红。 */
+.outcome-prepared {
+  color: var(--accent);
+}
+
+.detail-line {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.failure-code {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  color: var(--bad);
+  margin: 0 0 6px;
+}
+
+.evidence-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.evidence-list li {
+  padding: 3px 0;
+  color: var(--muted);
+}
+
+.history {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 620px;
+  overflow-y: auto;
+}
+
+.history-item {
+  width: 100%;
+  text-align: left;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: block;
+}
+
+.history-item.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px #2f6feb22;
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.history-contact {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.badge.is-ok {
+  background: #e8f6ee;
+  color: var(--ok);
+}
+
+.badge.is-warn {
+  background: #fdf3e0;
+  color: var(--warn);
+}
+
+.badge.is-bad {
+  background: #fef3f2;
+  color: var(--bad);
+}
+
+.badge.is-muted {
+  background: #f1f2f4;
+  color: var(--muted);
+}
+
+.history-meta {
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.history-failure {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--bad);
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.history-failure code {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  background: #fef3f2;
+  padding: 1px 5px;
+  border-radius: 4px;
+  flex: none;
+}
+
+.history-evidence {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: #10182866;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 10;
+}
+
+.modal {
+  background: #fff;
+  border-radius: 14px;
+  padding: 22px 24px;
+  width: min(520px, 100%);
+  box-shadow: 0 16px 48px #10182826;
+}
+
+.modal-warning {
+  font-size: 12px;
+  color: var(--warn);
+  background: #fdf3e0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 0 0 14px;
+}
+
+.confirm-grid {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 8px 12px;
+  margin: 0 0 14px;
+  font-size: 13px;
+}
+
+.confirm-grid dt {
+  color: var(--muted);
+}
+
+.confirm-grid dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.confirm-strong {
+  font-weight: 600;
+}
+
+.confirm-message {
+  white-space: pre-wrap;
+  background: #f7f8fa;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.countdown {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 14px;
+}
+
+.countdown.is-expired {
+  color: var(--bad);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* ── 区域标定 ─────────────────────────────────────────────────────── */
+
+.notice-error {
+  background: #fef3f2;
+  color: var(--bad);
+}
+
+/*
+ * 长诊断文本（例如图标匹配失败时那段"各模板前几名候选"）。
+ *
+ * 它靠**换行**分段，而 `<p>` / `<span>` 默认会把换行压成一个空格 ——
+ * 不写这一条，几行候选会挤成一整行，恰好把"要读的那几个数"埋掉。
+ * `overflow-wrap` 是因为候选坐标这种长串没有空格可断。
+ */
+.failure-detail {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.calibration {
+  margin: 18px 0 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+
+.calibration-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.calibration-head h3 {
+  font-size: 13px;
+  margin: 0;
+}
+
+.calibration-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.calibration-actions button {
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
+/* 容器尺寸由图片决定，叠加层才能用百分比正确定位。 */
+.calibration-stage {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+  margin-bottom: 8px;
+}
+
+.calibration-stage img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.calibration-overlay {
+  position: absolute;
+  box-sizing: border-box;
+  border: 2px solid;
+  pointer-events: none;
+}
+
+.calibration-overlay-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-size: 10px;
+  line-height: 1.4;
+  padding: 1px 5px;
+  color: #fff;
+  border-bottom-right-radius: 6px;
+  white-space: nowrap;
+}
+
+/*
+ * 10% 网格，用来让操作者用百分比回话（「把 1 的左边界挪到 32%」）。
+ *
+ * 每条线都是「浅色 1px + 深色 1px」的双色线：截图底色深浅不定，
+ * 单色线总有一半情况看不见。每 10% 一条细线，每 50% 一条更粗的。
+ * 在 background-image 里**先写的画在上面**，所以粗线放前面。
+ */
+.calibration-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    repeating-linear-gradient(
+      to right,
+      rgba(255, 255, 255, 0.75) 0 2px,
+      rgba(0, 0, 0, 0.5) 2px 3px,
+      transparent 3px 50%
+    ),
+    repeating-linear-gradient(
+      to bottom,
+      rgba(255, 255, 255, 0.75) 0 2px,
+      rgba(0, 0, 0, 0.5) 2px 3px,
+      transparent 3px 50%
+    ),
+    repeating-linear-gradient(
+      to right,
+      rgba(255, 255, 255, 0.5) 0 1px,
+      rgba(0, 0, 0, 0.32) 1px 2px,
+      transparent 2px 10%
+    ),
+    repeating-linear-gradient(
+      to bottom,
+      rgba(255, 255, 255, 0.5) 0 1px,
+      rgba(0, 0, 0, 0.32) 1px 2px,
+      transparent 2px 10%
+    );
+}
+
+.calibration-row {
+  margin-bottom: 12px;
+}
+
+.calibration-row-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+/* 方块里带编号，与截图上画的角标是同一套编号。 */
+.calibration-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* 指认窗口的倒计时与结果回显。 */
+.picker-countdown {
+  align-self: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.picker-result {
+  margin-top: 8px;
+}
+
+.calibration-problem {
+  color: var(--bad);
+  font-size: 11px;
+}
+
+.calibration-inputs {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.calibration-inputs label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.calibration-inputs span {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.calibration-inputs input {
+  width: 100%;
+  font-size: 12px;
+  padding: 4px 6px;
+}
+
+/* 「只填不发」勾选项：标签与说明整体跟在复选框右侧。 */
+.field-check {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2, transparent);
+}
+
+.field-check input[type="checkbox"] {
+  width: auto;
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+
+.field-check > span {
+  display: block;
+}
+
+.field-check .field-label {
+  margin-bottom: 2px;
+}
+
+/* ── 页签 ──────────────────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 28px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.tab.is-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab-dirty {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--warn);
+}
+
+/* 单列布局：三列那套宽度是给「任务」页的。 */
+.app-grid.is-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* ── 截图与叠加层 ──────────────────────────────────────────────────── */
+
+/* 容器尺寸由图片决定，叠加层才能跟着图片一起缩放。 */
+.shot-wrap {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+  margin: 6px 0 8px;
+}
+
+.shot-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* 叠加层用 SVG + viewBox：坐标直接用**图像坐标系**，缩放交给浏览器，
+   界面怎么缩都不会算错位置。所以它必须严丝合缝地盖住图片。 */
+.shot-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/* 搜索区：蓝虚线 = "在哪儿找"。 */
+.shot-strip {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+}
+
+/* 命中：实线。绿 = 过了阈值，红 = 没过。
+   没过阈值也要画——"它认为最像的地方在哪儿"正是判断模板对不对的唯一线索。 */
+.shot-hit {
+  fill: none;
+  stroke: var(--ok);
+  stroke-width: 2;
+}
+
+.shot-hit.is-low {
+  stroke: var(--bad);
+}
+
+/* 实际点击落点。 */
+.shot-click {
+  fill: rgba(124, 58, 237, 0.25);
+  stroke: #7c3aed;
+  stroke-width: 2;
+}
+
+/* 框选：琥珀色，和搜索区（蓝）、命中（绿/红）都区分得开。 */
+.shot-selection {
+  fill: rgba(245, 158, 11, 0.16);
+  stroke: #f59e0b;
+  stroke-width: 2;
+  stroke-dasharray: 5 3;
+}
+
+/* 拖框的那张图：十字光标 + 禁止触摸手势抢走拖动。 */
+.shot-crop {
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.crop-save {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.crop-zoom-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* 放大镜：用背景图从原画面上"抠"出框住的那一块。
+   为什么不用 <img> 再裁一张：那要重新编码一次图，而这里只想让人看清
+   "框住的到底是不是那个图标"。`pixelated` 是必须的——插值放大会把
+   边缘糊掉，而看这个图的全部意义就是看清边缘。 */
+.crop-zoom {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  image-rendering: pixelated;
+  background-repeat: no-repeat;
+}
+
+/* ── 图标库列表 ────────────────────────────────────────────────────── */
+
+.icon-list {
+  list-style: none;
+  margin: 10px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 一行 = 一个图标：名字在左，它底下的**全部变体**排在中间，动作在右。 */
+.icon-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+/* 有一个变体读不出来（尺寸越界、编码损坏）就要一眼看得出来：
+   它会让任务在装配期直接失败。 */
+.icon-row.is-broken {
+  border-color: #f3c2c0;
+  background: #fef7f7;
+}
+
+/* 一个名字底下的全部变体。会换行——补到七八张时一行放不下。 */
+.icon-variants {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.icon-variant {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  position: relative;
+}
+
+.icon-variant.is-broken .icon-thumb {
+  border-color: #f3c2c0;
+  background: #fef7f7;
+}
+
+.icon-variant-meta {
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.2;
+}
+
+/* 「删除这张」要小、要轻：它只丢一张，重截一张的成本很低。
+   删**整组**才是重动作，那个按钮在右边、要两下。 */
+.icon-variant-remove {
+  font-size: 10px !important;
+  padding: 1px 6px !important;
+  line-height: 1.4;
+}
+
+/* 坏在哪：贴在缩略图下面，够窄就换行，别把整行撑开。 */
+.icon-variant-problem {
+  max-width: 140px;
+  font-size: 10px;
+  color: var(--bad);
+  line-height: 1.25;
+  text-align: center;
+}
+
+.icon-thumb {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  object-fit: contain;
+  image-rendering: pixelated;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fafafa;
+}
+
+.icon-thumb-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 18px;
+}
+
+.icon-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 96px;
+  flex: 0 0 auto;
+}
+
+.icon-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.icon-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.icon-actions button {
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
+/* 列表里的「用于导航」：紧凑一点，别把整块说明的样式带过来。 */
+.icon-use {
+  padding: 4px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* 「定位并点击」上了膛：这一下按下去会真的产生鼠标点击，必须一眼看出来。 */
+button.danger {
+  background: var(--bad);
+  color: #fff;
+}
