@@ -118,7 +118,7 @@
 | 文件 | 行数 | 职责 | 关键符号 |
 | --- | --- | --- | --- |
 | `src/ocr.rs` | 242 | `ExternalOcr`：截图 → PNG → 子进程 stdin → JSON stdout | `ExternalOcr`、`UnconfiguredOcr` |
-| `src/template.rs` | 868 | 纯 Rust NCC 模板匹配（等价 `TM_CCOEFF_NORMED`），逐通道平均 | 匹配函数 |
+| `src/template.rs` | 793 | 纯 Rust NCC 模板匹配（等价 `TM_CCOEFF_NORMED`），逐通道平均。★ **分数不够时**再报"每个模板的前 3 个候选"（`top_candidates` / `candidate_report`）—— 只报最高分分不出「模板对不上画面」和「搜索区里根本没有它」这两件事 | 匹配函数、失败诊断 |
 | `src/pixels.rs` | 274 | **BGRA / 自上而下**的像素约定、裁切、放大 | — |
 | `src/evidence.rs` | 116 | 证据脱敏（每个文字框涂成中灰） | — |
 | `src/lib.rs` | 74 | 铁律：只处理内存中的局部截图、禁止网络 | — |

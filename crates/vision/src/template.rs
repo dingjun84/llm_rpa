@@ -75,6 +75,12 @@ pub const MAX_TEMPLATE_SIDE: u32 = 128;
 /// 当成 0 分会把一个本来能用的双色模板整体拉低。
 const FLAT_VARIANCE: f64 = 1e-6;
 
+/// 失败信息里每个模板报几个候选。
+///
+/// 三个够分辨"有一个明显的峰"和"到处都差不多"，再多只是把日志拉长——
+/// 人看的是"第二名离第一名有多远"，不是完整分布。
+const DIAGNOSTIC_PEAKS: usize = 3;
+
 /// 单通道像素平面，附带两张积分图。
 #[derive(Debug, Clone)]
 struct Plane {
@@ -547,6 +553,121 @@ pub fn crop_template(
     Ok(IconTemplate { label: label.into(), pixels, width: width as u32, height: height as u32 })
 }
 
+/// 同一个模板里，分数最高的前 `top` 个**互不重叠**的候选。
+///
+/// ## 为什么只报最高分是不够的
+///
+/// 一个"分数 0.55、低于阈值"有两种**完全不同的成因**，而它们在日志里长得
+/// 一模一样，人只能靠猜：
+///
+/// 1. **有一个明显的峰，只是峰不够高** —— 模板确实是那个图标，但它现在画出来的
+///    样子和模板不一样（选中/未选中换了字形、缩放了、主题变了）⇒ 处置是**重截模板**；
+/// 2. **到处都差不多** —— 搜索区里根本没有对应物，最高分只是噪声里的偶然
+///    ⇒ 处置是查**搜索区与几何**，重截模板一点用都没有。
+///
+/// 分辨这两者只需要知道"第二名离第一名有多远"。
+///
+/// ## 为什么要抑制重叠
+///
+/// 同一个图标上相邻的几个像素会拿到几乎一样的高分。不抑制的话"前 3 名"会是
+/// 同一个峰上的 3 个相邻像素，等于只报了一个位置。抑制半径取模板自己的宽高：
+/// 两个候选只要在任一方向上的距离都小于模板尺寸，就算落在同一处。
+///
+/// ⚠️ 抑制**必须按分数定强弱，不能按扫描顺序**。扫描是从左上往右下走的，
+/// 先扫到的不一定更"像"：一个 0.42 的边缘位置会先把真正的峰（0.98）压掉，
+/// 而结果是"只报了一个低分候选"——恰好把要说清的事情说反了。
+/// 所以规则是：**被更强者压住的丢弃，压住更弱者的把它挤出去**。
+///
+/// ## 代价
+///
+/// 单线程、不做任何近似，是 [`best_match_near`] 同款的"再扫一遍"。
+/// 它**只在失败路径上跑**（失败本来就要转人工，人比机器贵），
+/// 而且不影响任何一个位置上的分数——它读的是同一份 [`Prepared`]。
+///
+/// 量级：默认导航条（97×734）配 40×38 的模板，约 4 万个位置 × 1520 像素 × 3 通道，
+/// debug 构建下每张模板是**秒级**。这不是可以放进主路径的开销，所以它**只**在
+/// 已经决定转人工之后才被调用——那几秒换来的是"下一次该改哪里"，值。
+fn top_candidates(hay: &[Plane], prepared: &Prepared, top: usize) -> Vec<(usize, usize, f64)> {
+    let max_x = hay[0].width - prepared.width;
+    let rows = hay[0].height - prepared.height + 1;
+    // 落在同一处：两个方向上的距离都小于模板尺寸。
+    let overlaps = |x: usize, y: usize, px: usize, py: usize| {
+        x.abs_diff(px) < prepared.width && y.abs_diff(py) < prepared.height
+    };
+    // 按分数从高到低维持，末位就是"目前最弱的那个入选者"。
+    let mut peaks: Vec<(usize, usize, f64)> = Vec::with_capacity(top);
+    for y in 0..rows {
+        for x in 0..=max_x {
+            let Some(score) = position_score(
+                hay,
+                &prepared.zero,
+                &prepared.variance,
+                x,
+                y,
+                prepared.width,
+                prepared.height,
+            ) else {
+                continue;
+            };
+            // 名额已满且连最弱的入选者都打不过 ⇒ 这一位不可能进榜。
+            if peaks.len() >= top && score <= peaks[top - 1].2 {
+                continue;
+            }
+            if peaks.iter().any(|(px, py, best)| score <= *best && overlaps(x, y, *px, *py)) {
+                continue;
+            }
+            // 反过来：被这一位压住的、比它弱的峰要让位，否则它会一直占着
+            // "同一处只留一个"的名额，把真正的峰挡在外面。
+            peaks.retain(|(px, py, best)| !(score > *best && overlaps(x, y, *px, *py)));
+            let at = peaks.iter().position(|(_, _, best)| score > *best).unwrap_or(peaks.len());
+            peaks.insert(at, (x, y, score));
+            peaks.truncate(top);
+        }
+    }
+    peaks
+}
+
+/// 把每个模板的候选排成一段可读文本，附在"分数不够"的失败信息后面。
+///
+/// 它回答的是**下一次该动哪里**，所以每张模板都要带上自己的**尺寸**：
+/// 模板尺寸和画面上图标的实际尺寸对不上时，分数会整体偏低而位置看着又没错，
+/// 那是"模板截大了/截小了"，和"图标不在这里"是两回事。
+fn candidate_report(hay: &[Plane], templates: &[IconTemplate]) -> String {
+    let mut lines = Vec::with_capacity(templates.len());
+    for template in templates {
+        let Ok(needle) = planes_from_bgra(&template.pixels, template.width, template.height) else {
+            continue;
+        };
+        let size = format!("{}x{}", template.width, template.height);
+        let Some(prepared) = prepare(hay, &needle) else {
+            lines.push(format!("{} {size}：放不进搜索区", template.label));
+            continue;
+        };
+        let ranked: Vec<String> = top_candidates(hay, &prepared, DIAGNOSTIC_PEAKS)
+            .iter()
+            .map(|(x, y, score)| format!("{score:.3}@({x},{y})"))
+            .collect();
+        if ranked.is_empty() {
+            lines.push(format!("{} {size}：没有可比较的位置", template.label));
+        } else {
+            lines.push(format!("{} {size}：{}", template.label, ranked.join("  ")));
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    // ★ 这一段是给人看的：**第一名与第二名差多少**决定下一步往哪查。
+    format!(
+        "\n搜索区 {}x{}。各模板前 {} 个候选（分数@坐标，坐标相对搜索区左上角）：\n  {}\n\
+         若第一名明显高于后面 ⇒ 位置没错、是模板与当前画面对不上（重截模板）；\
+         若前几名挤在一起 ⇒ 搜索区里根本没有它（先查搜索区与窗口几何）。",
+        hay[0].width,
+        hay[0].height,
+        DIAGNOSTIC_PEAKS,
+        lines.join("\n  ")
+    )
+}
+
 /// 纯 Rust 的模板匹配定位器。
 ///
 /// 无状态、无外部依赖：一帧画面进，一个命中位置出。
@@ -625,8 +746,13 @@ impl IconLocator for TemplateLocator {
         if found.score < query.min_score {
             return Err(AutomationError::AmbiguousVision(format!(
                 "图标模板匹配不确定：最高分 {:.3}（模板「{}」，位置 ({}, {})），低于阈值 {:.3}。\
-                 请确认模板确实截自这个图标，且它此刻在搜索区域内可见。",
-                found.score, found.template_label, found.bounds.x, found.bounds.y, query.min_score
+                 请确认模板确实截自这个图标，且它此刻在搜索区域内可见。{}",
+                found.score,
+                found.template_label,
+                found.bounds.x,
+                found.bounds.y,
+                query.min_score,
+                candidate_report(&hay, query.templates)
             )));
         }
 

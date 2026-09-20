@@ -269,6 +269,63 @@ fn the_locator_refuses_to_guess_below_the_threshold() {
     assert!(err.requires_human_review());
 }
 
+/// 失败时的诊断：两个一模一样的方块必须被报成**两个**候选。
+///
+/// 这条用例盯的是"抑制重叠"那一步。少了它，前 3 名会是同一个峰上相邻的
+/// 三个像素——人看到的是"三个候选挤在一处"，于是得出"到处都差不多"的结论，
+/// 而真相恰恰相反（有两个很干净的峰，只是分数没到阈值）。
+#[test]
+fn the_diagnostic_reports_distinct_peaks_not_neighbouring_pixels() {
+    let frame = frame_of(60, 40, |x, y| {
+        let in_first = (10..22).contains(&x) && (8..20).contains(&y);
+        let in_second = (40..52).contains(&x) && (24..36).contains(&y);
+        if in_first || in_second {
+            [230, 60, 60, 255]
+        } else {
+            [40, 40, 40, 255]
+        }
+    });
+    // 模板带上四周的背景：纯色模板没有判别力（`prepare` 会拒掉）。
+    let template = template_at(&frame, 6, 4, 20, 20);
+    let hay = planes_from_bgra(&frame.pixels, frame.width, frame.height).unwrap();
+    let needle =
+        planes_from_bgra(&template.pixels, template.width, template.height).unwrap();
+    let prepared = prepare(&hay, &needle).unwrap();
+
+    let peaks = top_candidates(&hay, &prepared, DIAGNOSTIC_PEAKS);
+    assert!(peaks.len() >= 2, "两个方块应当报成两个候选，实际 {peaks:?}");
+    assert_eq!((peaks[0].0, peaks[0].1), (6, 4), "第一个峰是模板的来处");
+    assert_eq!((peaks[1].0, peaks[1].1), (36, 20), "第二个峰不能被抑制掉");
+    // 顺序必须按分数从高到低——人看的就是"第一名与第二名差多少"。
+    // 扫描是从左上往右下走的，若按"谁先扫到"决定强弱，(6,4) 就会被
+    // 左上角一个低分位置先占住名额、然后被当成"同一处"丢掉。
+    assert!(peaks[0].2 > 0.99, "来处必须是满分，实际 {:.4}", peaks[0].2);
+    assert!(
+        peaks.windows(2).all(|pair| pair[0].2 >= pair[1].2),
+        "候选必须按分数降序：{peaks:?}"
+    );
+}
+
+/// 失败信息里每张模板都要带上**自己的尺寸**。
+///
+/// "分数低"的两种成因（模板对不上 / 模板截得太大太小）在只报分数时无法区分，
+/// 尺寸是唯一能区分它们的东西。
+#[test]
+fn the_failure_message_names_every_template_with_its_size() {
+    let frame = frame_of(80, 40, pattern);
+    let first = template_at(&frame, 4, 4, 12, 12);
+    let second = template_at(&frame, 30, 10, 16, 9);
+
+    let err = TemplateLocator
+        .locate(&frame, &IconQuery::new(&[first, second], 1.01))
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("测试模板 12x12"), "缺尺寸：{message}");
+    assert!(message.contains("测试模板 16x9"), "缺尺寸：{message}");
+    assert!(message.contains("搜索区 80x40"), "缺搜索区尺寸：{message}");
+    assert!(message.contains("各模板前"), "缺候选分布：{message}");
+}
+
 #[test]
 fn the_locator_picks_the_best_of_several_templates() {
     let frame = frame_of(80, 40, pattern);
