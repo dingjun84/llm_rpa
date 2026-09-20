@@ -57,7 +57,7 @@ func collapseCJKSpaces(_ input: String) -> String {
 func parseArgs() -> (upscale: CGFloat, language: String?) {
     var upscale = DEFAULT_UPSCALE
     var language: String? = nil
-    var args = Array(CommandLine.arguments.dropFirst())
+    let args = Array(CommandLine.arguments.dropFirst())
     var i = 0
     while i < args.count {
         let a = args[i]

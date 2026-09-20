@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use automation_core::Rect;
 use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
-use core_foundation::boolean::CFBooleanGetValue;
+use core_foundation::boolean::{CFBoolean, CFBooleanRef};
 use core_foundation::dictionary::{CFDictionaryGetValueIfPresent, CFDictionaryRef};
 use core_foundation::number::{CFNumberGetValue, CFNumberRef, kCFNumberFloat64Type, kCFNumberSInt64Type};
 use core_foundation::string::{CFStringCreateWithCString, CFStringGetCString, CFStringRef, kCFStringEncodingUTF8};
@@ -117,7 +117,8 @@ fn dict_bool(dict: CFDictionaryRef, key: &str) -> bool {
         if present == 0 || value.is_null() {
             return false;
         }
-        CFBooleanGetValue(value as _)
+        // core-foundation 0.10 不再导出 CFBooleanGetValue，改走 CFBoolean → bool。
+        bool::from(CFBoolean::wrap_under_get_rule(value as CFBooleanRef))
     }
 }
 
