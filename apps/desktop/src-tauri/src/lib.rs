@@ -996,7 +996,7 @@ fn pick_target_window<R: Runtime>(_app: AppHandle<R>) -> Result<PickedWindow, St
         let exe_path = macosapi::window_process_path(w).ok();
 
         let is_self = match (&exe_path, std::env::current_exe()) {
-            (Some(picked), Ok(own)) => picked == own,
+            (Some(picked), Ok(own)) => *picked == own,
             _ => false,
         };
 
