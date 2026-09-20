@@ -548,19 +548,20 @@ fn live_wechat_refuses_when_the_contact_cannot_be_found() {
 /// 图标模板、标定尺寸——都在应用配置里，换一份配置等于换了个靶子测。
 /// 用 `RPA_LIVE_CONFIG` 可以指定别的文件。
 ///
-/// ## 图标模板从哪来
+/// ## 要测哪个图标
 ///
-/// 配置里存的是**图标名**（不是文件路径），由 `build_runner` 到图标库目录取图。
-/// 配置里没勾模板时本用例会补一个图标库里现成的名字——
-/// **空模板不该被当成"图标不在画面上"**：那是"配置缺失"，装配期就会拒绝，
-/// 而那样就测不到"匹配本身准不准"了。
+/// `RPA_LIVE_NAV_TARGET` 就是**图标库里的目录名**（`data/icons/` 下一级），
+/// 不填默认「通讯录」。它同时决定"点哪个图标"和"拿哪个目录的图当模板"——
+/// 现在是同一件事，所以没有第二个环境变量。
 ///
 /// ```text
-/// # 联系人（通讯录）图标
-/// RPA_LIVE_NAV_TARGET=contact cargo test -p desktop --test live_wechat -- --ignored --nocapture live_wechat_navigates_to_a_view
-/// # 聊天历史图标
-/// RPA_LIVE_NAV_TARGET=history cargo test -p desktop --test live_wechat -- --ignored --nocapture live_wechat_navigates_to_a_view
+/// # 默认：通讯录
+/// cargo test -p desktop --test live_wechat -- --ignored --nocapture live_wechat_navigates_to_a_view
+/// # 换成别的目录（名字要与 data/icons/ 下的一级目录一致）
+/// RPA_LIVE_NAV_TARGET=收藏夹 cargo test -p desktop --test live_wechat -- --ignored --nocapture live_wechat_navigates_to_a_view
 /// ```
+///
+/// 名字不存在 ⇒ 装配期直接拒绝，并报出**那个名字**（不会退回去点别的图标）。
 #[test]
 #[ignore = "会在真实桌面上产生真实点击，需要人工先把微信窗口点到前台"]
 fn live_wechat_navigates_to_a_view() {

@@ -331,7 +331,8 @@ fn turning_on_navigation_without_a_template_is_refused() {
     let err = assemble_with_icons(&config, &icons)
         .err()
         .expect("没有图标时必须拒绝装配");
-    // 报错要说清是**哪一组**模板缺了：两个目标各有一组，不说清就会去改错的那组。
+    // 报错要点名**缺的是哪个图标**：图标库里通常有四五个目录，
+    // 不说清就等于让人自己去猜该配哪一个。
     assert!(err.contains("没有配置「联系人」图标的模板"), "{err}");
     assert!(err.contains("图标库"), "要告诉人下一步去哪配：{err}");
 
