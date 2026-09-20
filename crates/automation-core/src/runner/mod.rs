@@ -284,30 +284,6 @@ impl Workflow {
     }
 }
 
-/// [`Workflow::NavigateOnly`] 要点的是哪一个导航图标。
-///
-/// 两个目标各有一组模板：它们在界面上长得不一样，模板不能通用。
-/// 分组而不是塞进一个列表里，是因为"用错了哪一组"不会报错——
-/// 只会拿聊天历史的模板去匹配联系人图标，然后转人工。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NavTarget {
-    /// 联系人（通讯录）视图。
-    Contact,
-    /// 聊天历史（会话列表）视图。
-    History,
-}
-
-impl NavTarget {
-    /// 面向操作者的名字，用于失败信息与证据。
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::Contact => "联系人",
-            Self::History => "聊天历史",
-        }
-    }
-}
-
 /// 运行参数。
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
@@ -417,10 +393,20 @@ pub struct RunnerConfig {
     /// 装配层（`apps/desktop` 的 `build_runner`）会在任务登记之前就拒绝，
     /// 不让它变成一条"跑到一半才发现没模板"的失败记录。
     pub navigate_before_search: bool,
-    /// 导航图标模板。**可以多张**——同一个图标在选中 / 未选中两种状态下长得不一样。
+    /// **本次导航要点的那一个图标**的模板。可以多张——同一个图标在选中 / 未选中
+    /// 两种状态下长得不一样。
     ///
     /// 只留一张模板，就会出现"上一次运行点完停在这个页面上，这一次再也匹配不上"。
     /// 多张模板是这里唯一诚实的解法，而不是把阈值调低到"两个状态都能过"。
+    ///
+    /// ## 这里是**结果**，不是配置
+    ///
+    /// 装配期（`apps/desktop` 的 `build_runner`）已经决定好这一次点哪个图标，
+    /// 把那个名字底下的**全部图**都载进来放在这儿。核心层不再去问"哪一组"。
+    ///
+    /// 一个名字底下几张图全都参与匹配、取最高分，是**同一个名字**的前提：
+    /// 图标换了个状态就不该算成"另一个图标"。跨名字取最高分则会点错图标——
+    /// 所以名字到模板这一步必须在装配期就定死，不能留到运行时。
     pub nav_icon_templates: Vec<IconTemplate>,
     /// 图标模板匹配的最低分数，低于它转人工。见 [`DEFAULT_NAV_ICON_MIN_SCORE`]。
     pub nav_icon_min_score: f32,
@@ -428,14 +414,22 @@ pub struct RunnerConfig {
     pub nav_strip: RelativeRegion,
     /// 本次任务跑到哪一步。见 [`Workflow`]。
     pub workflow: Workflow,
-    /// [`Workflow::NavigateOnly`] 要点的是哪一个图标。
-    pub nav_target: NavTarget,
-    /// **聊天历史**视图那个导航图标的模板。
+    /// 本次要点的那一个导航图标**叫什么**——面向操作者的名字，只进日志与失败信息。
     ///
-    /// 与 [`Self::nav_icon_templates`]（联系人图标）分开：两个图标长得不一样，
-    /// 混成一个列表会让"用错了哪一组"退化成一次分数不高的匹配，
-    /// 而不是一个能一眼看出来的配置错误。
-    pub history_icon_templates: Vec<IconTemplate>,
+    /// 与 [`Self::nav_icon_templates`] 是同一件事的两个面（那边是像素，这边是名字），
+    /// 由装配期**一起**填。失败信息里说"没找到「通讯录」"比说"没找到图标"有用得多：
+    /// 图标库里通常有四五张图标，不点名等于让人自己猜是哪一个出的问题。
+    ///
+    /// ## 为什么核心层不自己决定"点哪个图标"
+    ///
+    /// 因为来源有两个，而且分属不同的东西：
+    ///
+    /// - 「只做导航」：点**本次请求**里选的那个图标（运行参数，不落配置）；
+    /// - 查找之前先切视图：点**配置**里那组"联系人视图"图标（这台机器上的固定事实）。
+    ///
+    /// 两者在装配期就已经收敛成"要点这一个图标"了，核心层不需要、也不该
+    /// 知道这个决定是从哪儿来的——判断留两处，迟早会不一致。
+    pub nav_target_label: String,
     /// 位置先验的分数容差，`0` = 关掉先验。见 [`IconPrior`]。
     ///
     /// 导航栏是一列纵向排列、彼此长得很像的图标，逐张模板取最高分时偶尔会出现
@@ -500,8 +494,9 @@ impl Default for RunnerConfig {
             // 默认走**搜索式**：它是操作者当下要的那条路，也是不依赖
             // "列表里滚得到人"的那条路。列表扫描式仍然可用，改这一项即可。
             workflow: Workflow::SearchContact,
-            nav_target: NavTarget::Contact,
-            history_icon_templates: Vec::new(),
+            // 空串 = 还没有人指定过。装配期一定会覆盖它（导航要么不做，
+            // 要么就是带着一个明确的名字进来的），所以留空不是"缺省点某个图标"。
+            nav_target_label: String::new(),
             icon_prior_score_tolerance: DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
             nav_bar: None,
             // 下面这些新增区域**没有默认值**：它们对应的界面元素在哪儿，
@@ -1153,15 +1148,16 @@ impl<'a> Run<'a> {
         // 混在完整流程里时，点错图标的症状会表现为"找不到联系人"，
         // 而排查方向会一路偏向 OCR。
         if workflow == Workflow::NavigateOnly {
-            let nav_target = self.cfg().nav_target;
+            // 点的是哪一个图标，装配期已经定好了（见 `RunnerConfig::nav_target_label`）。
+            let label = self.cfg().nav_target_label.clone();
             self.advance(
                 TaskState::NavigatingToView,
-                Some(format!("目标：{}图标", nav_target.describe())),
+                Some(format!("目标：{label}图标")),
             )?;
-            self.navigate_to_view(nav_target)?;
+            self.navigate_to_view()?;
             self.advance(
                 TaskState::Navigated,
-                Some(format!("已找到并点击「{}」图标", nav_target.describe())),
+                Some(format!("已找到并点击「{label}」图标")),
             )?;
             return Ok(());
         }
@@ -1172,7 +1168,7 @@ impl<'a> Run<'a> {
         // 模板匹配。它必须在查找之前——查找假定"现在看的就是目标视图"。
         if self.cfg().navigate_before_search {
             self.advance(TaskState::NavigatingToView, None)?;
-            self.navigate_to_view(NavTarget::Contact)?;
+            self.navigate_to_view()?;
         }
 
         // ── 查找联系人 ──────────────────────────────────────────────

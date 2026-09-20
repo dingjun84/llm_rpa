@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
 
-import { workflowRequirements } from "../api";
+import { listIcons, workflowRequirements } from "../api";
+import { normalizeName } from "../iconNames";
 import {
-  NAV_TARGET_LABELS,
   SCENARIO_LABELS,
   WORKFLOW_LABELS,
   type DemoScenario,
-  type NavTarget,
+  type IconEntry,
   type RunChoice,
   type RuntimeConfig,
   type RuntimeInfo,
@@ -128,6 +128,59 @@ export function RunChoiceFields({
 
   const missingMarks = requirement?.required.filter((item) => !item.marked) ?? [];
 
+  /**
+   * 图标库里的图标（**一级目录名 + 它底下的全部图**）。
+   *
+   * ## 为什么这一组要读图标库
+   *
+   * 「要点哪一个图标」的答案**只在图标库里**：`data/icons/` 下的目录名
+   * （发现 / 收藏夹 / 聊天历史 / 通讯录…）。早先这里是一份写死的两项清单
+   * （「联系人图标」「聊天历史图标」），而操作者手里有四五个图标——
+   * 于是**选不出来也对不上**：想测「收藏夹」，下拉里根本没有它。
+   *
+   * 读的是**已保存的图标库目录**，与「图标库」页的列表同一个命令。
+   * 切页签会重新挂载本组件，所以刚在「图标库」页存下的图标，切回来就能看到。
+   *
+   * `null` = 还没读回来（此时下拉显示"正在读取"），`[]` = 读到了但是空的。
+   * 两者必须分开：把"还没读到"显示成"一个图标都没有"，会让人跑去图标库页白看一趟。
+   */
+  const [icons, setIcons] = useState<IconEntry[] | null>(null);
+  const [iconError, setIconError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const list = await listIcons();
+        if (!cancelled) setIcons(list);
+      } catch (err) {
+        // 读不到就**当作空**并把原因说出来，**不要**退回一份写死的清单：
+        // 那会让人以为图标库里真有那些图标，然后按着它去选。
+        if (!cancelled) {
+          setIcons([]);
+          setIconError(String(err));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** 本次要点的那一个图标（图标库里的目录名）。空串 = 还没选。 */
+  const chosenIcon = runChoice?.nav_target ?? "";
+  /**
+   * 选中的那个名字**还在不在**图标库里（被删了、或者图标库目录换了）。
+   *
+   * 不在的话原样把它显示出来并标一句，**绝不自动改选**：悄悄换成别的图标，
+   * 等于把"配置坏了"变成"点错了地方"——后者要难查得多。
+   */
+  const chosenMissing =
+    chosenIcon !== "" &&
+    icons !== null &&
+    !icons.some((entry) => normalizeName(entry.name) === normalizeName(chosenIcon));
+  const chosen = icons?.find((entry) => normalizeName(entry.name) === normalizeName(chosenIcon));
+
   return (
     <>
       {/* ★★ 它绑的是 `runChoice`（**运行参数**），不是 `draft`（配置草稿）：
@@ -213,30 +266,79 @@ export function RunChoiceFields({
       </label>
 
       {activeWorkflow === "navigate_only" && (
-        <label className="field">
-          <span className="field-label">要点哪一个图标</span>
-          <select
-            value={runChoice?.nav_target ?? ""}
-            disabled={!runChoice}
-            onChange={(event) =>
-              onPatchRunChoice({ nav_target: event.target.value as NavTarget })
-            }
-          >
-            {runChoice === null && <option value="">（正在读取运行配置…）</option>}
-            {(Object.keys(NAV_TARGET_LABELS) as NavTarget[]).map((target) => (
-              <option key={target} value={target}>
-                {NAV_TARGET_LABELS[target]}
-              </option>
-            ))}
-          </select>
-          <span className="field-hint">
-            两个图标各有各的模板组，在「图标库」页分别勾。这一项
-            <strong>同样只对本次任务有效</strong>。
-            这一条工作流<strong>不查找任何人</strong>，只用来看图标匹配准不准——
-            混在完整流程里时，点错图标的症状会表现为「找不到联系人」，
-            排查方向会一路偏向 OCR。
-          </span>
-        </label>
+        <>
+          <label className="field">
+            <span className="field-label">要点哪一个图标</span>
+            <select
+              value={chosenIcon}
+              disabled={!runChoice}
+              onChange={(event) => onPatchRunChoice({ nav_target: event.target.value })}
+            >
+              {runChoice === null && <option value="">（正在读取运行配置…）</option>}
+              {runChoice !== null && icons === null && (
+                <option value="">（正在读取图标库…）</option>
+              )}
+              {runChoice !== null && icons !== null && (
+                <>
+                  {chosenIcon === "" && <option value="">（还没选）</option>}
+                  {/* 被删掉 / 换过图标库目录的那个名字：原样列出来并说明，
+                      而不是把它悄悄抹掉——抹掉之后下拉会自动落到第一项，
+                      看起来像"已经选好了"。 */}
+                  {chosenMissing && (
+                    <option value={chosenIcon}>{chosenIcon}（图标库里已没有这个目录）</option>
+                  )}
+                  {icons.length === 0 && !chosenMissing && (
+                    <option value="">（图标库里还没有图标）</option>
+                  )}
+                  {icons.map((entry) => (
+                    <option key={entry.name} value={entry.name} disabled={!entry.usable}>
+                      {entry.name}（{entry.variants.length} 张图）
+                      {entry.usable ? "" : "　⚠ 有图读不出来"}
+                    </option>
+                  ))}
+                </>
+              )}
+            </select>
+            <span className="field-hint">
+              下拉里列的是<strong>图标库里的图标</strong>——<code>data/icons/</code> 下的一级目录，
+              就是「图标库」页列表里的那几行。选中一个，程序就拿<strong>那个目录下的全部图</strong>
+              一起参与匹配、取最高分：它们本来就是同一个图标的选中 / 未选中 / 带气泡等
+              不同状态，不该被当成不同图标比高低。
+              <br />
+              ⚠️ 列表读的是<strong>已保存的</strong>图标库目录（与「图标库」页一致）——
+              刚存下新图标、或刚改了「图标库目录」，要切到「图标库」页看一眼、
+              必要时点「保存配置」，回到这里才会出现。
+              <br />
+              这一项<strong>同样只对本次任务有效</strong>，不用保存。
+              这一条工作流<strong>不查找任何人</strong>，只用来看图标匹配准不准——
+              混在完整流程里时，点错图标的症状会表现为「找不到联系人」，
+              排查方向会一路偏向 OCR。
+            </span>
+          </label>
+
+          {icons !== null && icons.length === 0 && (
+            <p className="notice notice-warn">
+              图标库里<strong>一个图标都没有</strong>
+              {iconError ? `（读目录时出错：${iconError}）` : ""}。
+              先到「图标库」页截一张窗口画面、框住那个图标、起个名字存下来，
+              这里才有得选。
+            </p>
+          )}
+          {chosenMissing && (
+            <p className="notice notice-warn">
+              选中的「{chosenIcon}」<strong>已经不在图标库里了</strong>
+              ——它被删掉了，或者图标库目录换了。这样点「开始任务」会在装配期被直接拒绝。
+              到「图标库」页确认一下，或者在上面重新选一个。
+            </p>
+          )}
+          {chosen !== undefined && !chosen.usable && (
+            <p className="notice notice-warn">
+              「{chosen.name}」底下<strong>有图读不出来</strong>（不是 PNG、或者文件损坏）。
+              模板少一张的后果是"图标换个状态就认不出来"，所以这一项照样会在装配期被拒绝。
+              到「图标库」页把坏的那张删掉、重新截一张。
+            </p>
+          )}
+        </>
       )}
 
       {/* 这条工作流还缺哪几块标定。判据在后端，这里只渲染它算出来的结果——

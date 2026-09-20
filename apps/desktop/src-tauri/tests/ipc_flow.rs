@@ -99,7 +99,7 @@ fn run_choice_of(config: &RuntimeConfig) -> serde_json::Value {
     json!({
         "mode": serde_json::to_value(config.mode).expect("序列化模式失败"),
         "workflow": serde_json::to_value(config.workflow).expect("序列化工作流失败"),
-        "nav_target": serde_json::to_value(config.nav_target).expect("序列化导航目标失败"),
+        "nav_target": serde_json::to_value(config.nav_target.clone()).expect("序列化导航目标失败"),
     })
 }
 
@@ -1466,7 +1466,9 @@ fn start_task_follows_the_request_not_the_saved_config() {
             "run_choice": {
                 "mode": "dry_run",
                 "workflow": "search_contact",
-                "nav_target": "contact",
+                // 这条路不导航，所以这一项没有意义。留空串而不是随便写个名字：
+                // 写个像"选好了"的值，会让人以为它真的参与了什么判断。
+                "nav_target": "",
             },
         } }),
     );
@@ -1514,7 +1516,7 @@ fn start_task_takes_the_mode_from_the_request_not_the_saved_config() {
             "run_choice": {
                 "mode": "live",
                 "workflow": "scroll_list_contact",
-                "nav_target": "contact",
+                "nav_target": "",
             },
         } }),
     );
@@ -1522,6 +1524,49 @@ fn start_task_takes_the_mode_from_the_request_not_the_saved_config() {
         message.contains("记录窗口尺寸"),
         "应当按**请求里**的模式报错：{message}"
     );
+}
+
+/// ★ 回归（端到端）：「只做导航」点的图标由**图标库目录名**指定，不再是写死的枚举。
+///
+/// 这条路以前是"两个写死的目标（联系人 / 聊天历史）各配一组模板"，于是图标库里
+/// 四五个图标在下拉里根本选不出来——想测「收藏夹」都没得选。改成"从图标库选一个名字"
+/// 之后，这条链路有三处必须对齐：**请求里的字段名**（写错会被静默忽略）、
+/// **装配期拿它去图标库查目录**、以及**查不到时要拒**。
+///
+/// 走完整的 IPC 反序列化，正是为了钉住第一处：只在装配层测的话，
+/// 字段名写错照样全绿，而线上表现是"选了一个图标、跑起来却是另一个"。
+#[test]
+fn start_task_navigate_only_takes_the_icon_name_from_the_request() {
+    let harness = Harness::new("navigate-only-icon-name", DemoScenario::Happy);
+    let icons_dir = runtime_info(&harness).icons_dir;
+    put_icon(&icons_dir, "收藏夹", 2);
+    put_icon(&icons_dir, "通讯录", 1);
+
+    let choice = |nav_target: &str| {
+        json!({ "mode": "dry_run", "workflow": "navigate_only", "nav_target": nav_target })
+    };
+    let request = |nav_target: &str| {
+        json!({ "request": {
+            "external_contact_name": "张三",
+            "text": "你好",
+            "run_choice": choice(nav_target),
+        } })
+    };
+
+    // 选「收藏夹」⇒ 装配通过。「只做导航」不需要任何标定区域（它连人都不找），
+    // 需要的只有"这个名字能在图标库里展开出图"。
+    let id: String = harness.ok("start_task", request("收藏夹"));
+    assert!(!id.is_empty());
+
+    // 名字在图标库里没有 ⇒ 装配期拒绝，而且报错里要有**那个名字**：
+    // 图标库里通常有四五个图标，不点名等于让人自己猜该去改哪一个。
+    let message = harness.err("start_task", request("根本没有这个图标"));
+    assert!(message.contains("根本没有这个图标"), "{message}");
+
+    // 一个都没选 ⇒ 也拒绝。**不兜底**挑一个：那会变成"点到了别的地方"，
+    // 而任务照常跑完，看不出任何异常。
+    let message = harness.err("start_task", request(""));
+    assert!(message.contains("要指定点哪一个图标"), "{message}");
 }
 
 /// 靶标文字留空 ⇒ 装配期拒绝。
@@ -1733,5 +1778,21 @@ fn a_circle_trace_comes_back_self_consistent() {
         trace.speed_px_per_sec > 0.0,
         "速度必须是正数，实得 {}",
         trace.speed_px_per_sec
+    );
+
+    // ★ **实测**终点：`end` 是走完之后重新读的光标位置，不是算出来的那个终点。
+    // 走对了的话它到圆心的距离 ≈ 半径（终点在圆上，且**不在起点**——
+    // 起点也在圆上，所以"离圆心 ≈ 半径"本身证明不了终点离开了起点；
+    // 真正证明它动了的是"实测值"这件事本身：轨迹没生效时这个数会接近 0）。
+    let gap = trace.end_distance_px;
+    assert!(
+        (gap - trace.radius).abs() <= trace.radius / 10,
+        "实测终点离圆心 {gap} 像素，而半径是 {} —— 轨迹可能没走完，或者整段没生效",
+        trace.radius
+    );
+    assert_ne!(
+        trace.end,
+        [trace.center[0] + trace.radius, trace.center[1]],
+        "终点落回了圆的起点：那就分不出「走过」和「根本没动」了"
     );
 }

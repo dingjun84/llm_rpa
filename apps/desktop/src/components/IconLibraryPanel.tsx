@@ -173,13 +173,12 @@ export function IconLibraryPanel({
   }, [preview]);
 
   const configuredNames = draft.nav_icon_templates;
-  const historyNames = draft.history_icon_templates;
   const libraryNames = useMemo(
     () => new Set(entries.map((entry) => normalizeName(entry.name))),
     [entries],
   );
   /** 配置里引用了、但图标库里已经没有的名字（被删了，或者被手工改过配置）。 */
-  const dangling = [...configuredNames, ...historyNames].filter(
+  const dangling = configuredNames.filter(
     (name) => name.trim() !== "" && !libraryNames.has(normalizeName(name)),
   );
   /** 输入框里那个名字是不是**已经存在**：决定保存按钮是"新建"还是"补一张"。 */
@@ -294,19 +293,22 @@ export function IconLibraryPanel({
   };
 
   /**
-   * 把一个图标勾进 / 摘出某一组导航模板。
+   * 把一个图标勾进 / 摘出「联系人导航」那一组。
    *
-   * ## 为什么是**两组**而不是一组
+   * ## 这一组是**配置**，不是"本次要点哪个图标"
    *
-   * 联系人图标与聊天历史图标长得不一样，模板不能通用。混成一个列表时，
-   * 「用错了哪一组」不会报错——只会拿聊天历史的模板去匹配联系人图标，
-   * 然后以一次分数不高的匹配转人工。分开之后，配错的那一组是**空的**，
-   * 装配期就能直接拒绝并说清是哪一组。
+   * 它回答的是"这台机器上，联系人视图是哪个图标"——查找式任务在开始之前
+   * 会先点它一下把视图切过去。而"这一次要点哪一个"是**运行参数**，
+   * 在「任务」页的「要点哪一个图标」里选，那儿列的是图标库本身。
+   *
+   * 两者混起来过：那个下拉曾经只有两个写死的选项，其中一个（聊天历史）
+   * 只服务诊断路线，于是图标库里四五个图标在下拉里选不出来。现在
+   * 诊断路线直接从图标库选，这一组就只剩上面这一个用途。
    */
-  const toggleUse = (group: "nav_icon_templates" | "history_icon_templates", entry: IconEntry, on: boolean) => {
+  const toggleUse = (entry: IconEntry, on: boolean) => {
     const key = normalizeName(entry.name);
-    const rest = draft[group].filter((name) => normalizeName(name) !== key);
-    onPatch({ [group]: on ? [...rest, entry.name] : rest } as Partial<RuntimeConfig>);
+    const rest = draft.nav_icon_templates.filter((name) => normalizeName(name) !== key);
+    onPatch({ nav_icon_templates: on ? [...rest, entry.name] : rest });
   };
 
   /** 删掉一整组（含全部变体）。 */
@@ -318,23 +320,18 @@ export function IconLibraryPanel({
       await deleteIcon(entry.name);
       // 名字没了，配置里那一条就是死的——留着它，任务装配时必然报
       // 「图标库里没有这个图标」。顺手一起摘掉，并在提示里说明白。
-      // **两组都要摘**：只摘一组的话，另一组里会留下一个死名字，
-      // 而症状是"另一条工作流一跑就在装配期报错"，看起来与这次删除无关。
       const key = normalizeName(entry.name);
-      const stillUsed =
-        configuredNames.some((name) => normalizeName(name) === key) ||
-        historyNames.some((name) => normalizeName(name) === key);
+      const stillUsed = configuredNames.some((name) => normalizeName(name) === key);
       if (stillUsed) {
-        const strip = (names: string[]) =>
-          names.filter((name) => normalizeName(name) !== key);
         onPatch({
-          nav_icon_templates: strip(configuredNames),
-          history_icon_templates: strip(historyNames),
+          nav_icon_templates: configuredNames.filter(
+            (name) => normalizeName(name) !== key,
+          ),
         });
       }
       setNotice(
         `已删除「${entry.name}」${count > 1 ? `（连带 ${count} 张图）` : ""}` +
-          (stillUsed ? "，并把它从两组导航模板里都摘掉了（记得点「保存配置」）。" : "。"),
+          (stillUsed ? "，并把它从导航模板里摘掉了（记得点「保存配置」）。" : "。"),
       );
       await refresh();
     } catch (err) {
@@ -422,9 +419,9 @@ export function IconLibraryPanel({
         这件事只能靠<strong>模板匹配</strong>：拿一张图标的小图，在画面里找它最像的位置。
         <br />
         这一页就是造那张小图的地方：<strong>截一张窗口画面 → 在图上框住图标 → 起个名字存下来</strong>。
-        存好之后可以立刻「定位并点击」试一下，也可以勾上「用于联系人导航」或
-        「用于聊天历史导航」，让任务在查找之前先切视图（「只做导航」那条工作流
-        则一定要勾——它除了点图标什么都不做）。
+        存好之后可以立刻「定位并点击」试一下。要让查找式任务在开始前先切到联系人视图，
+        勾上「用于联系人导航」；而「只做导航」那条工作流是<strong>在「任务」页
+        直接从这个列表里选一个</strong>（它除了点图标什么都不做，所以不受这个勾选框约束）。
         <br />
         <strong>一个名字可以存多张图</strong>：同一个图标在选中 / 未选中 / 带气泡提醒 /
         气泡里数字不一样时长得都不一样，而它们指的是同一个图标。名字填一样的再存一次就是
@@ -632,7 +629,6 @@ export function IconLibraryPanel({
         <IconList
           entries={entries}
           configuredNames={configuredNames}
-          historyNames={historyNames}
           dangling={dangling}
           disabled={disabled}
           windowReady={windowReady}
@@ -649,16 +645,12 @@ export function IconLibraryPanel({
           <button
             type="button"
             disabled={
-              disabled ||
-              probing !== null ||
-              (configuredNames.length === 0 && historyNames.length === 0) ||
-              !windowReady
+              disabled || probing !== null || configuredNames.length === 0 || !windowReady
             }
             onClick={() =>
               runProbe(
-                // 两组一起量：操作者点这个按钮时想知道的是"我配的这些到底行不行"，
-                // 而两组用的是同一套阈值与同一个搜索区。
-                [...configuredNames, ...historyNames],
+                // 量的是"我配的这些到底行不行"——同一套阈值、同一个搜索区。
+                configuredNames,
                 "全部已选图标",
               )
             }

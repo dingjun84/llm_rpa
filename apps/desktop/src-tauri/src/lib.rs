@@ -566,7 +566,7 @@ fn start_task<R: Runtime>(
 
     let runner = runtime::build_runner(
         &config,
-        choice,
+        &choice,
         &task,
         &state.icons_dir(),
         state.audit.clone(),
@@ -647,8 +647,10 @@ fn start_task<R: Runtime>(
             ),
         );
         if choice.workflow == Workflow::NavigateOnly {
-            // 导航式只点一个图标，而"点的是哪个"决定了该看哪一组模板。
-            append_task_log(&log_path, &format!("导航目标   : {:?}", choice.nav_target));
+            // 记的是**图标库目录名**（`data/icons/` 下一级）；空 = 界面还没选。
+            let target = choice.nav_target.trim();
+            let shown = if target.is_empty() { "（没选）" } else { target };
+            append_task_log(&log_path, &format!("导航目标   : {shown}"));
         }
         append_task_log(&log_path, &format!("窗口类名   : {}", config.window_class));
         append_task_log(&log_path, &format!("目标程序   : {:?}", config.wecom_exe));

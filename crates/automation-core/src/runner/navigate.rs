@@ -47,8 +47,11 @@ impl Run<'_> {
     /// 这些情况下 `guarded_click` 会正常返回（鼠标确实点下去了），
     /// 而视图**根本没切**。不校验的话，后面整条查找流程都作用在一个
     /// 没切换成功的界面上，失败原因会表现为"找不到联系人"——那是错的方向。
-    pub(super) fn navigate_to_view(&mut self, nav_target: NavTarget) -> Result<(), AutomationError> {
-        let (strip, min_score, panel, prior) = {
+    /// 要点的是**哪一个**图标不在这里判断：装配期已经把那个名字底下的全部图
+    /// 载进了 [`RunnerConfig::nav_icon_templates`]，这里只管拿它们去匹配。
+    /// 名字（`nav_target_label`）只用来把失败信息写清楚。
+    pub(super) fn navigate_to_view(&mut self) -> Result<(), AutomationError> {
+        let (strip, min_score, panel, prior, what) = {
             let cfg = self.cfg();
             let strip = self.resolve(cfg.nav_strip, "导航图标搜索区")?;
             (
@@ -56,9 +59,9 @@ impl Run<'_> {
                 cfg.nav_icon_min_score,
                 self.resolve(cfg.contact_panel, "联系人候选区")?,
                 self.nav_prior(strip),
+                cfg.nav_target_label.clone(),
             )
         };
-        let what = nav_target.describe();
 
         // 用**联系人候选区**当"视图变了没有"的参照物：切换成功的话，
         // 这一块的内容必然整体换掉。用它而不是整窗，是因为整窗里有闪烁的光标、
@@ -74,17 +77,17 @@ impl Run<'_> {
         // 只借用 `self.runner`（它是一个共享引用），不碰 `self` 的可变部分——
         // 否则下面 `self.evidence.push` 会和这次调用打架。
         let runner = self.runner;
-        let templates: &[IconTemplate] = match nav_target {
-            NavTarget::Contact => &runner.config().nav_icon_templates,
-            NavTarget::History => &runner.config().history_icon_templates,
-        };
+        let templates: &[IconTemplate] = &runner.config().nav_icon_templates;
         // 模板为空是**配置缺失**，不是"这个图标不在画面上"。
-        // 装配期已经拦过一道，这里再拦一道是因为 `NavigateOnly` 那条路
-        // 可能在另一个目标上跑起来——两个目标各有各的模板，漏配哪一个都不会报错。
+        //
+        // 装配期已经拦过一道，这里再拦一道是因为核心层是个库：它的调用方
+        // 不只有 `apps/desktop` 的装配期（测试、探针都直接构造 `RunnerConfig`）。
+        // 空模板会让匹配器拿到一个空列表——那会退化成"找不到图标"，
+        // 而真正的原因是**没给模板**，两者的处置方向完全不同。
         if templates.is_empty() {
             return Err(AutomationError::NeedsHumanReview(format!(
-                "没有配置「{what}」图标的模板，无法定位它。\
-                 到「图标库」页对着那个图标截一张图存下来，再到配置里把它勾上。"
+                "没有「{what}」图标的模板，无法定位它。\
+                 到「图标库」页对着那个图标截一张图存下来，再回到「任务」页选它。"
             )));
         }
         let found = runner.ports.icons.locate(

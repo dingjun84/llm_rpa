@@ -139,21 +139,69 @@ pub struct CircleTrace {
     pub center: (i32, i32),
     /// 半径（像素）。
     pub radius: i32,
-    /// 圆周被切成了多少步。
+    /// 轨迹被切成了多少步（含多走的那一段）。
     pub steps: u32,
-    /// 实际走完一圈用的时长。
+    /// 实际走完整条轨迹用的时长。
     pub duration: Duration,
+    /// 走完之后**实测**的光标位置（重新读一次，不是算出来的那个终点）。
+    ///
+    /// ## 为什么要实测
+    ///
+    /// "命令返回了"和"光标真的动了"是两件事。`SendInput` 的返回值只说明
+    /// 系统接受了事件，不说明它落到哪儿了：坐标可能被夹到屏幕内、可能被前台
+    /// 锁定吞掉、也可能因为别的原因整段不生效。只报"我让它走到哪儿"的话，
+    /// 这种情况下界面会显示一个**看起来一切正常**的结果，而操作者眼里光标纹丝没动——
+    /// 两边对不上，而且谁都不知道该信哪边。
+    ///
+    /// 读一次真实位置，这个矛盾就消失了：见 [`Self::end_distance_px`]。
+    pub end: (i32, i32),
 }
 
-/// 圆周上均匀分布的 `steps` 个点（从正右方开始，屏幕坐标系里顺时针走）。
+impl CircleTrace {
+    /// 实测终点到**圆心**的距离（像素）。
+    ///
+    /// ★ 这是"光标到底动没动"的唯一**实测**判据：走对了的话它 ≈ [`Self::radius`]。
+    /// 接近 0 就意味着整段轨迹没有生效（光标还在原地），
+    /// 而那正是"按钮正常返回、屏幕上什么都没发生"那种情况。
+    pub fn end_distance_px(&self) -> i32 {
+        let dx = (self.end.0 - self.center.0) as f64;
+        let dy = (self.end.1 - self.center.1) as f64;
+        (dx * dx + dy * dy).sqrt().round() as i32
+    }
+}
+
+/// 走满一圈之后**再多走多少圈**才停下来。
+///
+/// ## 为什么不能停在起点上
+///
+/// 闭合的一圈，终点必然落回起点。而这条功能的**唯一用途**就是让人确认
+/// "光标真的按轨迹走了"——停在起点上的话，事后看光标位置与"它根本没动"
+/// 没法区分（半径不大时尤其分不出来，两个位置挨得很近）。
+///
+/// 多走 1/4 圈之后，终点与起点差 90°：**位置本身就成了一句可读的结论**。
+/// 取 1/4 而不是别的数，是因为 90° 在屏幕上一眼能看出不是同一个点，
+/// 又不至于让"走过一整圈"这件事看起来没走完。
+const CIRCLE_EXTRA_TURNS: f64 = 0.25;
+
+/// 圆周上均匀分布的 `steps` 个点，从正右方起、按 `turns` 圈扫过
+/// （屏幕坐标系里顺时针）。`turns = 1.0` 就是**首尾闭合**的一圈。
 ///
 /// 单独抽出来是因为它是**纯计算**：不碰 Win32、不产生任何输入，可以直接用用例
 /// 钉住"每个点都落在圆周上""首尾闭合"这两件事。而轨迹里最容易错的恰恰是这一步
 /// （半径当成直径、角度少走一圈、角度步长算错），它错了只会表现为"圆画得不对"，
 /// 从 `SendInput` 的返回值上**完全看不出来**。
 ///
+/// `turns` 做成参数而不是写死 `1.0`，是因为调用方要多走一段（见
+/// [`CIRCLE_EXTRA_TURNS`]）。点仍然是**沿弧长均匀**的：多走的那一段与整圈
+/// 用同一个步长，所以轨迹看上去仍是匀速的，不会在收尾处突然变慢或变快。
+///
 /// `steps` 为 0 时返回空表（除零会算出 NaN，而 NaN 转 `i32` 是未定义行为）。
-pub fn circle_points(center: (i32, i32), radius: i32, steps: u32) -> Vec<(i32, i32)> {
+pub(super) fn circle_points(
+    center: (i32, i32),
+    radius: i32,
+    steps: u32,
+    turns: f64,
+) -> Vec<(i32, i32)> {
     if steps == 0 {
         return Vec::new();
     }
@@ -161,7 +209,7 @@ pub fn circle_points(center: (i32, i32), radius: i32, steps: u32) -> Vec<(i32, i
     let radius = radius as f64;
     (1..=steps)
         .map(|step| {
-            let angle = std::f64::consts::TAU * step as f64 / steps as f64;
+            let angle = std::f64::consts::TAU * turns * step as f64 / steps as f64;
             (
                 cx + (radius * angle.cos()).round() as i32,
                 cy + (radius * angle.sin()).round() as i32,
@@ -180,12 +228,17 @@ pub fn circle_points(center: (i32, i32), radius: i32, steps: u32) -> Vec<(i32, i
 ///
 /// ## 时序
 ///
-/// 与 [`move_cursor`] 同一套：总时长 = 周长 ÷ 速度，按 [`POINTER_STEP_INTERVAL`]
+/// 与 [`move_cursor`] 同一套：总时长 = 轨迹长度 ÷ 速度，按 [`POINTER_STEP_INTERVAL`]
 /// 切步。**不做缓动**——smoothstep 是给"从 A 点到 B 点"这种有始有终的动作用的；
 /// 圆周是匀速运动，逐段缓动只会让它一顿一顿的。
 ///
 /// 开始之前先按普通轨迹走到圆的起点（正右方那一点）：**不能直接跳过去**，
 /// 跳过去正是"光标凭空出现在别处"，而这条功能存在的意义就是让人看见它怎么走。
+///
+/// ## 终点**不回到起点**
+///
+/// 走满一圈之后再多走 [`CIRCLE_EXTRA_TURNS`] 圈才停。理由见那个常量：
+/// 停在起点上的话，"走过"和"根本没动"在事后看光标位置时无法区分。
 ///
 /// 只移动光标，**不点击、不输入、不抢前台**。
 pub fn move_cursor_circle(
@@ -201,16 +254,18 @@ pub fn move_cursor_circle(
     }
 
     let (cx, cy) = center;
+    // 圆的起点：正右方那一点。**不跳过去**，按普通轨迹走过去。
     move_cursor(cx + radius, cy, speed_px_per_sec)?;
 
-    let circumference = std::f64::consts::TAU * radius as f64;
-    let duration = Duration::from_secs_f64(circumference / speed_px_per_sec)
+    let turns = 1.0 + CIRCLE_EXTRA_TURNS;
+    let path = std::f64::consts::TAU * radius as f64 * turns;
+    let duration = Duration::from_secs_f64(path / speed_px_per_sec)
         .clamp(CIRCLE_MIN_DURATION, CIRCLE_MAX_DURATION);
     let steps = ((duration.as_secs_f64() / POINTER_STEP_INTERVAL.as_secs_f64()).round() as u32)
         .max(CIRCLE_MIN_STEPS);
     let step_delay = duration / steps;
 
-    let points = circle_points(center, radius, steps);
+    let points = circle_points(center, radius, steps, turns);
     let last = points.len();
     for (index, (x, y)) in points.into_iter().enumerate() {
         move_cursor_absolute(x, y)?;
@@ -220,7 +275,9 @@ pub fn move_cursor_circle(
         }
     }
 
-    Ok(CircleTrace { center, radius, steps, duration })
+    // 实测一次，而不是把算出来的终点当成结果：见 `CircleTrace::end` 的文档。
+    let end = cursor_position()?;
+    Ok(CircleTrace { center, radius, steps, duration, end })
 }
 
 /// 发一次绝对坐标的鼠标移动。

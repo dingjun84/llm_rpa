@@ -379,16 +379,13 @@ export interface RuntimeConfig {
    * 那一份，于是表现为「界面上选了 A、跑的是 B」。
    */
   workflow: Workflow;
-  /** `navigate_only` 要点哪一个图标。其余工作流不读它。**同上：只是初始值。** */
-  nav_target: NavTarget;
   /**
-   * **聊天历史**图标的模板：图标名，可以多个变体。
+   * `navigate_only` 要点哪一个图标。其余工作流不读它。**同上：只是初始值。**
    *
-   * 与 `nav_icon_templates`（联系人图标）分开：两个图标长得不一样，
-   * 混成一个列表时"用错了哪一组"会退化成一次分数不高的匹配，
-   * 而不是一个能一眼看出来的配置错误。
+   * 值是**图标库里的名字**（`data/icons/` 下的一级目录名），与 `RunChoice.nav_target`
+   * 同一个值域。空串 = 还没选过。
    */
-  history_icon_templates: string[];
+  nav_target: string;
   /**
    * 位置先验的分数容差，`0` = **关掉**先验。
    *
@@ -425,9 +422,6 @@ export interface RuntimeConfig {
 /** 工作流。见 `RunChoice.workflow`。 */
 export type Workflow = "navigate_only" | "search_contact" | "scroll_list_contact";
 
-/** 「只做导航」要点哪一个图标。 */
-export type NavTarget = "contact" | "history";
-
 /**
  * 工作流的下拉选项。
  *
@@ -439,11 +433,6 @@ export const WORKFLOW_LABELS: Record<Workflow, string> = {
   search_contact: "搜索式查找联系人（点顶部搜索框 → 从下拉里挑人 → 资料页 → 发消息）",
   scroll_list_contact: "列表扫描式查找联系人（在左侧会话列表里滚动找人）",
   navigate_only: "只做导航（找到图标并点击，不查找任何人）",
-};
-
-export const NAV_TARGET_LABELS: Record<NavTarget, string> = {
-  contact: "联系人图标",
-  history: "聊天历史图标",
 };
 
 /** 一项标定区域对某条工作流的必要性（后端算好下发）。 */
@@ -624,6 +613,22 @@ export interface CircleTraceView {
    * 回给界面是为了能**核对**，而不是靠猜。
    */
   speed_px_per_sec: number;
+  /**
+   * 走完之后**实测**的光标位置（屏幕坐标）。
+   *
+   * ★ 这条自检画完**不回起点**：走满一圈之后会再多走一小段，停在圆上的另一个
+   * 位置（与起点差 90°）。停在起点上的话，"走过一整圈"和"它根本没动"
+   * 在事后看光标位置时是分不出来的。
+   */
+  end: [number, number];
+  /**
+   * 实测终点到**圆心**的距离（像素）。
+   *
+   * 走对了的话应当 ≈ `radius`。界面把这两个数并排显示，由人一眼对比——
+   * 前端刻意**不**拿它去判"算不算动过"：那需要一个容差阈值，而阈值定在哪里
+   * 都是拍脑袋，且没有任何自动判据依赖它。
+   */
+  end_distance_px: number;
 }
 
 /** 标定时记录的窗口几何（屏幕坐标 + 显示器缩放）。 */
@@ -740,7 +745,18 @@ export interface RunChoice {
    */
   mode: RuntimeMode;
   workflow: Workflow;
-  nav_target: NavTarget;
+  /**
+   * 「只做导航」要点哪一个图标 —— **图标库里的名字**（`data/icons/` 下的一级目录名）。
+   *
+   * 只有 `workflow === "navigate_only"` 会读它。空串 = 还没选，
+   * 后端装配期会直接拒绝，不会替你挑一个。
+   *
+   * 为什么是图标库里的名字而不是写死的两个选项：图标库里通常有四五个图标
+   * （发现 / 收藏夹 / 聊天历史 / 通讯录…），写死的选项**选不出来也对不上**。
+   * 选中的那个目录下的**全部图**一起参与匹配、取最高分——它们本来就是
+   * 同一个图标的不同状态，不该被当成不同图标比高低。
+   */
+  nav_target: string;
 }
 
 export interface StartTaskRequest {

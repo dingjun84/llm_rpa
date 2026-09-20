@@ -84,7 +84,8 @@ export function CursorMotionPanel({ busy }: Props) {
 
       <p className="muted-line">
         点下面的按钮，光标会以<strong>倒计时结束时它所在的位置</strong>为圆心，
-        沿圆周匀速走满一圈。圆心和半径都会在走完之后报出来。
+        沿圆周匀速走满一圈，<strong>画完停在圆的另一个位置</strong>（不回起点）。
+        圆心、半径、以及<strong>走完之后光标实际在哪儿</strong>都会报出来。
       </p>
 
       <div className="guide-stage-actions">
@@ -110,6 +111,13 @@ export function CursorMotionPanel({ busy }: Props) {
         <br />
         ⚠️ 倒计时期间<strong>别最小化本窗口</strong>：窗口最小化时浏览器会把定时器降频，
         开始得会晚一些（晚多少不定，但一定会晚）。
+        <br />
+        画完光标<strong>不回起点</strong>：它停在圆上的另一个位置，与起点差 90°——
+        这样"位置变了"本身就是它走过一圈的证据。
+        <br />
+        「离圆心」那个数应当与<strong>半径</strong>接近（走对了就在圆上）。
+        要是它接近 0，说明整段轨迹<strong>没有生效</strong>：光标还停在原地，
+        而按钮照样会正常返回——光看返回值是发现不了的。
       </p>
 
       {error && (
@@ -131,6 +139,13 @@ export function CursorMotionPanel({ busy }: Props) {
           <dt>这一圈</dt>
           <dd>
             {result.steps} 步 / 用时 {result.duration_ms} 毫秒 · 按 {result.speed_px_per_sec} 像素每秒走的
+          </dd>
+          {/* ★ 走完之后**实测**的光标位置。上面那些都是"我让它怎么走"，
+              只有这一行是"它最后到底在哪儿"——两者对不上就说明轨迹没生效，
+              而那正是"按钮正常返回、屏幕上什么都没发生"的那种情况。 */}
+          <dt>实测终点</dt>
+          <dd className="mono">
+            ({result.end[0]}, {result.end[1]}) · 离圆心 {result.end_distance_px} 像素
           </dd>
         </dl>
       )}

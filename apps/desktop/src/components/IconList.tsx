@@ -7,8 +7,6 @@ interface Props {
   entries: IconEntry[];
   /** 配置里「用于联系人导航」那组名字（原始写法）。 */
   configuredNames: string[];
-  /** 配置里「用于聊天历史导航」那组名字（原始写法）。 */
-  historyNames: string[];
   /** 配置里引用了、但图标库里已经没有的名字（被删了，或者图标库目录被改过）。 */
   dangling: string[];
   disabled: boolean;
@@ -18,11 +16,7 @@ interface Props {
   probing: string | null;
   /** 正在点击的那一组；`null` = 没在跑。 */
   clicking: string | null;
-  onToggleUse: (
-    group: "nav_icon_templates" | "history_icon_templates",
-    entry: IconEntry,
-    on: boolean,
-  ) => void;
+  onToggleUse: (entry: IconEntry, on: boolean) => void;
   onProbe: (names: string[], label: string) => void;
   onClick: (names: string[], label: string) => void;
   onRemove: (entry: IconEntry) => void;
@@ -45,7 +39,6 @@ interface Props {
 export function IconList({
   entries,
   configuredNames,
-  historyNames,
   dangling,
   disabled,
   windowReady,
@@ -74,9 +67,6 @@ export function IconList({
         {entries.map((entry) => {
           const key = normalizeName(entry.name);
           const usedForContact = configuredNames.some(
-            (name) => normalizeName(name) === key,
-          );
-          const usedForHistory = historyNames.some(
             (name) => normalizeName(name) === key,
           );
           const broken = !entry.usable;
@@ -135,31 +125,20 @@ export function IconList({
               </ul>
 
               <div className="icon-actions">
-                {/* 两组分开勾：联系人图标与聊天历史图标长得不一样，模板不能通用。
-                    勾错一组不会报错——只会拿另一个图标的模板去匹配，然后以
-                    一次分数不高的匹配转人工。分开之后配错的那一组是空的，
-                    装配期就能直接拒绝并说清是哪一组。 */}
+                {/* 这一个勾选框回答的是**"联系人视图"是哪个图标**——
+                    查找式任务在开始之前会先点它一下把视图切过去。
+                    它是一份**配置**（这台机器上的固定事实），不是"本次要点哪个"：
+                    后者在「任务」页的「要点哪一个图标」里选，那儿列的是图标库本身。
+                    勾错了不会报错，只会拿另一个图标的模板去匹配然后转人工，
+                    所以配错的那一组是**空的**时，装配期会直接拒绝并说清是哪一组。 */}
                 <label className="field-check icon-use">
                   <input
                     type="checkbox"
                     checked={usedForContact}
                     disabled={disabled || broken}
-                    onChange={(event) =>
-                      onToggleUse("nav_icon_templates", entry, event.target.checked)
-                    }
+                    onChange={(event) => onToggleUse(entry, event.target.checked)}
                   />
                   <span>用于联系人导航</span>
-                </label>
-                <label className="field-check icon-use">
-                  <input
-                    type="checkbox"
-                    checked={usedForHistory}
-                    disabled={disabled || broken}
-                    onChange={(event) =>
-                      onToggleUse("history_icon_templates", entry, event.target.checked)
-                    }
-                  />
-                  <span>用于聊天历史导航</span>
                 </label>
                 <button
                   type="button"

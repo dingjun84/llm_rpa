@@ -2195,7 +2195,7 @@ fn navigate_only_finds_the_icon_and_stops_at_navigated() {
     let icons = Arc::new(MockIconLocator::new());
     let config = RunnerConfig {
         workflow: Workflow::NavigateOnly,
-        nav_target: automation_core::NavTarget::Contact,
+        nav_target_label: "通讯录".to_string(),
         nav_icon_templates: vec![nav_template()],
         ..list_config()
     };

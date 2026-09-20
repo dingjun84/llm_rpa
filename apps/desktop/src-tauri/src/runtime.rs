@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use automation_core::{
-    AuditSink, ContainsNameMatcher, HumanConfirmation, IconTemplate, LocalOcr,
-    NavTarget, RelativePoint, RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask,
-    StrictContactMatcher, Workflow, WorkflowRunner, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
+    AuditSink, ContainsNameMatcher, HumanConfirmation, IconTemplate, LocalOcr, RelativePoint,
+    RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask, StrictContactMatcher, Workflow,
+    WorkflowRunner, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
     DEFAULT_MIN_CONFIDENCE, DEFAULT_NAV_ICON_MIN_SCORE, DEFAULT_NAV_STRIP,
     DEFAULT_PROFILE_CHAT_ENTRY_TEXT, DEFAULT_PROFILE_SCROLL_ANCHOR, DEFAULT_REGIONS,
     DEFAULT_SCROLL_ANCHOR, DEFAULT_SEARCH_CONTACT_GROUP_LABEL,
@@ -268,19 +268,16 @@ pub struct RuntimeConfig {
     pub workflow: Workflow,
     /// 「只做导航」时要点哪一个图标（只有 [`Workflow::NavigateOnly`] 读它）。
     ///
+    /// 值是**图标库里的名字**——`data/icons/` 下的一级目录名，与
+    /// [`RunChoice::nav_target`] 同一个值域。
+    ///
     /// 与 [`Self::workflow`] 同理：这只是界面上的初始值，
     /// **本次任务要点哪个**由 [`RunChoice::nav_target`] 决定。
     ///
     /// 把"找图标 → 点它"单独拎出来跑一遍，是为了在图标匹配不准时**一眼看出来**：
     /// 混在完整流程里的话，点错图标的症状会表现为"找不到联系人"，
     /// 排查方向会一路偏向 OCR。
-    pub nav_target: NavTarget,
-    /// **聊天历史**图标的模板（**图标名**，可以多个变体）。
-    ///
-    /// 与 [`Self::nav_icon_templates`]（联系人图标）分开存：两个图标长得不一样，
-    /// 混成一个列表时，"用错了哪一组"会退化成一次分数不高的匹配，
-    /// 而不是一个能一眼看出来的配置错误。
-    pub history_icon_templates: Vec<String>,
+    pub nav_target: String,
     /// 位置先验的分数容差，`0` = **关掉**先验。
     ///
     /// 导航栏是一列纵向排列、彼此长得很像的图标，逐张模板取最高分时偶尔会出现
@@ -376,8 +373,8 @@ impl Default for RuntimeConfig {
             // 默认走**搜索式**：它不依赖"列表里滚得到人"，是操作者当下要的那条路。
             // 列表扫描式仍然完整保留（`ScrollListContact`），改这一项即可切回去。
             workflow: Workflow::SearchContact,
-            nav_target: NavTarget::Contact,
-            history_icon_templates: Vec::new(),
+            // 空串 = 还没选过。界面上会显示成「（还没选）」，选完才生效。
+            nav_target: String::new(),
             icon_prior_score_tolerance: DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
             // 30ms 的依据：比人手打字快，又给客户端的联想逻辑留出处理时间。
             // 这是**间隔**不是超时，累加起来也就每字符 30ms，不影响总时长。
@@ -455,10 +452,9 @@ impl RuntimeConfig {
                 self.nav_strip[3],
             ),
             workflow: self.workflow,
-            nav_target: self.nav_target,
-            // 与 `nav_icon_templates` 同理：载入 PNG 会失败，而本方法没有 `Result`。
-            // 由 `build_runner` 在装配期把两组模板都填上，失败就在任务登记之前报出来。
-            history_icon_templates: Vec::new(),
+            // 同上：装配期会用**本次请求**选的那个图标名覆盖它，并在那里把
+            // `nav_icon_templates` 一起填上（两者必须同时改，见核心层字段的文档）。
+            nav_target_label: self.nav_target.clone(),
             icon_prior_score_tolerance: self.icon_prior_score_tolerance,
             // 这四个区域来自「界面标定」页。**没标就是 `None`**，
             // 由装配期（真实/演练都算）按所选工作流的要求拦下。
@@ -590,8 +586,9 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
 
 /// 载入一组导航图标模板：把配置里的**图标名**展开成它底下的**全部图**，再逐张读进来。
 ///
-/// `what` 是这组模板对应的目标名（「联系人」/「聊天历史」）。**必须传**：
-/// 两个目标各有各的模板组，报错时不说清是哪一个，人只会去改错的那一组。
+/// `what` 是这组模板对应的目标名——「只做导航」传的是**图标目录名**，
+/// 切视图那条路传的是「联系人」。**必须传**：图标库里通常有四五个图标，
+/// 报错时不说清是哪一个，人只会去改错的那一个。
 ///
 /// **必须在任务登记之前调用**：图标不存在、尺寸不像图标，都要在
 /// "任务还没进列表"的时候就报出来。否则列表里会留下一条注定失败的记录，
@@ -659,7 +656,7 @@ fn required_marks(workflow: Workflow) -> &'static [&'static str] {
 ///
 /// 判据按**本次要跑的那条路**（`choice.workflow`）算，不按配置里那个默认值——
 /// 否则会出现「界面选了搜索式、后端按列表式检查」，缺的区域一个都不报。
-fn missing_marks(config: &RuntimeConfig, choice: RunChoice) -> Vec<String> {
+fn missing_marks(config: &RuntimeConfig, choice: &RunChoice) -> Vec<String> {
     required_marks(choice.workflow)
         .iter()
         .filter(|key| mark_region(config, key).is_none())
@@ -737,7 +734,9 @@ pub fn workflow_requirements(config: &RuntimeConfig) -> Vec<WorkflowRequirement>
 ///
 /// 做成运行参数之后：**界面选的与真正跑的是同一个值**，而且不写进 `config.json`——
 /// 换一次任务就选一次，不留痕，也不需要为了跑一次先去点「保存配置」。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// 注意**没有 `Copy`**：`nav_target` 是图标库目录名（`String`），不再是枚举。
+// 加上 `Copy` 会得到一个指向别处内存的浅拷贝——那是本项目最不想看到的一类错。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunChoice {
     /// 这一次跑**演练还是真实**。
     ///
@@ -777,7 +776,23 @@ pub struct RunChoice {
     pub workflow: Workflow,
     /// 「只做导航」时要点哪一个图标——**本次任务**要点的那个
     /// （只有 [`Workflow::NavigateOnly`] 读它）。
-    pub nav_target: NavTarget,
+    ///
+    /// ## 为什么是**图标库里的名字**，不是一个写死的枚举
+    ///
+    /// 它要回答的问题是"点哪个图标"，而这个问题的答案**只在图标库里**：
+    /// `data/icons/` 下的一级目录名（发现 / 收藏夹 / 聊天历史 / 通讯录…）。
+    ///
+    /// 早先这里是一个只有两个变体的枚举（`Contact` / `History`），于是界面上
+    /// 只能显示「联系人图标」「聊天历史图标」两个抽象名字，而操作者手里的图标
+    /// 有四五个——**选不出来，也对不上**。名字换成图标库里的目录名之后，
+    /// 界面上列的就是他实际存的那几个，选哪个就点哪个。
+    ///
+    /// 一个目录下的**全部图**一起参与匹配、取最高分：它们本来就是同一个图标的
+    /// 不同状态（选中 / 未选中 / 带气泡），不该被当成不同图标比高低。
+    ///
+    /// 空串 = 还没选。装配期会直接拒绝，而不是猜一个默认图标——
+    /// 猜错的表现是"点了一个别的图标，任务照常往下跑"。
+    pub nav_target: String,
 }
 
 impl Default for RunChoice {
@@ -787,7 +802,7 @@ impl Default for RunChoice {
             // "请求里没带"（不可能，字段必填）时用到。
             mode: RuntimeMode::DryRun,
             workflow: Workflow::SearchContact,
-            nav_target: NavTarget::Contact,
+            nav_target: String::new(),
         }
     }
 }
@@ -806,7 +821,7 @@ impl Default for RunChoice {
 /// 因此"人工确认"不是被跳过的环节，而是真的会阻塞等待操作者。
 pub fn build_runner(
     config: &RuntimeConfig,
-    choice: RunChoice,
+    choice: &RunChoice,
     task: &SendTask,
     icons_dir: &std::path::Path,
     audit: Arc<dyn AuditSink>,
@@ -916,28 +931,30 @@ pub fn build_runner(
     // 所以 `to_runner_config()` 出来的 `platform_label` / `calibrated_window`
     // 已经是本次的那一份。再覆盖一遍等于把判据写成两处。
     runner_config.workflow = choice.workflow;
-    runner_config.nav_target = choice.nav_target;
 
-    // ── 导航图标：这一次要跑哪几个目标 ──────────────────────────
+    // ── 导航图标：这一次要点哪一个 ──────────────────────────────
     //
     // 「只做导航」那条路**导航就是任务本身**，所以不受 `navigate_before_search`
     // 这个开关约束——那个开关说的是"查找之前要不要先切一次视图"。
     // 另外两条路只会在开关打开时切一次，而且固定切到联系人视图
     // （列表扫描式扫的就是联系人列表；搜索式的搜索框也在主界面上）。
-    let nav_targets: Vec<NavTarget> = match choice.workflow {
-        Workflow::NavigateOnly => vec![choice.nav_target],
-        _ if config.navigate_before_search => vec![NavTarget::Contact],
-        _ => Vec::new(),
-    };
+    let navigate_only = choice.workflow == Workflow::NavigateOnly;
+    let need_nav = navigate_only || config.navigate_before_search;
 
-    // 「先点导航图标切视图」这一组的校验与模板载入。
+    // 模板从哪儿来，两种来源**都在这里收敛成"要点这一个图标"**：
+    //
+    // - 「只做导航」：本次请求选的那个图标名（运行参数）；
+    // - 另外两条路：配置里那组"联系人视图"图标（这台机器上的固定事实）。
+    //
+    // 核心层只认后者收敛出来的结果，所以下面两条分支里
+    // `nav_target_label` 与 `nav_icon_templates` **必须一起改**——
+    // 只改一个，日志里说的名字和实际匹配的模板就对不上了。
     //
     // 和上面几条同一个道理：**全部放在装配期**。区域比例非法、模板文件读不出来、
     // 该配模板却没配——这些都会让任务注定失败，而装配失败**不会在任务列表里
     // 留下记录**，装配成功才会登记。所以能提前判的一律提前判。
-    if !nav_targets.is_empty() {
-        // 搜索区与阈值两个目标共用，所以只验一次——按目标各验一遍的话，
-        // 同一个错误会在第一个目标上报出来，第二个目标的那份配置就没人看了。
+    if need_nav {
+        // 搜索区与阈值两处共用，所以只验一次。
         let strip = runner_config.nav_strip;
         if let Err(err) = strip.validate() {
             return Err(format!(
@@ -962,16 +979,27 @@ pub fn build_runner(
             ));
         }
 
-        for target in &nav_targets {
-            let (names, what) = match target {
-                NavTarget::Contact => (&config.nav_icon_templates, NavTarget::Contact),
-                NavTarget::History => (&config.history_icon_templates, NavTarget::History),
-            };
-            let templates = load_nav_icon_templates(icons_dir, names, what.describe())?;
-            match target {
-                NavTarget::Contact => runner_config.nav_icon_templates = templates,
-                NavTarget::History => runner_config.history_icon_templates = templates,
+        if navigate_only {
+            let name = choice.nav_target.trim();
+            if name.is_empty() {
+                // 空 = 界面上还没选。**不兜底**：随便挑一个图标去点，
+                // 症状会是"任务照常跑完，只是点到了别的地方"。
+                return Err(
+                    "「只做导航」要指定点哪一个图标，而现在还没选。\
+                     到「图标库」页把那个图标截下来存好，再回到「任务」页的\
+                     「要点哪一个图标」里选它。"
+                        .to_string(),
+                );
             }
+            runner_config.nav_target_label = name.to_string();
+            runner_config.nav_icon_templates =
+                load_nav_icon_templates(icons_dir, &[name.to_string()], name)?;
+        } else {
+            // 切的是"联系人视图"。这个名字是**这一组配置的含义**，
+            // 不是某个具体图标的目录名——组里可能有好几个名字（不同版本各存一份）。
+            runner_config.nav_target_label = "联系人".to_string();
+            runner_config.nav_icon_templates =
+                load_nav_icon_templates(icons_dir, &config.nav_icon_templates, "联系人")?;
         }
     }
 

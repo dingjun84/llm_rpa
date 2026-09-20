@@ -53,7 +53,7 @@ fn run_choice_from(config: &RuntimeConfig) -> RunChoice {
     RunChoice {
         mode: config.mode,
         workflow: config.workflow,
-        nav_target: config.nav_target,
+        nav_target: config.nav_target.clone(),
     }
 }
 
@@ -318,7 +318,7 @@ fn live_run_against_a_stand_in_window() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
-        run_choice_from(&config),
+        &run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
@@ -387,7 +387,7 @@ fn live_run_refuses_to_send_when_the_contact_is_absent() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
-        run_choice_from(&config),
+        &run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,

@@ -143,12 +143,12 @@
 
 | 文件 | 基线 | 现在 | |
 | --- | --- | --- | --- |
-| `apps/desktop/src-tauri/src/lib.rs` | 1903 | 1900 | ✅ **仍低于基线**。T23 收尾时一度涨到 1922（**破了基线**），随后把 `ModeNotices` 搬进 `runtime/mode.rs` 压回来了 |
+| `apps/desktop/src-tauri/src/lib.rs` | 1903 | 1902 | ✅ **仍低于基线**。T23 收尾时一度涨到 1922（**破了基线**），随后把 `ModeNotices` 搬进 `runtime/mode.rs` 压回来了。⚠️ T26 加日志时又顶到 1903，靠把注释压成一行才回到 1902 —— **下次再动 `lib.rs` 先想好从哪儿减** |
 | `crates/automation-core/src/runner/mod.rs` | 1395 | 1224 | ✅ 拆成 5 个文件 |
-| `apps/desktop/src-tauri/src/runtime.rs` | 1039 | 984 | ✅ **仍低于基线**。T23 收尾时一度涨到 1049（**破了基线**），随后把 `RuntimeMode` + `DemoScenario` + `ModeNotices` 整段搬成 `runtime/mode.rs`(127) 压回来了。见 `docs/todo.md` T17 |
+| `apps/desktop/src-tauri/src/runtime.rs` | 1039 | 1012 | ✅ **仍低于基线**。T23 收尾时一度涨到 1049（**破了基线**），随后把 `RuntimeMode` + `DemoScenario` + `ModeNotices` 整段搬成 `runtime/mode.rs`(127) 压回来了；T26 又长回 1012，仍在基线以下。见 `docs/todo.md` T17 |
 | `crates/vision/src/template.rs` | 881 | 667 | ✅ 减 |
 | `crates/platform-windows/src/winapi.rs` | 862 | 796 | ✅ **已拆完**（1215 → 985 → **796**）。两刀：光标轨迹 → `winapi/cursor.rs`(267)、输入原语 → `winapi/input.rs`(228)。见 `docs/todo.md` T17 |
-| `apps/desktop/src/components/IconLibraryPanel.tsx` | 983 | 808 | ✅ **已拆**（1064 → 808）。列表搬成 `IconList.tsx`(225)，两段结果预览搬成 `NavResultSections.tsx`(140)。见 `docs/todo.md` T17 |
+| `apps/desktop/src/components/IconLibraryPanel.tsx` | 983 | 800 | ✅ **已拆**（1064 → 808 → 800）。列表搬成 `IconList.tsx`(204)，两段结果预览搬成 `NavResultSections.tsx`(140)。T26 删掉「用于聊天历史导航」那一组后又减了 8 行 |
 | `apps/desktop/src/components/RuntimePanel.tsx` | 596 | 288 | ✅ **已拆**（858 → 288）。按「归属」拆成四个同级组件：`RunChoiceFields`(270，运行参数) / `TargetWindowSection`(202) / `AdvancedParamsSection`(192) / `TypingTextSection`(87)。见 `docs/todo.md` T17 |
 
 ⚠️ **`lib.rs` 这次给出了一个可复用的做法**：新功能有近百行、眼看着要破基线时，
@@ -179,7 +179,7 @@ get_webview_window`）。**搬完 `wc -l` 对一眼**，别信脚本的自报数
 | `crates/vision/src/template.rs`(1059) | 667 | `template/tests.rs` 396 |
 | `crates/automation-core/src/state.rs`(532) | 261 | `state/tests.rs` 275 |
 | `apps/desktop/src-tauri/src/lib.rs`(1931) | 1894 | `src/tests.rs` 88 |
-| `apps/desktop/src-tauri/src/lib.rs`(1993) | 1896 | `src/cursor_trace.rs` 117（**不是测试**，是整段功能搬出去；见上面那条 ⚠️）|
+| `apps/desktop/src-tauri/src/lib.rs`(1993) | 1896 | `src/cursor_trace.rs` 141（**不是测试**，是整段功能搬出去；见上面那条 ⚠️）|
 
 ★ **同一条思路再来一次**（2026-09-19 第四批）：启动期落日志（`src/startup_log.rs`，165 行）
 也是**整段新功能、不是测试**。⚠️ 但它没能把 `lib.rs` 压下去——同轮又加了 `ModeNotices`

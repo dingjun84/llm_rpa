@@ -74,11 +74,11 @@ fn assemble_with_icons(
     let choice = RunChoice {
         mode: config.mode,
         workflow: config.workflow,
-        nav_target: config.nav_target,
+        nav_target: config.nav_target.clone(),
     };
     build_runner(
         config,
-        choice,
+        &choice,
         &sample_task(),
         icons_dir,
         Arc::new(MemoryAudit::new()),
@@ -549,11 +549,12 @@ fn the_run_choice_decides_the_workflow_not_the_config() {
     let choice = RunChoice {
         mode: config.mode,
         workflow: Workflow::ScrollListContact,
-        nav_target: NavTarget::Contact,
+        // 这条工作流不导航，所以这一项没有意义——填空串，别让它看起来像"选好了"。
+        nav_target: String::new(),
     };
     let runner = build_runner(
         &config,
-        choice,
+        &choice,
         &sample_task(),
         &icons,
         Arc::new(MemoryAudit::new()),
@@ -569,7 +570,9 @@ fn the_run_choice_decides_the_workflow_not_the_config() {
         Workflow::ScrollListContact,
         "运行器里那条路必须来自运行参数"
     );
-    assert_eq!(runner.config().nav_target, NavTarget::Contact);
+    // 这条路不导航，所以不该带上任何图标模板：带上了就说明有人把配置里那组
+    // "联系人视图"图标无条件塞了进来——那会在别的场合让任务先点一个不该点的图标。
+    assert!(runner.config().nav_icon_templates.is_empty());
 }
 
 /// ★ 回归用例：**模式也是运行参数**，不是配置里的那个默认值。
@@ -590,7 +593,7 @@ fn the_run_choice_decides_the_mode_not_the_config() {
     let runner_of = |config: &RuntimeConfig, choice: RunChoice| {
         build_runner(
             config,
-            choice,
+            &choice,
             &sample_task(),
             &icons,
             Arc::new(MemoryAudit::new()),
@@ -612,7 +615,7 @@ fn the_run_choice_decides_the_mode_not_the_config() {
         RunChoice {
             mode: RuntimeMode::Live,
             workflow: Workflow::ScrollListContact,
-            nav_target: NavTarget::Contact,
+            nav_target: String::new(),
         },
     ) {
         Err(err) => err,
@@ -641,7 +644,7 @@ fn the_run_choice_decides_the_mode_not_the_config() {
         RunChoice {
             mode: RuntimeMode::DryRun,
             workflow: Workflow::ScrollListContact,
-            nav_target: NavTarget::Contact,
+            nav_target: String::new(),
         },
     )
     .expect("请求是演练模式时，不该按配置里的真实模式去要求标定尺寸");
@@ -659,52 +662,58 @@ fn the_run_choice_decides_the_mode_not_the_config() {
     );
 }
 
-/// 「只做导航」需要**它自己那个目标**的模板，而不是联系人那一组。
+/// 「只做导航」点的那个图标由**图标库里的目录名**指定，目录下的全部图都要载入。
 ///
-/// 两个目标各有一组模板，混用不会报错——只会拿聊天历史的模板去匹配联系人图标，
-/// 然后转人工。所以这里把"目标 → 模板组"这条对应关系钉死。
+/// 这条路曾经是"两个写死的目标各配一组模板"，于是图标库里四五个图标在下拉里
+/// 根本选不出来（想测「收藏夹」都没得选）。现在目标就是图标库里的名字，
+/// 这里把三件事钉住：**目录下的图全都参与匹配**、**名字不存在要拒**、
+/// **一个名字都没选也要拒**（不兜底挑一个——那会变成"点到了别的地方"）。
 #[test]
-fn navigate_only_loads_the_template_group_of_its_own_target() {
+fn navigate_only_loads_every_variant_of_the_chosen_icon() {
     let icons = temp_icons_dir("navigate-only");
     write_icon(&icons, "聊天历史", 2, 20, 18);
     write_icon(&icons, "联系人", 1, 20, 18);
 
-    // 目标 = 聊天历史，只配了聊天历史的模板 ⇒ 用 history 那一组。
+    // 选「聊天历史」：它底下的 2 张变体都要载入。
+    // 同时刻意把配置里那组「用于联系人导航」填上——它**不该**被读到，
+    // 所以下面"载入了 2 张"这个数就已经证明了没走错来源（那一组只有 1 张）。
     let config = RuntimeConfig {
         workflow: Workflow::NavigateOnly,
-        nav_target: NavTarget::History,
-        history_icon_templates: vec!["聊天历史".into()],
-        // 刻意**不**配联系人的那一组：不该被读到。
+        nav_target: "聊天历史".into(),
+        nav_icon_templates: vec!["联系人".into()],
         ..RuntimeConfig::default()
     };
     let runner = assemble_with_icons(&config, &icons).expect("导航就是任务本身，不受开关约束");
     let runner_config = runner.config();
-    assert_eq!(runner_config.history_icon_templates.len(), 2, "两张变体都要载入");
-    assert!(runner_config.nav_icon_templates.is_empty(), "不该去读联系人那一组");
+    assert_eq!(runner_config.nav_icon_templates.len(), 2, "两张变体都要载入");
+    assert_eq!(
+        runner_config.nav_target_label, "聊天历史",
+        "日志与失败信息里要出现的是那个目录名"
+    );
 
-    // 目标 = 聊天历史，却只配了联系人的模板 ⇒ 装配期就拒绝。
+    // 名字在图标库里不存在 ⇒ 装配期就拒绝（不是跑到一半才"匹配不上"）。
     let config = RuntimeConfig {
         workflow: Workflow::NavigateOnly,
-        nav_target: NavTarget::History,
-        nav_icon_templates: vec!["联系人".into()],
+        nav_target: "不存在的图标".into(),
         ..RuntimeConfig::default()
     };
     let err = assemble_with_icons(&config, &icons)
         .err()
-        .expect("配错了一组必须拒绝，否则会在运行期表现为匹配分数很低");
-    assert!(err.contains("没有配置「聊天历史」图标的模板"), "{err}");
+        .expect("名字不存在必须拒绝，否则会在运行期表现为一次分数很低的匹配");
+    assert!(err.contains("没有叫「不存在的图标」的图标"), "{err}");
 
-    // 「只做导航」是任务本身，所以 `navigate_before_search` 关着也照样要求模板。
+    // 一个名字都没选 ⇒ 同样拒绝。**不兜底**：随手挑一个图标去点，
+    // 症状会是"任务照常跑完，只是点到了别的地方"。
     let config = RuntimeConfig {
         workflow: Workflow::NavigateOnly,
-        nav_target: NavTarget::Contact,
+        nav_target: "  ".into(),
         navigate_before_search: false,
         ..RuntimeConfig::default()
     };
     let err = assemble_with_icons(&config, &icons)
         .err()
-        .expect("关着开关也要模板：导航就是这条工作流的全部内容");
-    assert!(err.contains("没有配置「联系人」图标的模板"), "{err}");
+        .expect("没选图标必须拒绝：导航就是这条工作流的全部内容");
+    assert!(err.contains("要指定点哪一个图标"), "{err}");
 }
 
 /// 靶标文字留空 ⇒ 装配期拒绝。
@@ -742,9 +751,11 @@ fn blank_target_texts_are_refused() {
 fn the_default_workflow_is_search_and_its_regions_have_no_defaults() {
     let config = RuntimeConfig::default();
     assert_eq!(config.workflow, Workflow::SearchContact);
-    assert_eq!(config.nav_target, NavTarget::Contact);
+    assert!(
+        config.nav_target.is_empty(),
+        "默认没选过图标——不兜底挑一个，那会变成「点到了别的地方」"
+    );
     assert!(config.area_marks.is_empty(), "默认一个新增区域都没标");
-    assert!(config.history_icon_templates.is_empty());
     assert_eq!(config.icon_prior_score_tolerance, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE);
     assert_eq!(config.typing_interval_ms, 30);
 

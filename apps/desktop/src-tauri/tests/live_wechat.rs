@@ -88,8 +88,8 @@ use std::time::Duration;
 
 use automation_core::{
     AuditSink, AutomationError, CancelToken, DesktopPlatform, HumanConfirmation, LocalOcr,
-    NavTarget, ProgressSink, Rect, RelativeRegion, SendLedger, SendTask, StateChange, TaskState,
-    TextBox, Workflow,
+    ProgressSink, Rect, RelativeRegion, SendLedger, SendTask, StateChange, TaskState, TextBox,
+    Workflow,
 };
 use desktop_lib::runtime::{RunChoice, RuntimeConfig, RuntimeMode, WindowGeometry};
 use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
@@ -107,7 +107,7 @@ fn run_choice_from(config: &RuntimeConfig) -> RunChoice {
     RunChoice {
         mode: config.mode,
         workflow: config.workflow,
-        nav_target: config.nav_target,
+        nav_target: config.nav_target.clone(),
     }
 }
 
@@ -387,7 +387,7 @@ fn live_wechat_finds_contact_by_scrolling_and_types_without_sending() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
-        run_choice_from(&config),
+        &run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
@@ -500,7 +500,7 @@ fn live_wechat_refuses_when_the_contact_cannot_be_found() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
-        run_choice_from(&config),
+        &run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
@@ -595,50 +595,38 @@ fn live_wechat_navigates_to_a_view() {
     config.wecom_exe_sha256 = None;
     config.ocr_command = Some(ocr_path.to_string_lossy().into_owned());
 
-    let target = match std::env::var("RPA_LIVE_NAV_TARGET")
-        .unwrap_or_else(|_| "contact".to_string())
+    // 导航目标就是**图标库里的目录名**（`data/icons/` 下一级目录）。
+    // 它同时指定了"点哪个图标"和"拿哪个目录的图当模板"——现在是同一件事，
+    // 所以不再有第二个环境变量去单独指定模板。
+    let target = std::env::var("RPA_LIVE_NAV_TARGET")
+        .unwrap_or_else(|_| "通讯录".to_string())
         .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "contact" | "联系人" | "通讯录" => NavTarget::Contact,
-        "history" | "聊天历史" | "历史记录" => NavTarget::History,
-        other => panic!("RPA_LIVE_NAV_TARGET 只认 contact / history，收到「{other}」"),
-    };
+        .to_string();
+    assert!(
+        !target.is_empty(),
+        "RPA_LIVE_NAV_TARGET 不能是空的：它就是图标库里的目录名"
+    );
     config.workflow = Workflow::NavigateOnly;
-    config.nav_target = target;
+    config.nav_target = target.clone();
 
-    // 图标库里现成的那两组名字（见 `data/icons/`）。
-    let fallback = match target {
-        NavTarget::Contact => "通讯录",
-        NavTarget::History => "聊天历史",
-    };
-    let name = std::env::var("RPA_LIVE_NAV_TEMPLATE")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| fallback.to_string());
-    let configured = match target {
-        NavTarget::Contact => config.nav_icon_templates.clone(),
-        NavTarget::History => config.history_icon_templates.clone(),
-    };
-    if configured.is_empty() {
-        println!("配置里没勾「{}」的模板，本次用图标库里的「{name}」", target.describe());
-        match target {
-            NavTarget::Contact => config.nav_icon_templates = vec![name.clone()],
-            NavTarget::History => config.history_icon_templates = vec![name.clone()],
-        }
-    }
-    let templates = match target {
-        NavTarget::Contact => config.nav_icon_templates.clone(),
-        NavTarget::History => config.history_icon_templates.clone(),
-    };
+    // 把可选的目录名列出来：名字写错时不用去翻文件管理器。
+    // 名字到底存不存在由装配期判（判据只有一处），这里只是打印。
+    let mut available: Vec<String> = std::fs::read_dir(icons_dir())
+        .map(|items| {
+            items
+                .filter_map(|item| item.ok())
+                .filter(|item| item.path().is_dir())
+                .filter_map(|item| item.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    available.sort();
 
     println!("配置文件：{}", config_file.display());
     println!("窗口类名：{}", config.window_class);
-    println!("工作流  ：{:?}    导航目标：{}", config.workflow, target.describe());
-    println!("模板    ：{templates:?}");
+    println!("工作流  ：{:?}    导航目标：{target}", config.workflow);
     println!("图标库  ：{}", icons_dir().display());
+    println!("可选图标：{}", available.join(" / "));
     println!("导航搜索区：{:?}    最低分 {:.2}\n", config.nav_strip, config.nav_icon_min_score);
 
     // ── 预检：窗口必须已经在前台 ────────────────────────────────────
@@ -677,7 +665,7 @@ fn live_wechat_navigates_to_a_view() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
-        run_choice_from(&config),
+        &run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
@@ -706,9 +694,9 @@ fn live_wechat_navigates_to_a_view() {
         outcome.failure
     );
     assert!(!outcome.succeeded(), "「只做导航」不是一次发送，不能被算作成功发送");
-    println!("\n✓ 已定位并点击「{}」图标", target.describe());
+    println!("\n✓ 已定位并点击「{}」图标", target);
     println!(
         "→ 请人工看一眼微信窗口：视图是否真的切到了「{}」，以及被点的是不是那个图标。",
-        target.describe()
+        target
     );
 }
