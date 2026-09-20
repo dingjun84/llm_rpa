@@ -11,6 +11,6 @@ sha2.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
-core-graphics = "0.24"
+core-graphics = { version = "0.24", features = ["highsierra"] }
 objc = "0.2"
 libc = "0.2"

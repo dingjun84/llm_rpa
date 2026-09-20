@@ -64,7 +64,7 @@ fn dict_string(dict: CFDictionaryRef, key: &str) -> String {
             buf.as_mut_ptr(),
             buf.len() as isize,
             kCFStringEncodingUTF8,
-        ) {
+        ) != 0 {
             CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
         } else {
             String::new()
@@ -451,7 +451,7 @@ pub fn capture_region(region: Rect) -> MacResult<CapturedFrame> {
                 "截屏失败：请到「系统设置 → 隐私与安全性 → 屏幕录制」中授权本程序".into(),
             );
         }
-        let result = cgimage_to_bgra(image);
+        let result = cgimage_to_bgra(image as *const c_void);
         // CGImageRelease
         extern "C" {
             fn CGImageRelease(image: *const c_void);
@@ -515,7 +515,7 @@ unsafe fn cgimage_to_bgra(image: *const c_void) -> MacResult<CapturedFrame> {
 
 pub fn cursor_position() -> MacResult<(i32, i32)> {
     let source = event_source()?;
-    let event = CGEvent::new(source).ok_or("无法读取光标位置")?;
+    let event = CGEvent::new(source).map_err(|_| "无法读取光标位置".to_string())?;
     let loc = event.location();
     let (_, screen_h) = primary_screen_size();
     Ok((
@@ -544,7 +544,7 @@ fn to_quartz_point(x: i32, y: i32) -> CGPoint {
 }
 
 fn event_source() -> MacResult<CGEventSource> {
-    CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok_or_else(|| {
+    CGEventSource::new(CGEventSourceStateID::CombinedSessionState).map_err(|_| {
         "无法创建事件源：请到「系统设置 → 隐私与安全性 → 辅助功能」中授权本程序".into()
     })
 }
@@ -580,7 +580,7 @@ fn warp_cursor(x: i32, y: i32) -> MacResult<()> {
     let point = to_quartz_point(x, y);
     let event =
         CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
-            .ok_or("创建鼠标移动事件失败")?;
+            .map_err(|_| "创建鼠标移动事件失败".to_string())?;
     event.post(CGEventTapLocation::HID);
     Ok(())
 }
@@ -595,10 +595,10 @@ pub fn left_click() -> MacResult<()> {
         point,
         CGMouseButton::Left,
     )
-    .ok_or("创建鼠标按下事件失败")?;
+    .map_err(|_| "创建鼠标按下事件失败".to_string())?;
     let up =
         CGEvent::new_mouse_event(source, CGEventType::LeftMouseUp, point, CGMouseButton::Left)
-            .ok_or("创建鼠标抬起事件失败")?;
+            .map_err(|_| "创建鼠标抬起事件失败".to_string())?;
     down.post(CGEventTapLocation::HID);
     up.post(CGEventTapLocation::HID);
     Ok(())
@@ -613,7 +613,7 @@ pub fn scroll_wheel(notches: i32) -> MacResult<()> {
     for index in 0..notches.unsigned_abs() {
         let event =
             CGEvent::new_scroll_event(source.clone(), ScrollEventUnit::LINE, 1, step, 0, 0)
-                .ok_or_else(|| format!("创建滚轮事件失败（第 {} 格）", index + 1))?;
+                .map_err(|_| format!("创建滚轮事件失败（第 {} 格）", index + 1))?;
         event.post(CGEventTapLocation::HID);
         if index + 1 < notches.unsigned_abs() {
             std::thread::sleep(WHEEL_STEP_DELAY);
@@ -654,7 +654,7 @@ pub fn wait_for_clipboard_release(_poll: Duration, timeout: Duration) -> bool {
 
 fn post_key(key: CGKeyCode, flags: CGEventFlags, down: bool) -> MacResult<()> {
     let source = event_source()?;
-    let event = CGEvent::new_keyboard_event(source, key, down).ok_or("创建键盘事件失败")?;
+    let event = CGEvent::new_keyboard_event(source, key, down).map_err(|_| "创建键盘事件失败".to_string())?;
     event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
     Ok(())
