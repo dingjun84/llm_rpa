@@ -1,3 +1,4 @@
+import { contactLabel } from "../taskDisplay";
 import { STATE_LABELS, type TaskState, type TaskView } from "../types";
 
 interface Props {
@@ -41,7 +42,7 @@ export function TaskHistory({ tasks, activeId, onSelect }: Props) {
               onClick={() => onSelect(task.id)}
             >
               <div className="history-head">
-                <span className="history-contact">{task.external_contact_name}</span>
+                <span className="history-contact">{contactLabel(task.external_contact_name)}</span>
                 <span className={stateClass(task.state)}>{STATE_LABELS[task.state]}</span>
               </div>
               <div className="history-meta">

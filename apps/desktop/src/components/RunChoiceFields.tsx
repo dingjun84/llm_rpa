@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { listIcons, workflowRequirements } from "../api";
+import { listIcons } from "../api";
 import { normalizeName } from "../iconNames";
 import {
   SCENARIO_LABELS,
@@ -36,6 +36,14 @@ interface Props {
   onPatchRunChoice: (patch: Partial<RunChoice>) => void;
   /** **这一次真正会跑的模式**，由 `App` 算好传下来（别读 `draft.mode`）。 */
   activeMode: RuntimeMode;
+  /**
+   * 当前工作流的要求（还缺哪几块标定、要不要填联系人 / 正文）。
+   *
+   * ★ 由 `App` 取好传下来，**不在这里自己问**：上面那张「新建发送任务」表单
+   * 也要用它（决定那两个框显不显示），两处各问一次就是两份可能不同步的答案。
+   * `null` = 还没问到 / 问不到 —— 这时**不显示**这条提示，而不是按草稿猜一条。
+   */
+  requirement: WorkflowRequirement | null;
 }
 
 const SCENARIOS = Object.keys(SCENARIO_LABELS) as DemoScenario[];
@@ -72,59 +80,20 @@ export function RunChoiceFields({
   runChoice,
   onPatchRunChoice,
   activeMode,
+  requirement,
 }: Props) {
-  /** 当前工作流需要哪些标定区域（**后端**算好下发，这里只渲染）。 */
-  const [requirement, setRequirement] = useState<WorkflowRequirement | null>(null);
-
   // 改草稿的字段。本地适配器——只为让下面的调用点短一点，判据不在这里。
   const update = <K extends keyof RuntimeConfig>(key: K, value: RuntimeConfig[K]) => {
     onPatch({ [key]: value } as Partial<RuntimeConfig>);
   };
 
   /**
-   * 标定结果的一个**稳定签名**，用来当刷新依赖。
-   *
-   * 直接依赖 `draft` 会让每次按键都去问一遍后端；而只有「工作流改了」
-   * 或「标定结果变了」才会改变答案。用 JSON 串而不是对象本身：
-   * `area_marks` 每次 `onPatch` 都会换一个新对象，按引用比会一直不相等。
-   */
-  const marksSignature = JSON.stringify(draft.area_marks ?? {});
-
-  /**
    * 本次**真正要跑**的那条工作流。
    *
    * ★ 取自 `runChoice`（运行参数），**不是** `draft.workflow`——后者只是界面
-   * 打开时的初始值，跟这次要跑什么没有关系。下面"还缺哪几块标定"必须按
-   * 前者算，否则会出现「界面说齐了、点开始却被拒」。
+   * 打开时的初始值，跟这次要跑什么没有关系。下面按它决定显示哪一段。
    */
   const activeWorkflow = runChoice?.workflow ?? null;
-
-  useEffect(() => {
-    if (!activeWorkflow) {
-      // 运行参数还没定（配置没读回来）。这时不显示提示，而不是按草稿猜一条。
-      setRequirement(null);
-      return;
-    }
-    let cancelled = false;
-    void (async () => {
-      try {
-        const all = await workflowRequirements(draft);
-        if (cancelled) return;
-        setRequirement(all.find((item) => item.workflow === activeWorkflow) ?? null);
-      } catch {
-        // 问不到就**不显示**这条提示。
-        //
-        // 它只是"点开始之前先提醒一句"，真正的判据在装配期（后端会拒绝并列出
-        // 缺哪几块）。为了它弹一个错误，反而会盖住页面上真正的问题。
-        if (!cancelled) setRequirement(null);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // 只在这两项变了才重问：答案只取决于它们。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeWorkflow, marksSignature]);
 
   const missingMarks = requirement?.required.filter((item) => !item.marked) ?? [];
 

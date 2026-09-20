@@ -26,12 +26,19 @@ use serde::{Deserialize, Serialize};
 use crate::calibration;
 
 mod mode;
+mod requirements;
 
-// ★ 再导出：`RuntimeMode` / `DemoScenario` 搬进了 `mode.rs`，但
-// `crate::runtime::RuntimeMode` 这条路径必须照旧成立——`lib.rs` 与
-// `runtime/tests.rs` 都按它引用（`use crate::runtime::{RunChoice, RuntimeMode, …}`）。
-// 少这一行，症状是一堆 `E0432: unresolved import`，看着像"文件没编进去"。
+// ★ 再导出：这几块搬进了 `mode.rs` / `requirements.rs`，但
+// `crate::runtime::X` 这条路径必须照旧成立——`lib.rs` 与 `runtime/tests.rs`
+// 都按它引用（`use crate::runtime::{RunChoice, RuntimeMode, …}`）。
+// 少这几行，症状是一堆 `E0432: unresolved import`，看着像"文件没编进去"。
 pub use mode::{DemoScenario, ModeNotices, RuntimeMode};
+pub use requirements::{
+    workflow_inputs, workflow_requirements, MarkRequirement, WorkflowInputs, WorkflowRequirement,
+};
+
+// 它只在 `runtime.rs` 内部用（装配期按工作流拒绝任务），所以不对外再导出。
+use requirements::missing_marks;
 
 /// 单步超时相对 OCR 超时的余量（秒）。
 ///
@@ -401,7 +408,9 @@ fn flatten(region: RelativeRegion) -> [f32; 4] {
 /// `None` = 还没标过。**不兜底、不猜**：给一个默认值的话，症状会是
 /// "任务照常跑完，只是点到了别的地方"，那是本项目最难查的一类现象。
 /// 缺哪些区域会在装配期被拦下（见 [`build_runner`]）。
-fn mark_region(config: &RuntimeConfig, key: &str) -> Option<RelativeRegion> {
+/// 可见性是 `pub(super)`：`requirements.rs` 也要按它判断"这块标了没有"，
+/// 但它不该出现在 `crate::runtime::` 的公开面上（外面只认 `WorkflowRequirement`）。
+pub(super) fn mark_region(config: &RuntimeConfig, key: &str) -> Option<RelativeRegion> {
     config.area_marks.get(key).map(|mark| {
         let [x, y, width, height] = mark.rect;
         RelativeRegion::new(x, y, width, height)
@@ -629,100 +638,6 @@ pub(crate) fn load_nav_icon_templates(
     Ok(templates)
 }
 
-/// 所选工作流**必须**标好的新增区域（键 = 标定清单里的 `key`）。
-///
-/// ## 为什么按工作流分别要求，而不是"一概全要"或"一概不要"
-///
-/// - 一概全要：只想跑列表扫描式的人也得去标搜索框、下拉、资料页——三块
-///   他根本不会走到的区域。多标一块就是多一次"框歪了"的机会。
-/// - 一概不要：搜索式会在走到那一块时才转人工，而那时任务**已经登记进列表**，
-///   看起来像是真跑过一遍。
-///
-/// ## 为什么 `NavigateOnly` 一个都不要
-///
-/// 它连人都不找，只用导航区与图标模板。但它在**真实模式**下仍然要求
-/// 标定窗口尺寸——那是 `build_runner` 开头那道与工作流无关的检查。
-fn required_marks(workflow: Workflow) -> &'static [&'static str] {
-    match workflow {
-        // 搜索式：点搜索框 → 在下拉里挑人 → 在资料页点「发消息」。
-        // 这三块各自对应一步点击，缺任何一块都走不下去。
-        Workflow::SearchContact => &["main_search", "search_dropdown", "contact_profile"],
-        // 列表扫描式只用 `regions.contact_panel`（必填、有默认值）。
-        Workflow::ScrollListContact | Workflow::NavigateOnly => &[],
-    }
-}
-
-/// 缺哪些区域、分别叫什么（给操作者看的名字取自标定清单，**不在这里另起一份**）。
-///
-/// 判据按**本次要跑的那条路**（`choice.workflow`）算，不按配置里那个默认值——
-/// 否则会出现「界面选了搜索式、后端按列表式检查」，缺的区域一个都不报。
-fn missing_marks(config: &RuntimeConfig, choice: &RunChoice) -> Vec<String> {
-    required_marks(choice.workflow)
-        .iter()
-        .filter(|key| mark_region(config, key).is_none())
-        .map(|key| {
-            // 清单里的 `label` 才是界面上的说法（「搜索框区」「下拉列表区域」…）。
-            // 用 `key` 报错的话，人得自己把 `main_search` 翻译成界面上那一项。
-            calibration::find_item(key).map_or_else(|| (*key).to_string(), |item| {
-                format!("{}（{}）", item.label, item.key)
-            })
-        })
-        .collect()
-}
-
-/// 一项标定区域对某条工作流的必要性（下发给界面）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MarkRequirement {
-    pub key: String,
-    /// 界面上的说法（标定清单里的 `label`）。
-    pub label: String,
-    /// 当前配置里标了没有。
-    pub marked: bool,
-}
-
-/// 一条工作流要用到哪些标定区域。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowRequirement {
-    pub workflow: Workflow,
-    /// 工作流的名字，取自 `Workflow::describe`。
-    pub label: String,
-    /// 必须标好的区域；空表 = 这条工作流一块新增区域都不需要。
-    pub required: Vec<MarkRequirement>,
-}
-
-/// 列出每条工作流需要哪些区域，以及**这份配置里标了没有**。
-///
-/// ## 为什么由后端算，而不是界面自己列一张表
-///
-/// 「这条工作流需要哪几块」是一个**判据**——装配期就是按 [`required_marks`]
-/// 拒绝任务的。界面再写一份的话，两边不一致时的表现是
-/// 「界面说齐了、点开始却被拒」，而人只会去怀疑标定本身。
-/// 所以判据留在这一处，界面只负责渲染。
-///
-/// ## 为什么参数是配置、而不是读服务端那份
-///
-/// 界面是**草稿式**的：操作者刚把工作流改成搜索式、还没点保存时，
-/// 他要看的是"我现在这份配置还缺什么"。读服务端那份会答非所问。
-pub fn workflow_requirements(config: &RuntimeConfig) -> Vec<WorkflowRequirement> {
-    Workflow::ALL
-        .iter()
-        .map(|workflow| WorkflowRequirement {
-            workflow: *workflow,
-            label: workflow.describe().to_string(),
-            required: required_marks(*workflow)
-                .iter()
-                .map(|key| MarkRequirement {
-                    key: (*key).to_string(),
-                    label: calibration::find_item(key).map_or_else(
-                        || (*key).to_string(),
-                        |item| item.label.to_string(),
-                    ),
-                    marked: mark_region(config, key).is_some(),
-                })
-                .collect(),
-        })
-        .collect()
-}
 
 /// 本次任务走哪一条路 —— **运行参数，不进配置文件**。
 ///

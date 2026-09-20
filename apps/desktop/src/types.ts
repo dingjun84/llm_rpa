@@ -458,6 +458,16 @@ export interface WorkflowRequirement {
   label: string;
   /** 必须标好的区域；空表 = 这条工作流一块新增区域都不需要。 */
   required: MarkRequirement[];
+  /**
+   * 这条工作流要不要填「外部联系人名称」。
+   *
+   * ★ 判据在后端（`runtime::workflow_inputs`），界面只渲染：`false` 时那个框
+   * **整个不显示**，「开始任务」也不拿它当门槛。前端自己判断的话，
+   * 两边不一致的表现是「按钮点不动、也不说为什么」——2026-09-20 实测过。
+   */
+  needs_contact: boolean;
+  /** 这条工作流要不要填「消息正文」。同上。 */
+  needs_message: boolean;
 }
 
 /**

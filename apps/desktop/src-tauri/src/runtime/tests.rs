@@ -810,3 +810,33 @@ fn a_negative_prior_tolerance_is_refused() {
     };
     assert!(assemble_with_icons(&config, &icons).is_ok(), "0 = 关掉先验，不是错误");
 }
+
+/// ★ 任务输入按工作流校验，而**判据只有一处**（`workflow_inputs`）。
+///
+/// 2026-09-20 实测的现象：选了「只做导航」+ 通讯录，点「开始任务」**什么都不发生**
+/// ——`data/` 下连 `task-*.log` 都没生成。原因是命令层无条件要求联系人与正文非空，
+/// 而界面上那两个框（对这条路毫无意义）空着时按钮根本点不动、也不说为什么。
+///
+/// 这条用例钉两件事：
+/// ① 每条工作流的答案本身（只做导航：都不用；另外两条：都要）；
+/// ② `workflow_requirements` 下发的与 `workflow_inputs` 说的是同一份
+///    —— 界面按前者渲染、命令层按后者拒绝，两者分叉就又回到"点不动/白填"。
+#[test]
+fn task_inputs_are_decided_by_the_workflow() {
+    for (workflow, contact, message) in [
+        (Workflow::NavigateOnly, false, false),
+        (Workflow::SearchContact, true, true),
+        (Workflow::ScrollListContact, true, true),
+    ] {
+        let inputs = workflow_inputs(workflow);
+        assert_eq!(inputs.contact, contact, "{workflow:?} 的联系人要求");
+        assert_eq!(inputs.message, message, "{workflow:?} 的正文要求");
+
+        let requirement = workflow_requirements(&RuntimeConfig::default())
+            .into_iter()
+            .find(|item| item.workflow == workflow)
+            .expect("每条工作流都要有一份要求");
+        assert_eq!(requirement.needs_contact, contact, "{workflow:?} 下发的要求");
+        assert_eq!(requirement.needs_message, message, "{workflow:?} 下发的要求");
+    }
+}

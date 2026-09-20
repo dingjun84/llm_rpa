@@ -151,14 +151,16 @@
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `src/lib.rs` | 1900 | **24 个 IPC 命令** + `with_commands` 注册（含**托管状态**）+ 任务日志落盘 |
+| `src/lib.rs` | 1793 | **24 个 IPC 命令** + `with_commands` 注册（含**托管状态**）。★ 任务日志**不在这里**了，见 `task_log.rs` |
+| `src/task_log.rs` | 159 | ★ **任务日志的两件事**：`append_task_log`（纯追加、带毫秒时间戳、写完 flush）+ `write_start_header`（开跑前那份**配置快照**——"当时到底按哪份配置跑的"）。★ 快照里的**运行参数**（模式 / 工作流 / 导航目标）全部取自 `RunChoice`，与界面上选的必须一致。T27 从 `lib.rs` 整段搬出来（那一百来行是"写日志"的活，与"装配 / 登记 / 起线程"不是一回事） |
 | `src/cursor_trace.rs` | 141 | ★ **「画圆」自检**（`draw_cursor_circle` + `CircleTraceView`）。★ 回报里带 **`end` / `end_distance_px`**（走完之后**实测**的光标位置与它到圆心的距离）—— "命令返回了"不等于"光标真的动了"，这是唯一能分辨的判据。单独成模块是为了让 `lib.rs` 不破基线；命令**仍注册在 `lib.rs`**。⚠️ 跨模块的命令必须是 `pub`（私有 ⇒ `E0603: macro import ... is private`）。见 `docs/todo.md` T24 |
 | `src/startup_log.rs` | 165 | ★★ **启动期落文件日志**（`data/startup.log`）。GUI 没有控制台，而"窗口还没出现就退出"这类故障的现场**全在窗口出现之前**——这是唯一的现场。第一行截断、之后追加；**写失败一律静默**（观测手段不该成为新的失败点）；数据目录建不出来时**退回工作目录**记。另装了一个 panic 钩子（**包一层原钩子，不替换**）。见 `docs/todo.md` T25 |
 | `src/tests.rs` | 88 | `lib.rs` 的用例（测试文件不限行数） |
 | `src/capture_hotkey.rs` | 138 | 「一键截屏」全局热键的接线：`attach` 挂托管状态 + 持有注册句柄 + 命中时只发事件（**不自己截图**，理由见文件头） |
-| `src/runtime.rs` | 984 | `RuntimeConfig`（草稿与已保存）、**`RunChoice`（本次怎么跑：模式 + 工作流 + 导航目标，运行参数）**、`build_runner` 装配、模式校验、**按工作流列出所需标定区域**。★★ **`RunChoice` 的字段一律由请求带**，`build_runner` 的**第一件事**就是把 `config.mode` 换成请求里的那个，让后面所有"模式相关"的判断仍然只读 `config.mode`（判据只有一处）。见 `docs/todo.md` T23 |
+| `src/runtime.rs` | 927 | `RuntimeConfig`（草稿与已保存）、**`RunChoice`（本次怎么跑：模式 + 工作流 + 导航目标，运行参数）**、`build_runner` 装配、模式校验。★★ **`RunChoice` 的字段一律由请求带**，`build_runner` 的**第一件事**就是把 `config.mode` 换成请求里的那个，让后面所有"模式相关"的判断仍然只读 `config.mode`（判据只有一处）。见 `docs/todo.md` T23 |
+| `src/runtime/requirements.rs` | 171 | ★★ **「这条工作流到底要什么」**：`required_marks`（必须标好哪几块区域）、`workflow_inputs`（要不要填「外部联系人名称」/「消息正文」）、`WorkflowRequirement`（下发给界面的那一份）。**装配期与界面共用同一份判据**——分叉的表现是「界面说齐了、点开始却被拒」或者**「按钮点不动、也不说为什么」**（T27 实测过后者）。T27 从 `runtime.rs` 搬出来 |
 | `src/runtime/mode.rs` | 127 | ★ 「演练还是真实」这件事本身：`RuntimeMode`（+ `platform_label` / `calibrated_window` / `notice`）、`DemoScenario`、`ModeNotices`（两种模式各自的提示文案，成对下发）。**纯数据 + 纯函数**，自成一类，从 `runtime.rs` / `lib.rs` 搬出来压回行数基线。⚠️ 父模块有 `pub use mode::{…};` —— 少了它是一堆 `E0432: unresolved import`，看着像"文件没编进去" |
-| `src/runtime/tests.rs` | 800 | 装配期校验的用例（哪些配置必须在登记任务之前就被拒） |
+| `src/runtime/tests.rs` | 842 | 装配期校验的用例（哪些配置必须在登记任务之前就被拒） |
 | `src/calibration.rs` | 370 | 标定清单的**数据结构 / 存取 / 视图组装**（清单内容在 `calibration/catalog.rs`） |
 | `src/calibration/catalog.rs` | 198 | **清单本身**：4 个场景、14 个标定项，纯数据 |
 | `src/calibration/tests.rs` | 287 | 清单内容与失效项清理的测试（测试文件不限行数） |
@@ -219,13 +221,14 @@ draw_cursor_circle
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `App.tsx` | 452 | **持有配置草稿 `draft`**（四个页签改同一份）+ **持有运行参数 `runChoice`**（不进草稿、不置 `dirty`）+ 页签切换 |
+| `App.tsx` | 536 | **持有配置草稿 `draft`**（四个页签改同一份）+ **持有运行参数 `runChoice`**（不进草稿、不置 `dirty`）+ **持有 `requirement`**（当前工作流要不要填联系人/正文、还缺哪块标定）+ 页签切换。★ `requirement` 放这里是因为它有**两个**消费者（`TaskForm` 与 `RunChoiceFields`），各取一次会有两份可能不同步的答案 |
 | `api.ts` | 381 | 所有 `invoke` 封装 + 事件订阅。**要改命令名先看这里** |
-| `types.ts` | 784 | 与 Rust 侧 serde 结构对应的类型（含 `Workflow` / **`RunChoice`** / `StartTaskRequest` / `TaskFormValues` / `CircleTraceView` / `HotkeyRequest`）。★ `RunChoice.nav_target` 是**图标库里的目录名**（`string`），**不是**枚举——见 `docs/todo.md` T26 |
+| `types.ts` | 794 | 与 Rust 侧 serde 结构对应的类型（含 `Workflow` / **`RunChoice`** / `StartTaskRequest` / `TaskFormValues` / `CircleTraceView` / `HotkeyRequest`）。★ `RunChoice.nav_target` 是**图标库里的目录名**（`string`），**不是**枚举——见 `docs/todo.md` T26。★ `WorkflowRequirement` 带 `needs_contact` / `needs_message`（T27） |
+| `taskDisplay.ts` | 18 | `contactLabel`：任务列表与「当前任务」两处都显示收件人，空名字**不是"漏填了"**（「只做导航」根本不找人），所以给它一句话。**只写一处**，否则改文案必漏一处 |
 | `countdown.ts` | 92 | ★ **「先倒数、到点再动手」的唯一实现**（`useCountdown` / `COUNTDOWN_TICK_MS` / `remainingSeconds`）。**到点判据是「现在 ≥ 截止时刻」**，别在任何调用点改成"把间隔累加起来"。秒数留在各调用点（截图 8 秒 / 画圆 3 秒） |
 | `calibration.css` | 470 | 「界面标定」页与区域画布的样式（自成一套） |
-| `components/RuntimePanel.tsx` | 288 | 「任务」页配置面板的**骨架**：页头三条提示（模式说明 / 未保存警告 / 搬迁结果）+ 四个开关 + 确认有效期与置信度 + 保存按钮 + 数据目录说明。★ **表单按"归属"拆给了四个同级组件**，见下面四行；加东西前先问"它属于哪一组" |
-| `components/RunChoiceFields.tsx` | 372 | ★★ **运行参数那一组**：模式 / 演练场景 / 工作流 / 要点哪个图标 / 还缺哪块标定。**绑 `runChoice` 而不是 `draft`**（选完直接点开始就生效，不用保存）。它拿 `draft` 只为两件事：演练场景（唯一一个配置字段）与标定结果签名。★ 「要点哪一个图标」的下拉**读图标库**（`listIcons()`，切页签会重新挂载所以自动刷新），列的是 `data/icons/` 的一级目录——**不要改回一份写死的清单**（见 T26）。⚠️ 判据一句话：**要"保存配置"的留在 `RuntimePanel`，只管"这一次怎么跑"的搬这里** |
+| `components/RuntimePanel.tsx` | 304 | 「任务」页配置面板的**骨架**：页头三条提示（模式说明 / 未保存警告 / 搬迁结果）+ 四个开关 + 确认有效期与置信度 + 保存按钮 + 数据目录说明。★ **表单按"归属"拆给了四个同级组件**，见下面四行；加东西前先问"它属于哪一组"。★ `requirement` 只是**透传**（`App` → 这里 → `RunChoiceFields`），别在这里自己取 |
+| `components/RunChoiceFields.tsx` | 341 | ★★ **运行参数那一组**：模式 / 演练场景 / 工作流 / 要点哪个图标 / 还缺哪块标定。**绑 `runChoice` 而不是 `draft`**（选完直接点开始就生效，不用保存）。它拿 `draft` 只剩**一个**用途：演练场景（唯一一个配置字段）。★ 「要点哪一个图标」的下拉**读图标库**（`listIcons()`，切页签会重新挂载所以自动刷新），列的是 `data/icons/` 的一级目录——**不要改回一份写死的清单**（见 T26）。★ `requirement` 由 `App` 传下来，**不要在这里自己问后端**（T27：两个消费者各问一次会有两份答案）。⚠️ 判据一句话：**要"保存配置"的留在 `RuntimePanel`，只管"这一次怎么跑"的搬这里** |
 | `components/TargetWindowSection.tsx` | 202 | **目标窗口**那一组：指认窗口 / 可执行文件路径与哈希 / 启动客户端 / 窗口类名 / 记录窗口尺寸 / OCR 程序路径。自带「启动中」「读取中」两份局部状态。★ 全是**配置**，要保存 |
 | `components/AdvancedParamsSection.tsx` | 192 | **超时 + 滚动查找**两组旋钮（含 `ratioFromInput`：清空输入框时**保留原值**，别退回 0）。平时不动，机器慢/列表长才来调 |
 | `components/TypingTextSection.tsx` | 87 | **逐字输入间隔 + 靶标文字**（资料页入口文字、搜索下拉「联系人」分组标题）。这几个值**随客户端版本变**，改动理由相同，所以归到一起 |
@@ -239,7 +242,7 @@ draw_cursor_circle
 | `components/RegionCanvas.tsx` | 323 | 可拖拽画布：移动 / 八向缩放 / 空白处拉新框 |
 | `components/RegionCalibration.tsx` | 83 | ★ **不再是组件**：只剩 `DEFAULT_REGIONS`（四块区域的默认比例，后端是单一来源、这里只能手抄）与 `regionsAreValid`（保存前校验）。四个区域**只在「界面标定」页标**，旧的手填数字面板已删 |
 | `components/WindowPicker.tsx` | 172 | 倒计时悬停取窗口。⚠️ **它不用 `countdown.ts`**：那个定时器每跳一次还要顺便采一次"光标下是哪个窗口"，数与采必须同一拍 |
-| `components/TaskForm.tsx` / `TaskHistory.tsx` / `StateTimeline.tsx` / `ConfirmationDialog.tsx` | 77 / 72 / 66 / 59 | 任务发起、历史、状态轨迹、人工确认。`TaskForm` **不碰「走哪条路」**，那是 `App.handleStart` 补进请求的 |
+| `components/TaskForm.tsx` / `TaskHistory.tsx` / `StateTimeline.tsx` / `ConfirmationDialog.tsx` | 121 / 73 / 86 / 59 | 任务发起、历史、状态轨迹、人工确认。`TaskForm` **不碰「走哪条路」**，那是 `App.handleStart` 补进请求的。★★ `TaskForm` 按 `needsContact` / `needsMessage`（**后端下发**，T27）决定那两个框显不显示、按钮能不能点；⚠️ 这两个值是 `boolean \| null`，**`null`（还没问到）一律放行**——拒绝是看得见的，点不动是看不见的 |
 
 ## 4. ★ 需求 → 文件（反向索引）
 
@@ -251,7 +254,8 @@ draw_cursor_circle
 | **改列表扫描式**（原有那条：滚会话列表认名字） | `runner/list.rs` |
 | **改「只做导航」**（工作流 1 / 2） | `runner/navigate.rs`（判据与点击）+ `vision/src/template.rs`（匹配算法） |
 | **改「在哪一步停下 / 要不要发」** | `runner/message.rs` 的 `prepare_message`。搜索式与「只填不发」都停在 `Prepared` |
-| 改三条工作流各自要求先标哪些区域 | `src-tauri/src/runtime.rs` 的 `required_marks`。**判据只有这一处**，界面通过 `workflow_requirements` 命令读它 |
+| **改「这条工作流到底要什么」**（要标哪些区域 / 要不要填联系人·正文） | **`src-tauri/src/runtime/requirements.rs`** 的 `required_marks` 与 `workflow_inputs`。★★ **判据只有这一处**：装配期按它拒绝、界面通过 `workflow_requirements` 命令读它渲染。★ 分叉的两种后果都很难查：`required_marks` 分叉 ⇒「界面说齐了、点开始却被拒」；`workflow_inputs` 分叉 ⇒「按钮点不动、也不说为什么」（2026-09-20 实测，见 T27） |
+| 给任务日志**加一行** / 改开头那份配置快照 | `src-tauri/src/task_log.rs` 的 `write_start_header`。★ **别加回 `lib.rs`**（它贴着基线，那一百来行是整段搬出去的）。运行参数（模式 / 工作流 / 导航目标）一律取自 `choice`，与界面上选的必须一致 |
 | **改「本次走哪条路」怎么传到后端**（**模式** / 工作流 / 导航目标） | `runtime.rs` 的 `RunChoice` + `lib.rs::start_task`（读 `request.run_choice`，**不读也不写配置**）+ `App.tsx::handleStart`（补进请求）+ **`components/RunChoiceFields.tsx`** 的三个选择器（绑 `runChoice`）。★★ **这是运行参数、不是配置项**——别改回读 `state.config`，那正是 2026-09-19「选了 A 跑的是 B」那个 bug。★ `nav_target` 的值域是**图标库目录名**（`String`），装配期在 `runtime.rs` 的 `build_runner` 里收敛成"要点这一个图标" |
 | 改**模式**（演练 / 真实）影响到的行为 | ① 挑哪组端口 ② 真实模式没标定尺寸就拒 ③ 审计里的平台字段（`RuntimeMode::platform_label`）④ 要不要带标定窗口（`RuntimeMode::calibrated_window`）。★ 上面四条**全部**通过 `build_runner` 开头那句 `config.mode = choice.mode` 跟随本次运行参数，**判据只有一处**。界面侧：页头徽标 / `canSave` / 演练场景显隐一律看 `App` 的 `activeMode`，**别用 `draft.mode`**。提示文案只有一处：`RuntimeMode::notice()`，后端成对下发（`RuntimeInfo.mode_notices`）。★ 这几样**全在 `src-tauri/src/runtime/mode.rs`** 里，改模式相关的东西先开它 |
 | 改区域比例默认值 / 加一个区域 | `automation-core/src/regions.rs` + `src-tauri/src/runtime.rs` 的 `RegionConfig` + `components/RegionCalibration.tsx` |

@@ -1567,6 +1567,54 @@ fn start_task_navigate_only_takes_the_icon_name_from_the_request() {
     // 而任务照常跑完，看不出任何异常。
     let message = harness.err("start_task", request(""));
     assert!(message.contains("要指定点哪一个图标"), "{message}");
+
+    // ★★ 回归：**联系人与正文留空也必须能提交**。
+    //
+    // 这条路不找任何人、也发不出消息，那两个输入框在界面上根本不显示。
+    // 以前命令层无条件要求它们非空，于是点「开始任务」什么都不发生——
+    // 连 `task-*.log` 都没生成，看起来像"后端判断逻辑坏了"（2026-09-20 实测）。
+    // 这里连"字段整个不带"一起钉住：前端传 `""` 与不传都该放行。
+    let bare = json!({ "request": {
+        "external_contact_name": "",
+        "text": "",
+        "run_choice": choice("通讯录"),
+    } });
+    let id: String = harness.ok("start_task", bare);
+    assert!(!id.is_empty(), "空联系人与空正文不该拦住「只做导航」");
+}
+
+/// ★ 回归：另外两条工作流**仍然**要求联系人与正文非空。
+///
+/// 与上面那条是一对：放宽「只做导航」的时候最容易顺手把门槛整条删掉，
+/// 而"发消息给谁、发什么"这两件事在那两条路上都是**必需**的——
+/// 少了它们，任务会跑到"找不到人"那一步才转人工，失败现象与"真的没有这个人"
+/// 一模一样，方向全错。
+#[test]
+fn the_two_contact_workflows_still_require_contact_and_message() {
+    let harness = Harness::with_config(
+        "contact-inputs-required",
+        RuntimeConfig {
+            mode: RuntimeMode::DryRun,
+            // 列表扫描式：一块标定区域都不需要，所以下面报的错只可能来自输入校验。
+            workflow: Workflow::ScrollListContact,
+            ..Default::default()
+        },
+    );
+
+    for (contact, text, expected) in [
+        ("", "你好", "外部联系人名称不能为空"),
+        ("张三", "", "消息正文不能为空"),
+    ] {
+        let message = harness.err(
+            "start_task",
+            json!({ "request": {
+                "external_contact_name": contact,
+                "text": text,
+                "run_choice": { "mode": "dry_run", "workflow": "scroll_list_contact", "nav_target": "" },
+            } }),
+        );
+        assert!(message.contains(expected), "应当报「{expected}」：{message}");
+    }
 }
 
 /// 靶标文字留空 ⇒ 装配期拒绝。

@@ -1,4 +1,10 @@
-import type { RunChoice, RuntimeConfig, RuntimeInfo, RuntimeMode } from "../types";
+import type {
+  RunChoice,
+  RuntimeConfig,
+  RuntimeInfo,
+  RuntimeMode,
+  WorkflowRequirement,
+} from "../types";
 import { AdvancedParamsSection } from "./AdvancedParamsSection";
 import { RunChoiceFields } from "./RunChoiceFields";
 import { TargetWindowSection } from "./TargetWindowSection";
@@ -34,6 +40,14 @@ interface Props {
    * 按错了方向（提示说"演练"、实际在动真窗口）比没有提示更糟。
    */
   activeMode: RuntimeMode;
+  /**
+   * 当前工作流的要求（要不要填联系人 / 正文、还缺哪几块标定）。
+   *
+   * ★ 由 `App` 算好传下来，**不在这里自己取**：上面那张「新建发送任务」表单
+   * 也要用它决定那两个框显不显示。两个消费者各取一次的话，会有两次请求、
+   * 两份可能不同步的答案。
+   */
+  requirement: WorkflowRequirement | null;
   onSave: () => void;
   /** 草稿与已保存的配置是否不一致。 */
   dirty: boolean;
@@ -69,6 +83,7 @@ export function RuntimePanel({
   runChoice,
   onPatchRunChoice,
   activeMode,
+  requirement,
   onSave,
   dirty,
   canSave,
@@ -129,6 +144,7 @@ export function RuntimePanel({
         runChoice={runChoice}
         onPatchRunChoice={onPatchRunChoice}
         activeMode={activeMode}
+        requirement={requirement}
       />
 
       <TargetWindowSection draft={draft} onPatch={onPatch} busy={busy} />

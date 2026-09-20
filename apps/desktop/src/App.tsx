@@ -10,6 +10,7 @@ import { RuntimePanel } from "./components/RuntimePanel";
 import { StateTimeline } from "./components/StateTimeline";
 import { TaskForm } from "./components/TaskForm";
 import { TaskHistory } from "./components/TaskHistory";
+import { contactLabel } from "./taskDisplay";
 import {
   TERMINAL_STATES,
   type ConfirmationRequest,
@@ -19,6 +20,7 @@ import {
   type RuntimeMode,
   type TaskFormValues,
   type TaskView,
+  type WorkflowRequirement,
 } from "./types";
 
 type Tab = "tasks" | "calibration" | "icons" | "trace";
@@ -189,6 +191,55 @@ export function App() {
    */
   const activeMode: RuntimeMode = runChoice?.mode ?? info?.config.mode ?? "dry_run";
 
+  /**
+   * 当前工作流对**任务输入**的要求（要不要填「外部联系人名称」/「消息正文」）。
+   *
+   * ★★ 为什么由 `App` 持有、而不是 `RunChoiceFields` 自己取：这个答案有**两个**
+   * 消费者——上面那张「新建发送任务」表单（决定那两个框要不要显示、「开始任务」
+   * 能不能点）与工作流那一组下面的提示。放在其中一个组件里的话，另一个只能自己
+   * 猜一条判据，而猜的两种后果都很难查；猜严了就是**按钮点不动、也不说为什么**
+   * （2026-09-20 实测：选了「只做导航」，点开始什么都不发生，连日志都没生成）。
+   *
+   * `null` = 还没问回来 / 问不到。**这时一律不拦**（见 `TaskForm`）：
+   * 界面拿不到判据时宁可放行，让命令层去拒绝并给出原因——
+   * **拒绝是看得见的，点不动是看不见的**。
+   */
+  const [requirement, setRequirement] = useState<WorkflowRequirement | null>(null);
+
+  /**
+   * 标定结果的一个**稳定签名**，用来当刷新依赖。
+   *
+   * 直接依赖 `draft` 会让每次按键都去问一遍后端；而只有「工作流改了」或
+   * 「标定结果变了」才会改变答案。用 JSON 串而不是对象本身：
+   * `area_marks` 每次 `onPatch` 都会换一个新对象，按引用比会一直不相等。
+   */
+  const marksSignature = JSON.stringify(draft?.area_marks ?? {});
+
+  useEffect(() => {
+    const workflow = runChoice?.workflow ?? null;
+    if (!draft || !workflow) {
+      setRequirement(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const all = await api.workflowRequirements(draft);
+        if (cancelled) return;
+        setRequirement(all.find((item) => item.workflow === workflow) ?? null);
+      } catch {
+        // 问不到就**不显示、也不拦**：真正的判据在装配期（后端会拒绝并列出原因）。
+        // 为了这条提示弹一个错误，反而会盖住页面上真正的问题。
+        if (!cancelled) setRequirement(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // 只在这两项变了才重问：答案只取决于它们。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runChoice?.workflow, marksSignature]);
+
   const activeTask = useMemo(
     () => tasks.find((task) => task.id === activeId) ?? null,
     [tasks, activeId],
@@ -327,7 +378,13 @@ export function App() {
       {tab === "tasks" && (
         <main className="app-grid">
           <div className="column">
-            <TaskForm disabled={running} onStart={handleStart} error={error} />
+            <TaskForm
+              disabled={running}
+              onStart={handleStart}
+              error={error}
+              needsContact={requirement?.needs_contact ?? null}
+              needsMessage={requirement?.needs_message ?? null}
+            />
             {info && draft && (
               <RuntimePanel
                 info={info}
@@ -336,6 +393,7 @@ export function App() {
                 runChoice={runChoice}
                 onPatchRunChoice={patchRunChoice}
                 activeMode={activeMode}
+                requirement={requirement}
                 onSave={handleSaveConfig}
                 dirty={dirty}
                 canSave={canSave}
@@ -351,7 +409,7 @@ export function App() {
                   <h2>当前任务</h2>
                   <dl className="meta-list">
                     <dt>收件人</dt>
-                    <dd className="strong">{activeTask.external_contact_name}</dd>
+                    <dd className="strong">{contactLabel(activeTask.external_contact_name)}</dd>
                     <dt>消息</dt>
                     <dd className="message-preview">{activeTask.text}</dd>
                     <dt>状态</dt>
