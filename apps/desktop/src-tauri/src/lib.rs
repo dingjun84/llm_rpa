@@ -15,10 +15,12 @@
 pub mod calibration;
 pub mod capture_hotkey;
 pub mod confirmation;
+pub mod cursor_trace;
 pub mod data_dir;
 pub mod icon_library;
 pub mod legacy_data;
 pub mod runtime;
+pub mod startup_log;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -36,7 +38,7 @@ use vision::RedactionPlan;
 
 use crate::confirmation::UiConfirmation;
 use crate::icon_library::IconEntry;
-use crate::runtime::{RuntimeConfig, RuntimeMode, WindowGeometry};
+use crate::runtime::{ModeNotices, RunChoice, RuntimeConfig, WindowGeometry};
 
 pub const EVENT_TASK_UPDATED: &str = "task://updated";
 const EVIDENCE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -56,6 +58,16 @@ pub struct StartTaskRequest {
     pub text: String,
     #[serde(default)]
     pub created_by: Option<String>,
+    /// 本次任务走哪一条路（**运行参数**，不写进配置）。
+    ///
+    /// ★ 为什么放在请求里、而不是让命令层去读 `state.config`：
+    /// 界面上那个下拉是**即时选择**——用户选完就该按这个跑，不需要先点
+    /// 「保存配置」。放在配置里必然出现两处真相（界面改的是草稿、
+    /// 命令层读的是已保存的那份），表现为「选了 A、跑的是 B」。
+    ///
+    /// **没有 `#[serde(default)]`**：请求里必须带上它。缺了就直接报反序列化错误，
+    /// 而不是悄悄退回配置里的默认值——那正是这次要消灭的行为。
+    pub run_choice: RunChoice,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,8 +125,9 @@ pub struct RuntimeInfo {
     pub template_max_side: u32,
     pub audit_entry_count: u64,
     pub is_windows: bool,
-    /// 演练模式的显式提示，避免被误当成真实发送。
-    pub notice: String,
+    /// 演练 / 真实两种模式各自的显式提示，避免被误当成真实发送。
+    /// 前端按**界面上当前选的那个模式**取（见 [`ModeNotices`]）。
+    pub mode_notices: ModeNotices,
     /// 启动时那次一次性搬迁的结果（**只在真发生过、或搬失败时**才有值）。
     ///
     /// 下发给界面是为了让「配置怎么突然有值了」和「配置怎么是空的」
@@ -544,8 +557,16 @@ fn start_task<R: Runtime>(
     // **先装配、再登记**。装配会因为配置问题失败（例如真实模式还没记录标定尺寸），
     // 那种情况下不该在任务列表里留下一个永远不会推进的草稿任务——
     // 列表里凭空多出一条"草稿"，会让人以为任务已经提交了。
+    // 本次任务走哪条路 —— **运行参数**，来自请求；既不读配置、也不写配置。
+    //
+    // ★ 这里以前是让 `build_runner` 去读 `config.workflow` 的，于是"界面上改了
+    // 工作流、没点保存"就变成"跑的还是旧的那条"（2026-09-19 实测：连跑三条，
+    // 三条日志里记的全是 `SearchContact`）。现在判据只有一个来源：请求。
+    let choice = request.run_choice;
+
     let runner = runtime::build_runner(
         &config,
+        choice,
         &task,
         &state.icons_dir(),
         state.audit.clone(),
@@ -600,7 +621,12 @@ fn start_task<R: Runtime>(
             &log_path,
             &format!("目标联系人 : {}", task.external_contact_name),
         );
-        append_task_log(&log_path, &format!("运行模式   : {:?}", config.mode));
+        // 记的是**本次请求带来的**模式（运行参数），不是配置里那个默认值。
+        //
+        // 模式与工作流是同一类东西：界面上选完就该按这个跑，不需要先点保存。
+        // 所以"日志里记的"与"界面上选的"必须始终一致——不一致就说明请求那条链路
+        // 出了问题，而不是"用户选错了"。
+        append_task_log(&log_path, &format!("运行模式   : {:?}", choice.mode));
         // 「哪条工作流」必须写进日志。
         //
         // 三条路的失败现象**一模一样**（都是「找不到联系人」），而处置方向完全相反：
@@ -609,19 +635,20 @@ fn start_task<R: Runtime>(
         // 而那条证据要往后翻十几行才看得到——于是很容易把"跑的不是这条工作流"
         // 误判成"这条工作流坏了"。
         //
-        // 记的是**已保存配置**里的值，也就是这次任务真正用的那份。
-        // 界面上的下拉是草稿，改了不保存不会生效（`start_task` 读的是 `state.config`）。
+        // 记的是**本次请求带来的运行参数**，也就是这次任务真正走的那条路。
+        // 它是即时选择、不落配置——所以"日志里记的"与"界面上选的"必须始终一致，
+        // 不一致就说明请求那条链路出了问题。
         append_task_log(
             &log_path,
             &format!(
                 "工作流     : {}（{:?}）",
-                config.workflow.describe(),
-                config.workflow
+                choice.workflow.describe(),
+                choice.workflow
             ),
         );
-        if config.workflow == Workflow::NavigateOnly {
+        if choice.workflow == Workflow::NavigateOnly {
             // 导航式只点一个图标，而"点的是哪个"决定了该看哪一组模板。
-            append_task_log(&log_path, &format!("导航目标   : {:?}", config.nav_target));
+            append_task_log(&log_path, &format!("导航目标   : {:?}", choice.nav_target));
         }
         append_task_log(&log_path, &format!("窗口类名   : {}", config.window_class));
         append_task_log(&log_path, &format!("目标程序   : {:?}", config.wecom_exe));
@@ -813,15 +840,6 @@ fn runtime_info<R: Runtime>(
     _app: AppHandle<R>,
 ) -> Result<RuntimeInfo, String> {
     let config = state.config.lock().map_err(|_| "配置锁已中毒".to_string())?.clone();
-    let notice = match config.mode {
-        RuntimeMode::DryRun => {
-            "当前为演练模式：全部使用替身端口，不会启动企业微信、不会产生任何真实输入。".to_string()
-        }
-        RuntimeMode::Live => {
-            "当前为真实模式：会操作本机企业微信窗口。发送期间请勿切换窗口或操作鼠标键盘。"
-                .to_string()
-        }
-    };
     Ok(RuntimeInfo {
         config,
         data_dir: state.data_dir.display().to_string(),
@@ -833,7 +851,7 @@ fn runtime_info<R: Runtime>(
         template_max_side: vision::MAX_TEMPLATE_SIDE,
         audit_entry_count: state.audit.count().unwrap_or(0),
         is_windows: cfg!(windows),
-        notice,
+        mode_notices: ModeNotices::all(),
         migration_note: state.migration_note.clone(),
     })
 }
@@ -1846,11 +1864,16 @@ pub fn with_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R
         save_icon_from_crop,
         delete_icon,
         delete_icon_variant,
-        click_icon
+        click_icon,
+        cursor_trace::draw_cursor_circle
     ])
 }
 
 pub fn run() {
+    // 启动期的每一步都落一份文件：窗口还没画出来进程就没了的时候，
+    // `data/startup.log` 是唯一的现场（理由见 `startup_log` 的模块文档）。
+    startup_log::begin();
+
     with_commands(tauri::Builder::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -1858,8 +1881,10 @@ pub fn run() {
             match AppState::new(&handle) {
                 Ok(state) => {
                     app.manage(state);
+                    startup_log::note("setup：应用状态就绪");
                 }
                 Err(err) => {
+                    startup_log::note(&format!("setup 失败：{err}"));
                     eprintln!("[desktop] 初始化应用状态失败：{err}");
                     return Err(err.into());
                 }

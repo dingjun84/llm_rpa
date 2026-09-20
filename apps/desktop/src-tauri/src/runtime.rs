@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use automation_core::{
-    AuditSink, CalibratedWindow, ContainsNameMatcher, HumanConfirmation, IconTemplate, LocalOcr,
+    AuditSink, ContainsNameMatcher, HumanConfirmation, IconTemplate, LocalOcr,
     NavTarget, RelativePoint, RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask,
     StrictContactMatcher, Workflow, WorkflowRunner, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
     DEFAULT_MIN_CONFIDENCE, DEFAULT_NAV_ICON_MIN_SCORE, DEFAULT_NAV_STRIP,
@@ -25,32 +25,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::calibration;
 
+mod mode;
+
+// ★ 再导出：`RuntimeMode` / `DemoScenario` 搬进了 `mode.rs`，但
+// `crate::runtime::RuntimeMode` 这条路径必须照旧成立——`lib.rs` 与
+// `runtime/tests.rs` 都按它引用（`use crate::runtime::{RunChoice, RuntimeMode, …}`）。
+// 少这一行，症状是一堆 `E0432: unresolved import`，看着像"文件没编进去"。
+pub use mode::{DemoScenario, ModeNotices, RuntimeMode};
+
 /// 单步超时相对 OCR 超时的余量（秒）。
 ///
 /// 一个步骤里除了 OCR 还有截屏、图像编码、进程启动这些开销，
 /// 单步超时必须比 OCR 超时宽松这么多，否则调大 `ocr_timeout_ms` 是白调的。
 const STEP_TIMEOUT_OCR_MARGIN_SECS: u64 = 5;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeMode {
-    DryRun,
-    Live,
-}
-
-/// 演练模式下要复现的场景，用于在界面上演示各类失败路径。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DemoScenario {
-    Happy,
-    DuplicateContact,
-    NearName,
-    LowConfidence,
-    HeaderMismatch,
-    LoginPrompt,
-    DeliveryMissing,
-    UnstableScreen,
-}
 
 /// 相对窗口的标定区域（比例，0.0–1.0）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,7 +246,14 @@ pub struct RuntimeConfig {
     pub nav_icon_min_score: f32,
     /// 导航图标搜索区（相对窗口比例 `[x, y, w, h]`）。
     pub nav_strip: [f32; 4],
-    /// 本次任务走哪条路。见 [`automation_core::Workflow`]。
+    /// 界面打开时**默认选中**的那条路。见 [`automation_core::Workflow`]。
+    ///
+    /// ★★ **真正跑的那条路不在这里。** 它是本次任务的运行参数 [`RunChoice`]，
+    /// 由 `start_task` 从任务请求里取，**既不读这个字段、也不写回配置**。
+    /// 这个字段只负责给界面一个初始值（"上次是这样"），改它不影响任何任务。
+    ///
+    /// 之所以拆开：放在配置里就必然出现两处真相——界面改的是草稿、
+    /// 命令层读的是已保存的那份，于是「界面上选了 A、跑的是 B」。
     ///
     /// ## 为什么要显式选，而不是自动判断
     ///
@@ -273,6 +267,9 @@ pub struct RuntimeConfig {
     /// 这两种情况的处置方向完全相反。所以由操作者显式指定。
     pub workflow: Workflow,
     /// 「只做导航」时要点哪一个图标（只有 [`Workflow::NavigateOnly`] 读它）。
+    ///
+    /// 与 [`Self::workflow`] 同理：这只是界面上的初始值，
+    /// **本次任务要点哪个**由 [`RunChoice::nav_target`] 决定。
     ///
     /// 把"找图标 → 点它"单独拎出来跑一遍，是为了在图标匹配不准时**一眼看出来**：
     /// 混在完整流程里的话，点错图标的症状会表现为"找不到联系人"，
@@ -418,10 +415,7 @@ impl RuntimeConfig {
     pub fn to_runner_config(&self) -> RunnerConfig {
         let (contact_panel, chat_header, chat_body, composer) = self.regions.to_runner_regions();
         RunnerConfig {
-            platform_label: match self.mode {
-                RuntimeMode::DryRun => "dry-run".to_string(),
-                RuntimeMode::Live => std::env::consts::OS.to_string(),
-            },
+            platform_label: self.mode.platform_label(),
             min_confidence: self.min_confidence.clamp(0.0, 1.0),
             confirmation_ttl: Duration::from_secs(self.confirmation_ttl_secs.max(5)),
             step_timeout: self.effective_step_timeout(),
@@ -439,16 +433,9 @@ impl RuntimeConfig {
             // 落点比例原样透传，**不在这里夹到 0–1**：夹边界会把「配置写错了」
             // 变成「滚了半天没反应」，而核心层会直接报错，那才是能查的失败。
             scroll_anchor: RelativePoint::new(self.scroll_anchor.x, self.scroll_anchor.y),
-            calibrated_window: match self.mode {
-                // 演练模式跑的是替身窗口，没有"真实窗口尺寸"这回事。
-                // 拿配置里的尺寸去比，只会把每个演练场景都变成失败。
-                RuntimeMode::DryRun => None,
-                RuntimeMode::Live => self.calibrated_window.map(|geometry| CalibratedWindow {
-                    width: geometry.width,
-                    height: geometry.height,
-                    scale_factor: geometry.scale_factor,
-                }),
-            },
+            // 这里读的是**配置里的默认模式**。真正开跑时 `build_runner` 会用
+            // 请求带来的模式重算一遍——判断只有 `RuntimeMode::calibrated_window` 一处。
+            calibrated_window: self.mode.calibrated_window(self.calibrated_window),
             max_search_sweeps: self.max_search_sweeps.clamp(1, 20),
             liveness_check: self.liveness_check,
             // 刻意**不设上限**：这是"最多等多久"的上限值，操作者愿意等多久是他的选择。
@@ -669,8 +656,11 @@ fn required_marks(workflow: Workflow) -> &'static [&'static str] {
 }
 
 /// 缺哪些区域、分别叫什么（给操作者看的名字取自标定清单，**不在这里另起一份**）。
-fn missing_marks(config: &RuntimeConfig) -> Vec<String> {
-    required_marks(config.workflow)
+///
+/// 判据按**本次要跑的那条路**（`choice.workflow`）算，不按配置里那个默认值——
+/// 否则会出现「界面选了搜索式、后端按列表式检查」，缺的区域一个都不报。
+fn missing_marks(config: &RuntimeConfig, choice: RunChoice) -> Vec<String> {
+    required_marks(choice.workflow)
         .iter()
         .filter(|key| mark_region(config, key).is_none())
         .map(|key| {
@@ -737,29 +727,116 @@ pub fn workflow_requirements(config: &RuntimeConfig) -> Vec<WorkflowRequirement>
         .collect()
 }
 
+/// 本次任务走哪一条路 —— **运行参数，不进配置文件**。
+///
+/// ★★ 为什么不放进 [`RuntimeConfig`]：配置回答的是"这台机器怎么配"，
+/// 而这条路回答的是"这一次要做什么"。放进配置就必然出现**两处真相**——
+/// 界面改的是草稿、`start_task` 读的是已保存的那份，于是表现为
+/// 「界面上选了列表扫描式、跑的还是搜索式」。
+/// 2026-09-19 实测：连跑三条任务，三条 `task-*.log` 里记的全是 `SearchContact`。
+///
+/// 做成运行参数之后：**界面选的与真正跑的是同一个值**，而且不写进 `config.json`——
+/// 换一次任务就选一次，不留痕，也不需要为了跑一次先去点「保存配置」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunChoice {
+    /// 这一次跑**演练还是真实**。
+    ///
+    /// 它和 [`RuntimeConfig::mode`] 是同一个枚举，但回答的是不同的问题：
+    /// 配置里那个是"这台机器默认怎么跑"，这里是"这一次怎么跑"。
+    ///
+    /// ## 为什么模式也必须由请求带
+    ///
+    /// 它踩的是**同一个坑**：界面上的下拉改的是草稿、`start_task` 读的是已保存的
+    /// `state.config`，于是"界面上切成真实模式、实际按演练跑"（或者反过来——
+    /// **那个方向更危险**：以为在演练、其实在真实客户端上操作）。
+    /// 工作流那条路 2026-09-19 已经改成运行参数，模式当时**刻意留着没动**
+    /// （影响面更大），现在一并改掉。
+    ///
+    /// ## 它不只是"换一组端口"
+    ///
+    /// 模式还决定三件事，全部在装配期落地：
+    /// - 用哪一组端口（替身 / 真实）；
+    /// - **要不要带标定窗口**（演练模式没有"真实窗口尺寸"这回事）；
+    /// - 核心层审计里的"平台"字段（`dry-run` 还是 `windows`）。
+    ///
+    /// 所以它是 `RunChoice` 的字段，而不是 `build_runner` 的第四个参数：
+    /// 这三个判断都只该有一处。
+    pub mode: RuntimeMode,
+    /// 走哪一条路。见 [`automation_core::Workflow`]。
+    ///
+    /// ## 为什么要显式选，而不是自动判断
+    ///
+    /// 「找联系人」有两条完全不同的路：在顶部搜索框里打字、从联想下拉里挑人；
+    /// 或者在会话列表里往下滚、用 OCR 一行行认名字。两者看的是**不同的界面**，
+    /// 需要的标定区域也不同（搜索式要 `main_search` / `search_dropdown` /
+    /// `contact_profile`，列表式只用 `list_area`）。
+    ///
+    /// 而它们的失败现象一模一样：**「找不到联系人」**。自动判断一旦选错，
+    /// 现场就分不清是"搜索没生效"还是"列表里真的没有这个人"——
+    /// 这两种情况的处置方向完全相反。所以由操作者显式指定。
+    pub workflow: Workflow,
+    /// 「只做导航」时要点哪一个图标——**本次任务**要点的那个
+    /// （只有 [`Workflow::NavigateOnly`] 读它）。
+    pub nav_target: NavTarget,
+}
+
+impl Default for RunChoice {
+    fn default() -> Self {
+        Self {
+            // 默认走**演练**：它是安全的那一侧。这份默认值只在测试与
+            // "请求里没带"（不可能，字段必填）时用到。
+            mode: RuntimeMode::DryRun,
+            workflow: Workflow::SearchContact,
+            nav_target: NavTarget::Contact,
+        }
+    }
+}
+
 /// 组装一个可运行的 [`WorkflowRunner`]。
 ///
 /// `icons_dir` 是**图标库目录**（由调用方按 [`RuntimeConfig::icons_dir`] 解析好）。
 /// 之所以从外面传进来而不是在这里算：算它需要"配置没写时的兜底目录"，
 /// 那是应用状态才知道的事（见 `AppState::icons_dir`）。
 ///
+/// `choice` 是**本次任务**要跑的那条路（运行参数，来自任务请求，见 [`RunChoice`]）。
+/// 它决定跑演练还是真实、用哪几块标定区域、要不要点导航图标；**不写回配置**。
+/// 注意它带来的模式**会覆盖** `config.mode`——配置里那个只是"这台机器的默认值"。
+///
 /// `confirmation` 由调用方注入：真实界面走 [`crate::confirmation::UiConfirmation`]，
 /// 因此"人工确认"不是被跳过的环节，而是真的会阻塞等待操作者。
 pub fn build_runner(
     config: &RuntimeConfig,
+    choice: RunChoice,
     task: &SendTask,
     icons_dir: &std::path::Path,
     audit: Arc<dyn AuditSink>,
     ledger: Arc<dyn SendLedger>,
     confirmation: Arc<dyn HumanConfirmation>,
 ) -> Result<WorkflowRunner, String> {
+    // ★★ 第一件事：把**本次请求带来的模式**并进配置副本。
+    //
+    // 放在所有校验之前，是因为下面每一处"模式相关"的判断，问的都是
+    // "**这一次**跑的是演练还是真实"：
+    // - 真实模式没有标定尺寸就拒绝开跑；
+    // - 挑替身端口还是真实端口；
+    // - 审计里记 `dry-run` 还是当前系统；
+    // - 要不要把标定窗口交给核心层（演练模式没有"真实窗口尺寸"这回事）。
+    //
+    // 这四处**只该有一个判据**。所以不在这里逐条 `if`，而是把模式本身换掉，
+    // 让它们照旧读 `config.mode` —— 之后再加第五处也不会漏。
+    //
+    // ⚠️ 只改**内存里的副本**：不写回 `state.config`、不落盘。这正是
+    // 「界面上选的那个模式，不点保存也生效」的落点。
+    let mut config = config.clone();
+    config.mode = choice.mode;
+
     // 真实模式下没有标定尺寸就拒绝开跑。客户端由操作者手动启动，程序没法从窗口外面
     // 分辨"这是不是我标定过的那个窗口、是不是那个尺寸"，只能靠这条记录。
     // 少了它，"按标定尺寸工作"就只是一句口号：尺寸变了区域会整体偏移，而点击
     // 落偏的后果是点到别的地方——宁可停在原地让人把窗口恢复回去。
     if config.mode == RuntimeMode::Live && config.calibrated_window.is_none() {
         return Err(
-            "真实模式必须先点「记录窗口尺寸」并保存配置：\
+            "真实模式必须先点「记录窗口尺寸」并保存配置（模式本身不用保存）：\
              任务只在标定时的窗口尺寸下运行，否则四个区域会整体偏移。"
                 .to_string(),
         );
@@ -782,14 +859,14 @@ pub fn build_runner(
     //
     // 和上面两条同一个道理：**放在装配期**。装配失败**不会在任务列表里
     // 留下记录**，装配成功才会登记。所以能提前判的一律提前判。
-    let missing = missing_marks(config);
+    let missing = missing_marks(&config, choice);
     if !missing.is_empty() {
         return Err(format!(
             "「{}」还缺 {} 块没标定的区域：{}。\
              请到「界面标定」页按提示切到对应界面、截图、把这几块框出来，\
              保存配置后再跑——否则会在走到那一步时转人工，\
              而那时任务已经登记进列表了。",
-            config.workflow.describe(),
+            choice.workflow.describe(),
             missing.len(),
             missing.join("、")
         ));
@@ -821,13 +898,25 @@ pub fn build_runner(
     }
 
     let mut ports = match config.mode {
-        RuntimeMode::DryRun => dry_run_ports(config, task),
-        RuntimeMode::Live => live_ports(config)?,
+        RuntimeMode::DryRun => dry_run_ports(&config, task),
+        RuntimeMode::Live => live_ports(&config)?,
     };
     // 确认端口始终来自界面，保证真实模式下也必须人工确认。
     ports.confirmation = confirmation;
 
     let mut runner_config = config.to_runner_config();
+
+    // 运行参数覆盖「配置里的默认值」。
+    //
+    // `to_runner_config` 是纯粹的"配置 → 核心层结构"映射，它照抄的是配置里
+    // 那个**默认值**字段；本次真正要跑的是请求带来的这一份。**只改内存里的副本**，
+    // 不回写 `state.config`、也不落盘——这正是「选工作流不要保存」的落点。
+    //
+    // ⚠️ 模式不在这里覆盖：它在本函数**开头**就换掉了 `config.mode`，
+    // 所以 `to_runner_config()` 出来的 `platform_label` / `calibrated_window`
+    // 已经是本次的那一份。再覆盖一遍等于把判据写成两处。
+    runner_config.workflow = choice.workflow;
+    runner_config.nav_target = choice.nav_target;
 
     // ── 导航图标：这一次要跑哪几个目标 ──────────────────────────
     //
@@ -835,8 +924,8 @@ pub fn build_runner(
     // 这个开关约束——那个开关说的是"查找之前要不要先切一次视图"。
     // 另外两条路只会在开关打开时切一次，而且固定切到联系人视图
     // （列表扫描式扫的就是联系人列表；搜索式的搜索框也在主界面上）。
-    let nav_targets: Vec<NavTarget> = match config.workflow {
-        Workflow::NavigateOnly => vec![config.nav_target],
+    let nav_targets: Vec<NavTarget> = match choice.workflow {
+        Workflow::NavigateOnly => vec![choice.nav_target],
         _ if config.navigate_before_search => vec![NavTarget::Contact],
         _ => Vec::new(),
     };

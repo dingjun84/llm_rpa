@@ -412,7 +412,7 @@
 
 **为什么没合成一处**：`RegionCalibration` 提供的**直接填数字**在"我已经知道
 该填多少"时比拖框快，删掉是功能倒退。而把它改成从后端清单读标签，
-需要 `RuntimePanel` 也去拉一次 `list_calibration_plan`，多一次 IPC 与一层传递。
+需要「任务」页那个配置面板也去拉一次 `list_calibration_plan`，多一次 IPC 与一层传递。
 
 **要修的话**（两条路，选一条）：
 
@@ -568,40 +568,110 @@
 | 原文件 | 现在 | 抽出的测试 |
 | --- | --- | --- |
 | `automation-core/src/runner.rs`（一度 2136，基线 1395） | `runner/mod.rs` 1224 + 4 个子模块 | — |
-| `src-tauri/src/runtime.rs`（1541） | 893 | `runtime/tests.rs` 653 |
+| `src-tauri/src/runtime.rs`（1541） | 959 | `runtime/tests.rs` 711 |
 | `vision/src/template.rs`（1059） | 667 | `template/tests.rs` 396 |
 | `automation-core/src/state.rs`（532） | 261 | `state/tests.rs` 275 |
-| `src-tauri/src/lib.rs`（1931） | 1847 | `src/tests.rs` 88 |
+| `src-tauri/src/lib.rs`（1931） | 1894 | `src/tests.rs` 88 |
 
-**还欠着的五处**（这轮**只涨没拆**，别以为处理过了）：
+★ **T24 之后 `lib.rs` 又搬出去一段**（不是测试，是整段功能）：
+1993 → **1896**，搬出 `src/cursor_trace.rs`(117)。**仍然低于基线 1903**。
+⚠️ 跨模块的命令必须 `pub`，否则 `E0603: macro import … is private`
+（错指向 `generate_handler!`）；模块要自己 `use`（漏 `Manager` ⇒
+`E0599: no method named get_webview_window`）。细节见 `CONVENTIONS.md` §9。
+
+⚠️ 后两行是 **T23**（工作流改成运行参数）之后的实测值：`runtime.rs` +66、`lib.rs` +47、
+`runtime/tests.rs` +58。两者**仍低于各自基线**（1039 / 1903），所以没破坏「只减不增」；
+`runtime/tests.rs` 是测试文件，本来就不受行数限制。
+
+★★ **T23 收尾（模式也改成运行参数）这一轮，`runtime.rs` 一度破了基线，当天就压回来了**：
+959 → 1049（**破基线**，基线 1039）→ **984**（✅ 重新低于基线）。
+
+破的那一下是因为 `RunChoice.mode` 与 `RuntimeMode` 的三个方法
+（`platform_label` / `calibrated_window` / `notice`）及其文档净增了约 90 行。
+**拆法**（`CONVENTIONS.md` §9 里也记了一份，可照抄）：
+
+> `RuntimeMode`（含那三个方法）与 `DemoScenario` 整段搬成 **`runtime/mode.rs`**（100 行）。
+> 选它的理由是**自成一类**：纯数据 + 纯函数，不碰端口、不碰配置的其余部分、不碰装配流程。
+> ⚠️ 三个坑，按顺序踩过：
+> ① 可见性 —— `notice()` 被 `lib.rs` 调 ⇒ `pub`；另两个只被 `runtime.rs` 调 ⇒ `pub(super)`。
+> 　 漏了报 `E0624: method is private`，**指向调用点而不是定义处**，容易找错方向。
+> ② 父模块要加 `pub use mode::{DemoScenario, RuntimeMode};` 保住原来的路径，
+> 　 否则 `lib.rs` 与 `runtime/tests.rs` 的 `use crate::runtime::{…}` 一起报
+> 　 `E0432: unresolved import`，看着像"文件没编进去"。
+> ③ 搬完 `cargo check --tests` 会报出**因为搬走而变成未使用的 import**
+> 　（这次是 `CalibratedWindow`，它的最后一次使用就是那个方法的签名），删掉即可。
+> 顺带：`notice()` 返回 `&'static str`、由 `ModeNotices::all()` 成对下发 —— 这两处没拆散。
+
+同轮 `lib.rs` 1896 → 1922（基线 1903，**+19，也破了**）→ **1900**（✅ 压回来了）。
+破的那一下来自 `startup_log.rs` 的接线（`begin` + 两处 `note`）+ `ModeNotices`
++ 任务日志改记请求里的模式；压回来的办法是**把 `ModeNotices` 搬进 `runtime/mode.rs`**
+（它讲的正是"两种模式各自是什么"，跟 `RuntimeMode::notice()` 是同一件事，不用改设计）。
+
+⚠️ **这是"搬出去又被填回来"的第二次**（第一次是 T24 搬出 `cursor_trace.rs` 之后又长回来）。
+**教训：搬走一大块之后，新功能会继续往里填，一两轮就又回去了。**
+所以往 `lib.rs` 加东西之前，**先问"这块能不能跟着某个已有的子模块走"**。
+`lib.rs` 若还要减，下一个切口是 `start_task`（225 行）：
+把"登记任务 + 落日志快照"整段提成 `task_registry.rs`。**那是核心命令，动它要单独一轮。**
+
+**还欠着的两处**（这轮**只涨没拆**，别以为处理过了。`runtime.rs`、`winapi.rs`、
+`RuntimePanel.tsx` 与 `IconLibraryPanel.tsx` 原本也在这张表里，**都已拆完 ⇒ 移出**）：
 
 | 文件 | 基线 | 现在 | 涨 |
 | --- | --- | --- | --- |
-| `apps/desktop/src/components/RuntimePanel.tsx` | 596 | 782 | +186 |
-| `apps/desktop/src/components/IconLibraryPanel.tsx` | 983 | 1064 | +81 |
-| `crates/platform-windows/src/winapi.rs` | 862 | 915 | +53 |
 | `apps/desktop/src/components/CalibrationPanel.tsx` | 462 ⚠️ | 722 | +260 |
-| `apps/desktop/src/types.ts` | — | 676 | 没记过基线 |
+| `apps/desktop/src/types.ts` | — | 710 | 没记过基线 |
 
-⚠️ **后两行是 2026-09-19 晚做「截图触发方式」时实测发现的**：`CONVENTIONS.md` §9 的
+⚠️ **`CalibrationPanel.tsx` 与 `types.ts` 这两行是 2026-09-19 晚做「截图触发方式」时
+实测发现的**：`CONVENTIONS.md` §9 的
 正文写着 CalibrationPanel「已拆出 `CalibrationSteps.tsx`(132) 与 `StaleMarksNotice.tsx`(48)，
 **回到 462**」——那两处拆分确实存在、行数也对得上，但主文件实测 **722**，
 正文那个 462 是错的（拆分之后又长了 260 行，没人记）。`types.ts` 则**从来没进过那张表**。
 **没有改基线表**（§9 明说那张表是存量、往里加等于作废规矩），只把实测值记在这里。
 
-这三处不像抽测试那样机械，得真做拆分设计：
+这几处不像抽测试那样机械，得真做拆分设计：
 
-1. **`RuntimePanel.tsx`**：现在一个文件里塞了「模式 / 工作流 / 窗口 / 区域 / 参数」
-   五组表单。可按组提成 `RuntimePanel/{Mode,Workflow,Window,Regions,Params}.tsx`，
-   各自吃 `draft` + `onPatch`（与 `IconLibraryPanel` 的写法一致）。
-   ⚠️ 拆的时候注意：**配置草稿由 `App` 持有**，子组件不许自己 `useState` 存一份。
-2. **`IconLibraryPanel.tsx`**：涨的是「导航目标（联系人 / 聊天历史）」那一组。
-   可与「用于导航」勾选、模板测试合起来提成 `NavIconSection.tsx`。
-3. **`winapi.rs`**：涨的是 `unicode_input` / `send_unicode_text`（逐字输入原语）。
-   可按「截屏 / 输入 / 窗口」提成 `winapi/{capture,input,window}.rs`，
-   但它是 `unsafe` 集中地，拆之前先把边界理清楚（见 `CONVENTIONS.md` 的 `unsafe` 边界那条）。
+1. ✅ **`RuntimePanel.tsx` 已拆完**（2026-09-19）：858 → **288**。
+   拆法就是下面这条"现成的切口"，但**多做了一刀** —— 只拆 `RunChoiceFields`
+   只到 733 行，仍高于基线 596，所以按**归属**又拆了三个：
+   `TargetWindowSection.tsx`(202)、`AdvancedParamsSection.tsx`(192)、
+   `TypingTextSection.tsx`(87)。
+   ★ **判据一句话**：**凡是要"保存配置"的留在主文件，只管"这一次怎么跑"的搬走**。
+   ★★ **拆 `.tsx` 不要用搬运脚本**（`large-file-mechanical-split` skill 里也写了）：
+   提组件要先设计 props，脚本只能搬、搬完还得改 import，手改更快。
+   ★ 收尾提醒：`npm run build` 会因为沙箱的 safe-delete 拦住 `vite` 清 `dist/`
+   而报 `SAFE_DELETE_BULK_CONFIRM_REQUIRED` —— **那不是代码错**，
+   先把 `dist` 改名（`mv dist dist.stale-build`）再 build 即可。
+2. ✅ **`IconLibraryPanel.tsx` 已拆完**（2026-09-19）：1064 → **808**。
+   ★ 实际切的**不是**计划里那一刀（「导航目标」那一组）—— 那一组与列表行渲染
+   绞在一起，硬切要往下传十几个 props。改切了两处**边界更干净**的：
+   - `IconList.tsx`(225)：整个列表（含那两个"两下确认"状态 `armed` / `armDelete`，
+     **它们只被列表用**，搬走以后主面板少一份噪声状态）；
+   - `NavResultSections.tsx`(140)：两段只读结果预览（连 `ShotOverlay` 一起），
+     **入参就是后端回来的两份结果，没有回调、没有本地状态** —— 这是全文件里
+     唯一能整块搬走而不牵动别处的一段。
+   ★ 顺手把 `normalizeName` 提成 `src/iconNames.ts`：它是**判据**
+   （"算不算同一个图标"），现在主面板与列表都要用，**不能再各抄一份**。
+   ★⚠️ **踩到的坑**：`cut()` 这类"起点→终点"替换，**终点锚点本身会被保留**，
+   所以新内容里**不要再写一遍终点** —— 这次就多出了一段重复的
+   `</section> ); }`（`tsc` 会报错，但要是恰好写成合法结构就查不出来了）。
+   另外**替换区间套住的东西要逐条数一遍**：这次把「测试全部已选图标」按钮
+   一起删掉了（它在列表后面、同一段里），是回读时才发现的。
+3. ✅ **`winapi.rs` 已拆完**（2026-09-19，两刀）：1215 → 985 → **796**（基线 862 ✅）。
+   - 第一刀 `winapi/cursor.rs`(267)：光标轨迹。踩到的三个坑记在
+     `CONVENTIONS.md` §9「第二次照抄」。
+   - 第二刀 `winapi/input.rs`(228)：键盘 / 鼠标 / 滚轮 / 逐字输入的原语。
+     ★ 这一刀的特殊之处：**「输入」段被「光标轨迹」的 `mod cursor;` 声明从中间切开**
+     （`scroll_wheel` 在声明之前、`left_click` 在声明之后），所以是**两段**（A + B）
+     合成一个文件 —— 脚本里按两对行号切片，别硬当一整段。
+   - ★★ `mouse_move_input` 的处理：它定义在「输入」段里，但**唯一调用方是同级子模块
+     `cursor.rs`** ⇒ 给它 `pub(super)`，**不** `pub use` 出去，`cursor.rs` 改成
+     `use super::input::mouse_move_input;`。判断依据是**调用方在哪个模块**，
+     不是"它长在哪一段"。
+   - ★ 它的文档里原来链到 `[move_cursor_absolute]`（在 `cursor.rs`）—— 搬进 `input.rs`
+     以后那个链接解析不了（rustdoc broken intra-doc link）⇒ 改成纯代码片段。
+     **搬走带 intra-doc link 的东西时，顺手 grep 一遍 `[` 链接。**
 
-**验收**：拆完 `wc -l` 三项都**不高于基线**，`cargo test --workspace` 全绿。
+**验收**：拆完 `wc -l` 这几项都**不高于基线**，`cargo test --workspace` 全绿。
 
 ---
 
@@ -820,7 +890,209 @@ self.runner.ports.confirmation.confirm_send(...)?;            // ② 登记确�
 - ⏳ **人眼确认还没拿到**：操作者是否**看见**了光标沿轨迹飞过去。
   改之前是一步跳过去（`SetCursorPos`），人眼很容易错过；
   现在有 120–800ms 的缓动轨迹，理论上看得见。**还没人确认过**。
+  ★ **验收手段已经有了**：「轨迹自检」页签（**T24**）——点一下按钮就能单独看一遍
+  光标怎么走，不必把整条工作流跑起来。
   ⚠️ 跑之前要先让微信在前台。**置前的实测规律**：前台锁定只在
   **用户刚有输入之后**的一段时间内生效——操作者一空闲，后台进程就能置前
   （`screen_probe focus` 在桌面为前台时成功过）。所以"抢不到前台"并不是死路，
   而是**取决于操作者当时有没有在动键盘鼠标**。
+
+---
+
+## T23 「本次走哪条路」改成了运行参数（2026-09-19），还剩「模式」是同款陷阱
+
+**需求原话**（2026-09-19）：
+
+> 「我选择了三条工作流，点击任务运行，执行逻辑全部是进行搜索框，输入文字这个流程。」
+> 「我希望是用当前界面选的哪个工作流，就执行哪个，**这个不要保存**。」
+
+### 根因（有实证，不是推测）
+
+界面上的工作流下拉改的是**配置草稿** `draft`；而 `start_task` 读的是**已保存的**
+`state.config`。两者不一致时，界面上看起来选了、实际跑的是旧的。
+实证：6 条 `data/task-*.log`（19:41）**每一条**都记
+「工作流 : 搜索式查找联系人（SearchContact）」，终态全部 `NeedsHumanReview`。
+界面上本来有一行警告说"还没保存"，**没拦住**——因为"选工作流"和"保存配置"
+在人的心智里是两件事。
+
+### 已做完的
+
+工作流 / 导航目标改成**运行参数** `RunChoice { workflow, nav_target }`：
+
+- `StartTaskRequest.run_choice` **必填**，**没有 `#[serde(default)]`** —— 缺了直接
+  反序列化失败，而不是悄悄退回配置里的默认值（"悄悄退回"正是这个 bug 本身）。
+- `start_task` 把它交给 `build_runner(config, choice, task, …)`；**既不读也不写**
+  `config.workflow`。`RuntimeConfig.workflow` / `.nav_target` 保留，但降级为
+  **界面初始值**，装配期不再读。
+- 界面：`App` 持有 `runChoice`（**不进 `draft`、不置 `dirty`**），`handleStart` 补进请求；
+  `RunChoiceFields` 的三个选择器（模式 / 工作流 / 导航目标）绑它；`TaskForm` **不碰**这件事（用 `TaskFormValues = Omit<StartTaskRequest, "run_choice">` 钉住）。
+  ⚠️ `runChoice` 的初值只在**第一次**读到配置时定 —— 写成 `useEffect(…, [info])`
+  会让每次「保存配置」都把用户当下选的那条路重置回去。
+- 回归用例两条：`runtime::tests::the_run_choice_decides_the_workflow_not_the_config`（装配层）、
+  `ipc_flow.rs::start_task_follows_the_request_not_the_saved_config`（完整 IPC 链路）。
+
+### ⏳ 还没做完 / 待确认
+
+1. **真机复核**：跑一条真实任务，确认 `data/task-*.log` 里那行「工作流」与界面上选的一致。
+   自动化用例只能证明"请求里的值被读到了"，证明不了"界面把值填进了请求"。
+2. ~~**「模式」（演练 / 真实）还是老样子**~~ → **2026-09-19 已改成运行参数**
+   （用户原话：「「模式」（演练 / 真实）也改成读界面的选项，配置里只做为默认值加载」）。
+   见下面「模式那一条是怎么改的」。
+3. **真机复核（模式）**：界面上切到「真实模式」**不点保存**直接开始任务，
+   确认 `data/task-*.log` 里那行「运行模式」记的是 `Live`。
+   自动化用例只能证明"请求里的值被读到了"。
+4. `RuntimeConfig.workflow` / `.nav_target` / `.mode` 现在只剩"界面初始值"这一个用途。
+   等真机复核通过、用户也不再需要"上次用的那条路"作为默认时，可以考虑把这几个
+   字段彻底删掉（`config.json` 里的旧值会被 serde 忽略，不会报错）。
+
+### 模式那一条是怎么改的（2026-09-19 同轮）
+
+`RunChoice` 加了 `mode: RuntimeMode`（**放在 `workflow` 之前**）。
+
+★ **它不是"换一组端口"那么简单**，这是它当初被刻意留下的原因。模式决定四件事，
+**全部在装配期落地**：
+
+| 判断 | 在哪 |
+|---|---|
+| 用替身端口还是真实端口 | `build_runner` 里 `match config.mode` |
+| 真实模式没有标定尺寸就拒绝开跑 | `build_runner` 开头 |
+| 核心层审计记 `dry-run` 还是当前系统 | `RuntimeMode::platform_label()` |
+| 要不要把标定窗口交给核心层 | `RuntimeMode::calibrated_window()` |
+
+**做法：不在装配函数里逐条 `if`，而是在 `build_runner` 的**第一件事**就把模式并进
+配置副本**：
+
+```rust
+let mut config = config.clone();
+config.mode = choice.mode;
+```
+
+⇒ 上面四处照旧读 `config.mode`，**判据仍然只有一处**，以后再加第五处也不会漏。
+后两个方法（`platform_label` / `calibrated_window`）由 `to_runner_config()`
+（配置默认值路径）与本次覆盖路径**共用**，避免两处 `match` 漂移。
+
+**界面侧**：
+
+- 模式下拉绑 `runChoice.mode`（**不进 `draft`、不置 `dirty`**），与工作流同款。
+- 页头那个模式徽标、`canSave` 的区域校验、演练场景选择器的显隐，
+  一律改看 `App` 算出来的 **`activeMode`**（`runChoice.mode ?? info.config.mode`）。
+  ⚠️ 不能再用 `draft.mode`——那只是配置里的默认值。
+- `RuntimeInfo.notice`（单句）→ **`mode_notices`（演练 / 真实各一句）**。
+  模式是运行参数，只发一句就必须在"界面选的"和"配置存的"里选一个，
+  而选错的方向恰好是最危险的那个（提示说"演练"、实际在动真窗口）。
+  文案仍只有一处：`runtime::RuntimeMode::notice()`。
+- **保存配置时会顺手把当前选的模式记成下次的默认值**（`handleSaveConfig` 里
+  `{ ...draft, mode: activeMode }`）。否则配置里那个字段永远停在第一次写下的值，
+  "上次用的模式"就再也不会被记住。
+
+**回归用例两条**（与工作流那对同款）：
+`runtime::tests::the_run_choice_decides_the_mode_not_the_config`（装配层，**两个方向都钉**）、
+`ipc_flow.rs::start_task_takes_the_mode_from_the_request_not_the_saved_config`（完整 IPC 链路）。
+
+---
+
+## T24 「轨迹自检」页签（2026-09-19）：等一次人眼验收
+
+**需求原话**（2026-09-19）：
+
+> 「界面上增加一个页签，增加一个额外的测试功能，我点击按钮，就帮我以点击点为中心
+> 　用鼠标移动一个圆形的轨迹，半径为窗口的1/2左右。」
+
+半径口径经确认取 **本程序窗口的 1/2**（不依赖微信是否开着、不依赖窗口标定做没做）。
+
+### 做成了什么
+
+- 平台层：`winapi::circle_points`（**纯计算**，可测）+ `winapi::move_cursor_circle`。
+  时长 = 周长 ÷ 速度，夹在 `CIRCLE_MIN_DURATION`(400ms) / `CIRCLE_MAX_DURATION`(8s)；
+  步数下限 `CIRCLE_MIN_STEPS`(24)。**匀速、不做缓动** —— smoothstep 是给"从 A 到 B"
+  这种有始有终的动作用的，圆周逐段缓动会一顿一顿。开始前先按普通轨迹**走到**圆的起点
+  （正右方），不跳过去。
+- 命令层：`draw_cursor_circle` → `CircleTraceView`。半径 = `inner_size()` **短边**的一半
+  （按宽度算的话，宽扁窗口的圆会超出屏幕高度）。
+- 界面：「轨迹自检」页签 → `CursorMotionPanel.tsx`。**点按钮 → 倒计时 3 秒 → 再调命令**，
+  操作者可以在倒计时里把鼠标挪到想当圆心的位置。
+- 命令层**单独成模块** `src-tauri/src/cursor_trace.rs`（不是塞进 `lib.rs`）：
+  `lib.rs` 的基线是 1903 行，这段自己就有近百行，塞进去就破了。
+  注册点仍然只有 `lib.rs` 的 `with_commands` 一处。搬移的坑记在 `CONVENTIONS.md` §9。
+- 倒计时的"怎么数"抽成了 `src/countdown.ts`（`useCountdown` / `COUNTDOWN_TICK_MS` /
+  `remainingSeconds`），`CaptureTrigger` 一并改用它。**秒数不共用**（那边 8 秒要够切回
+  客户端输完联系人名，这边 3 秒只是挪一下手）。
+  ⚠️ `WindowPicker` **刻意不改**：它那个定时器每跳一次还要顺便采一次"光标下是哪个窗口"，
+  数与采是同一拍，拆开会出现"倒计时结束了但最后一次采样还没回来"。
+
+### 取舍与已知限制
+
+1. **速度不收界面参数**：光标速度目前不是可配项（`to_runner_config()` 给平台层用的是
+   `..default()`，速度就落在 `WindowsDesktopConfig::default().pointer_speed_px_per_sec`）。
+   所以命令**只认那一个来源**，并把实际用的值回报给界面。
+   让界面传值 = 在 TS 里再抄一份默认值 = 两处真相：以后有人调了平台层默认值，
+   自检里看到的快慢会和任务里不一致，而**两边都看不出来**。
+   将来如果速度变成可配项，这条命令要改成**从配置读**，而不是从请求参数读。
+2. **不受运行模式限制**（演练模式下也能用）：它只移动光标，不点击、不输入、不抢前台。
+   与「界面标定」那组命令同一个理由。
+3. **一圈走完才返回**，界面在期间没有任何中间反馈（只有按钮变灰）。
+   这是刻意的——光标自己就是那个反馈；做成流式回报要新开一条事件通道，
+   为一条演示功能不值得。**倒计时存在的第二个理由就是它**。
+4. 切页签会卸载面板，倒计时与上次的结果都会丢。与其它页签一致（一次性展示，不必留住）。
+
+### ⏳ 还没做完
+
+1. **人眼验收**：还没人真的点过那个按钮。要看的就三件事 ——
+   ① 光标是**走**过去的（不是跳过去）；② 走出来的确实是个圆（不是椭圆、不是多边形）；
+   ③ 快慢是否合适（`CIRCLE_MAX_DURATION` 触顶时实际速度会快于配置速度，这是刻意的取舍）。
+   → 这条同时是 **T22** 那个"轨迹可见性还没被验收"的验收手段。
+2. ✅ **`winapi.rs` 已经拆到基线以下**（2026-09-19，两刀）：1215 → 985 → **796**
+   （基线 862）。光标轨迹 → `winapi/cursor.rs`(267)，输入原语 → `winapi/input.rs`(228)。
+   同一天里 `runtime.rs`(1049→984)、`lib.rs`(1922→1900)、`RuntimePanel.tsx`(858→288)
+   与 `IconLibraryPanel.tsx`(1064→808) 也各拆了刀。详见 T17。
+3. `ipc_flow.rs::a_circle_trace_comes_back_self_consistent` **默认 `#[ignore]`** ——
+   它会真的画一圈、抢走鼠标。要跑：
+   `cargo test -p desktop --features custom-protocol -- --ignored a_circle_trace`
+   圆周算得对不对另有 5 条**不碰光标**的纯计算用例每次都会跑
+   （`platform-windows/src/winapi/tests.rs`）。
+
+---
+
+## T25 「窗口一闪就退出」：加启动期落文件日志 + `run.cmd` 不再一闪而过（2026-09-19）
+
+**需求原话**（2026-09-19）：
+
+> 「运行 run.cmd 进程启动后，我看到窗口闪现了一下又退出了」
+
+### 先说要紧的：**没复现出来**
+
+所有自动化启动方式（后台 `&`、`Start-Process`、`cmd /c run.cmd`）进程**都活着**。
+所以这一轮**没有去猜原因**，而是把它做成**可诊断的**——下次再出现，现场要留得下来。
+
+### 为什么原来什么都看不到
+
+GUI 程序没有控制台；而"窗口还没出现就退出"这类故障（数据目录建不出来、
+应用状态初始化失败、WebView2 起不来）**全发生在窗口出现之前**。
+`run.cmd` 自己也是启动完就结束 —— 两件事叠在一起，操作者看到的就只有「窗口闪了一下」，
+**没有任何文字可看**。
+
+### 做了两件事
+
+**① `src-tauri/src/startup_log.rs`（新模块，165 行）→ `data/startup.log`**
+
+- `begin()` 在 `run()` 的**第一行**调用，记：启动横幅、工作目录、数据目录、可执行文件路径。
+  之后 `setup` 成功 / 失败各记一条。每行带 `+123ms` 相对偏移（省掉日期格式化依赖）。
+- ★ **第一条写下去时截断**旧文件，之后追加 —— 这份日志只描述**这一次**启动。
+- ★ **写失败一律静默**：观测手段不该成为新的失败点。
+- ★ **数据目录建不出来时退回工作目录记** —— 否则最需要它的那种故障反而没有日志。
+- ★ 另装了一个 panic 钩子，**包一层原有钩子、不替换**（替换会把原有的 panic 输出弄丢）。
+
+**② `run.cmd`：启动后等 4 秒再确认进程还在**
+
+`start` 之后 `ping -n 5 127.0.0.1`（⚠️ **不能用 `timeout`**：标准输入被重定向时它直接报错），
+再 `tasklist /FI "IMAGENAME eq desktop.exe" | find /I "desktop.exe"` 判断存活。
+不存活 ⇒ `type` 出 `startup.log` 全文 + `pause`，把"窗口闪一下"变成一屏能读的文字。
+
+### ⏳ 还没做完
+
+1. **等一次真实复现**：用户再遇到时，把 `run.cmd` 窗口的输出（或 `data/startup.log`）发回来。
+2. ⚠️ 判读要点：**连 `startup.log` 都没有** ⇒ 程序根本没跑到 `run()` ——
+   那不是本程序自己的问题（缺 DLL、被安全软件拦下、双击的不是这个 exe）。
+   这条已经写进 `run.cmd` 的提示文字里。
+3. 已知不完美：若用户**本来就有**一个 `desktop.exe` 开着，`tasklist` 那条会误判成"启动成功"。
+   代价可接受（那只可能是用户自己先跑的），但要写在这里。

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { CalibrationPanel, type CachedPreview } from "./components/CalibrationPanel";
 import { ConfirmationDialog } from "./components/ConfirmationDialog";
+import { CursorMotionPanel } from "./components/CursorMotionPanel";
 import { IconLibraryPanel } from "./components/IconLibraryPanel";
 import { regionsAreValid } from "./components/RegionCalibration";
 import { RuntimePanel } from "./components/RuntimePanel";
@@ -12,13 +13,15 @@ import { TaskHistory } from "./components/TaskHistory";
 import {
   TERMINAL_STATES,
   type ConfirmationRequest,
+  type RunChoice,
   type RuntimeConfig,
   type RuntimeInfo,
-  type StartTaskRequest,
+  type RuntimeMode,
+  type TaskFormValues,
   type TaskView,
 } from "./types";
 
-type Tab = "tasks" | "calibration" | "icons";
+type Tab = "tasks" | "calibration" | "icons" | "trace";
 
 export function App() {
   const [tasks, setTasks] = useState<TaskView[]>([]);
@@ -39,6 +42,28 @@ export function App() {
    */
   const [draft, setDraft] = useState<RuntimeConfig | null>(null);
   const [dirty, setDirty] = useState(false);
+
+  /**
+   * 本次任务走哪一条路 —— **运行参数，不是配置的一部分**。
+   *
+   * ★★ 它刻意**不放进 `draft`**：放进草稿就会跟着 `dirty` 走，于是"改了工作流"
+   * 变成"配置有未保存的改动"，用户还得先去点「保存配置」才生效——而他想要的
+   * 只是"这一次按我选的跑"。改它**不置 `dirty`**，因为没有东西要保存。
+   *
+   * 由 `App` 持有（而不是 `RuntimePanel` 自己 `useState`），理由与 `draft` 相同：
+   * 它是"任务怎么跑"的一部分，提交时由 `handleStart` 补进请求里。
+   *
+   * 初始值取自配置里那几个同名字段——那是"上次用的那条路"，只作为起点；
+   * 后端不会再读它们（见 `RunChoice`）。
+   *
+   * ★ 模式（演练 / 真实）也在这里。它与工作流是同一类东西：界面上选完就该按这个跑。
+   * 配置里的 `mode` 只剩一个作用——给这里**设初值**。
+   */
+  const [runChoice, setRunChoice] = useState<RunChoice | null>(null);
+
+  const patchRunChoice = useCallback((next: Partial<RunChoice>) => {
+    setRunChoice((current) => (current ? { ...current, ...next } : current));
+  }, []);
 
   /**
    * 标定页的截图缓存：场景 id → 那次截图。
@@ -133,6 +158,37 @@ export function App() {
     setDirty(false);
   }, [info]);
 
+  /**
+   * 运行参数的初值：只在**第一次**读到配置时定。
+   *
+   * ⚠️ 不能写成 `useEffect(() => setRunChoice(...), [info])`：`info` 每次
+   * 「保存配置」之后都会刷新，那样每保存一次就会把用户当下选的那条路重置回
+   * 配置里的默认值——"选好的工作流被保存操作悄悄换掉"，又是一个难查的坑。
+   */
+  useEffect(() => {
+    if (!info) return;
+    setRunChoice(
+      (current) =>
+        current ?? {
+          mode: info.config.mode,
+          workflow: info.config.workflow,
+          nav_target: info.config.nav_target,
+        },
+    );
+  }, [info]);
+
+  /**
+   * **这一次真正会跑的模式** —— 判据只有这一处。
+   *
+   * ★★ 不能用 `draft.mode`：那只是配置里的默认值，界面上切了模式、没点保存时
+   * 它与真正会跑的不是一回事。真实模式那句提示是**安全提示**，
+   * 按错了方向（提示说"演练"、实际在动真窗口）比没有提示更糟。
+   *
+   * `runChoice` 还没读回来时退回配置里的值：那种状态下界面上两个选择器都是禁用的，
+   * 退回去只是为了首帧别显示空白。
+   */
+  const activeMode: RuntimeMode = runChoice?.mode ?? info?.config.mode ?? "dry_run";
+
   const activeTask = useMemo(
     () => tasks.find((task) => task.id === activeId) ?? null,
     [tasks, activeId],
@@ -148,10 +204,28 @@ export function App() {
     setDirty(true);
   }, []);
 
-  const handleStart = async (request: StartTaskRequest) => {
+  /**
+   * 「开始任务」。
+   *
+   * ★★ `run_choice` **必须由这里补进请求**。工作流 / 导航目标是**运行参数**，
+   * 不是配置的一部分——`start_task` 只认请求里的这一份，既不去读配置里那两个
+   * 同名字段，也不会把它们写回去（见 `RunChoice`）。
+   *
+   * 这里就是那个 bug 的修复点：以前命令层读的是**已保存的** `state.config`，
+   * 于是"界面上改了工作流、没点保存"就变成"跑的还是旧的那条"。
+   * 2026-09-19 实测：连跑三条任务，三条 `task-*.log` 里记的全是 `SearchContact`。
+   *
+   * `runChoice` 还没定（配置还没读回来）时**不提交**：那种状态下"要跑哪条路"
+   * 根本没有值，随便猜一个默认值正是上面那个 bug 的老路。
+   */
+  const handleStart = async (values: TaskFormValues) => {
     setError(null);
+    if (!runChoice) {
+      setError("还没读到运行配置，稍等一下再点「开始任务」。");
+      return;
+    }
     try {
-      const id = await api.startTask(request);
+      const id = await api.startTask({ ...values, run_choice: runChoice });
       setActiveId(id);
     } catch (err) {
       setError(String(err));
@@ -182,7 +256,12 @@ export function App() {
     if (!draft) return;
     setError(null);
     try {
-      await api.setRuntimeConfig(draft);
+      // ★ 保存时把**界面上当前选的模式**一并记成下次的默认值。
+      //
+      // 模式是运行参数（改它不置 `dirty`、也不单独保存），但配置里那个同名字段
+      // 仍然要有个来源——否则它永远停在第一次写下的值，"上次用的模式"
+      // 就再也不会被记住。所以在这一处（保存配置）顺手对齐。
+      await api.setRuntimeConfig({ ...draft, mode: activeMode });
       setInfo(await api.runtimeInfo());
     } catch (err) {
       setError(String(err));
@@ -192,7 +271,8 @@ export function App() {
   // 演练模式不碰真实窗口，标定值用不上；真实模式则必须保证四个区域都合法，
   // 否则后端 `RelativeRegion::validate` 会在执行时才报错，白白浪费一次任务。
   // 三个页面共用这一个判断——保存按钮在每页都有，判据只能有一处。
-  const canSave = draft ? draft.mode === "dry_run" || regionsAreValid(draft.regions) : false;
+  // 看的是 `activeMode`（这一次会跑的那个），不是配置里那个默认值。
+  const canSave = draft ? activeMode === "dry_run" || regionsAreValid(draft.regions) : false;
 
   return (
     <div className="app">
@@ -204,8 +284,10 @@ export function App() {
           </p>
         </div>
         {info && (
-          <span className={info.config.mode === "dry_run" ? "mode-pill" : "mode-pill is-live"}>
-            {info.config.mode === "dry_run" ? "演练模式" : "真实模式"}
+          // 徽标说的是**这一次会跑的模式**，不是配置里那个默认值：
+          // 它是个安全指示，必须与真正会发生的事一致。
+          <span className={activeMode === "dry_run" ? "mode-pill" : "mode-pill is-live"}>
+            {activeMode === "dry_run" ? "演练模式" : "真实模式"}
           </span>
         )}
       </header>
@@ -232,6 +314,13 @@ export function App() {
         >
           图标库
         </button>
+        <button
+          type="button"
+          className={tab === "trace" ? "tab is-active" : "tab"}
+          onClick={() => setTab("trace")}
+        >
+          轨迹自检
+        </button>
         {dirty && <span className="tab-dirty">有未保存的改动</span>}
       </nav>
 
@@ -244,6 +333,9 @@ export function App() {
                 info={info}
                 draft={draft}
                 onPatch={patch}
+                runChoice={runChoice}
+                onPatchRunChoice={patchRunChoice}
+                activeMode={activeMode}
                 onSave={handleSaveConfig}
                 dirty={dirty}
                 canSave={canSave}
@@ -366,6 +458,14 @@ export function App() {
                 <p className="muted-line">正在读取运行配置…</p>
               </section>
             )}
+          </div>
+        </main>
+      )}
+
+      {tab === "trace" && (
+        <main className="app-grid is-single">
+          <div className="column">
+            <CursorMotionPanel busy={running} />
           </div>
         </main>
       )}

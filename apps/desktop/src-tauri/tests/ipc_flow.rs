@@ -80,7 +80,27 @@ impl Drop for TempDir {
 struct Harness {
     app: tauri::App<MockRuntime>,
     webview: WebviewWindow<MockRuntime>,
+    /// 启动任务时随请求发下去的「本次走哪条路」。
+    ///
+    /// ★ 它**不在配置里**（见 `StartTaskRequest::run_choice`），所以不能像别的
+    /// 字段那样只写进 `config.json` 就完事——每条构造请求的地方都得带上。
+    /// 这里默认照抄配置里那个同名字段（配置里那份只是界面初始值），
+    /// 于是"用例改一处配置就换一条路"的写法保持不变。
+    /// 需要**刻意制造"请求与配置不一致"**的用例直接改这个字段。
+    run_choice: serde_json::Value,
     _dir: TempDir,
+}
+
+/// 把配置里那几个同名字段照抄成一份运行参数（JSON 形状）。
+///
+/// 手写 JSON 而不是用 `RunChoice` 结构体：这条路径顺带验证**请求的反序列化**，
+/// 而"字段名写错"恰恰是这条链路最容易出的问题（写错了会被静默忽略）。
+fn run_choice_of(config: &RuntimeConfig) -> serde_json::Value {
+    json!({
+        "mode": serde_json::to_value(config.mode).expect("序列化模式失败"),
+        "workflow": serde_json::to_value(config.workflow).expect("序列化工作流失败"),
+        "nav_target": serde_json::to_value(config.nav_target).expect("序列化导航目标失败"),
+    })
 }
 
 impl Harness {
@@ -112,6 +132,7 @@ impl Harness {
     fn with_config(tag: &str, config: RuntimeConfig) -> Self {
         let dir = TempDir::new(tag);
         let evidence_root = dir.join("evidence");
+        let run_choice = run_choice_of(&config);
         std::fs::write(
             dir.join("config.json"),
             serde_json::to_string_pretty(&config).expect("序列化配置失败"),
@@ -133,7 +154,7 @@ impl Harness {
             .build()
             .expect("创建测试窗口失败");
 
-        Self { app, webview, _dir: dir }
+        Self { app, webview, run_choice, _dir: dir }
     }
 
     fn state(&self) -> tauri::State<'_, AppState<MockRuntime>> {
@@ -166,7 +187,11 @@ impl Harness {
     fn start(&self, contact: &str, text: &str) -> String {
         self.ok(
             "start_task",
-            json!({ "request": { "external_contact_name": contact, "text": text } }),
+            json!({ "request": {
+                "external_contact_name": contact,
+                "text": text,
+                "run_choice": self.run_choice.clone(),
+            } }),
         )
     }
 
@@ -458,7 +483,16 @@ fn runtime_info_reports_the_dry_run_notice_and_audit_count() {
     let before: desktop_lib::RuntimeInfo = harness.ok("runtime_info", json!({}));
     assert_eq!(before.config.mode, RuntimeMode::DryRun);
     assert_eq!(before.audit_entry_count, 0);
-    assert!(before.notice.contains("演练模式"), "演练模式必须有醒目提示");
+    // 两种模式的提示都下发（模式是运行参数，界面上选的与配置里存的可以不是同一个），
+    // 界面上按当前选的那个取。
+    assert!(
+        before.mode_notices.dry_run.contains("演练模式"),
+        "演练模式必须有醒目提示"
+    );
+    assert!(
+        before.mode_notices.live.contains("真实模式"),
+        "真实模式必须有醒目提示"
+    );
     assert_eq!(before.is_windows, cfg!(windows));
 
     let id = harness.start("张三", BODY);
@@ -480,19 +514,19 @@ fn start_task_rejects_blank_input() {
 
     let blank_contact = harness.err(
         "start_task",
-        json!({ "request": { "external_contact_name": "   ", "text": "你好" } }),
+        json!({ "request": { "external_contact_name": "   ", "text": "你好", "run_choice": harness.run_choice.clone() } }),
     );
     assert!(blank_contact.contains("联系人"), "错误信息应指出联系人问题：{blank_contact}");
 
     let blank_text = harness.err(
         "start_task",
-        json!({ "request": { "external_contact_name": "张三", "text": "  " } }),
+        json!({ "request": { "external_contact_name": "张三", "text": "  ", "run_choice": harness.run_choice.clone() } }),
     );
     assert!(blank_text.contains("正文"), "错误信息应指出正文问题：{blank_text}");
 
     let too_long = harness.err(
         "start_task",
-        json!({ "request": { "external_contact_name": "张三", "text": "长".repeat(2001) } }),
+        json!({ "request": { "external_contact_name": "张三", "text": "长".repeat(2001), "run_choice": harness.run_choice.clone() } }),
     );
     assert!(too_long.contains("上限"), "超长正文应被拒绝：{too_long}");
 }
@@ -725,7 +759,7 @@ fn live_mode_without_a_calibrated_window_is_refused() {
 
     let message = harness.err(
         "start_task",
-        json!({ "request": { "external_contact_name": "张三", "text": "你好" } }),
+        json!({ "request": { "external_contact_name": "张三", "text": "你好", "run_choice": harness.run_choice.clone() } }),
     );
     assert!(
         message.contains("记录窗口尺寸"),
@@ -1359,7 +1393,7 @@ fn the_search_workflow_is_refused_without_its_regions() {
 
     let message = harness.err(
         "start_task",
-        json!({ "request": { "external_contact_name": "张三", "text": "你好" } }),
+        json!({ "request": { "external_contact_name": "张三", "text": "你好", "run_choice": harness.run_choice.clone() } }),
     );
 
     // 报错要说清"哪条工作流、缺哪几块"，并且用界面上的说法（label）而不是 key：
@@ -1394,6 +1428,102 @@ fn the_list_workflow_does_not_need_the_search_regions() {
     assert!(!id.is_empty());
 }
 
+/// ★ 回归（端到端）：`start_task` 按**请求里的** run_choice 走，不读配置里那个同名字段。
+///
+/// 2026-09-19 的 bug —— 界面上选了工作流、跑的却是配置里那条：连跑三条任务，
+/// 三条 `task-*.log` 里记的全是 `SearchContact`。修法是把工作流变成**运行参数**
+/// （`StartTaskRequest::run_choice`）。`runtime::tests` 里有一条装配层的同款用例，
+/// 这条走完整 IPC 链路（请求反序列化 → 命令层 → 装配），两处一起钉住。
+///
+/// 手法：配置写成**列表扫描式**（一块区域都不需要），请求里带**搜索式**（缺三块）。
+/// 装配被拒 ⇒ 它读的是请求；若装配通过，说明它又回去读配置了。
+#[test]
+fn start_task_follows_the_request_not_the_saved_config() {
+    let harness = Harness::with_config(
+        "run-choice-from-request",
+        RuntimeConfig {
+            mode: RuntimeMode::DryRun,
+            workflow: Workflow::ScrollListContact,
+            ..Default::default()
+        },
+    );
+
+    // 前提：**已保存的**配置是列表式。前提不成立的话下面那条断言什么都证明不了。
+    let info: desktop_lib::RuntimeInfo = harness.ok("runtime_info", json!({}));
+    assert_eq!(
+        info.config.workflow,
+        Workflow::ScrollListContact,
+        "前提：已保存的配置是列表式"
+    );
+
+    // 请求里带搜索式 ⇒ 缺三块区域 ⇒ 装配期就该被拒。
+    // 这里没被拒，就说明命令层又回去读配置了 —— 那正是这个 bug。
+    let message = harness.err(
+        "start_task",
+        json!({ "request": {
+            "external_contact_name": "张三",
+            "text": "你好",
+            "run_choice": {
+                "mode": "dry_run",
+                "workflow": "search_contact",
+                "nav_target": "contact",
+            },
+        } }),
+    );
+    assert!(
+        message.contains("搜索式查找联系人"),
+        "应当按**请求里**的工作流报错：{message}"
+    );
+    assert!(message.contains("界面标定"), "{message}");
+}
+
+/// ★ 回归（端到端）：**模式也取自请求**，不读配置里那个同名字段。
+///
+/// 与工作流那条是同一个坑，但后果更重：模式不只决定用哪一组端口，还决定
+/// **要不要带标定窗口**、以及审计里记哪个平台。读错了方向可能是
+/// 「以为在演练、其实在真实客户端上操作」。
+///
+/// 手法：配置写成**演练**且**没有**标定尺寸（这样按配置走必然装配成功），
+/// 请求里带**真实**。被拒 ⇒ 它读的是请求；若装配通过，说明它又回去读配置了。
+#[test]
+fn start_task_takes_the_mode_from_the_request_not_the_saved_config() {
+    let harness = Harness::with_config(
+        "run-choice-mode-from-request",
+        RuntimeConfig {
+            mode: RuntimeMode::DryRun,
+            calibrated_window: None,
+            workflow: Workflow::ScrollListContact,
+            ..Default::default()
+        },
+    );
+
+    // 前提：**已保存的**配置是演练模式。前提不成立的话下面那条断言什么都证明不了。
+    let info: desktop_lib::RuntimeInfo = harness.ok("runtime_info", json!({}));
+    assert_eq!(
+        info.config.mode,
+        RuntimeMode::DryRun,
+        "前提：已保存的配置是演练模式"
+    );
+
+    // 请求里带真实模式 ⇒ 没有标定尺寸 ⇒ 装配期就该被拒。
+    let message = harness.err(
+        "start_task",
+        json!({ "request": {
+            "external_contact_name": "张三",
+            "text": "你好",
+            "run_choice": {
+                "mode": "live",
+                "workflow": "scroll_list_contact",
+                "nav_target": "contact",
+            },
+        } }),
+    );
+    assert!(
+        message.contains("记录窗口尺寸"),
+        "应当按**请求里**的模式报错：{message}"
+    );
+}
+
 /// 靶标文字留空 ⇒ 装配期拒绝。
 ///
 /// 空串在「包含」判断里**匹配一切**：空的分组标题会让下拉里的第一行被当成
@@ -1413,7 +1543,7 @@ fn blank_target_texts_are_refused_at_assembly_time() {
 
     let message = harness.err(
         "start_task",
-        json!({ "request": { "external_contact_name": "张三", "text": "你好" } }),
+        json!({ "request": { "external_contact_name": "张三", "text": "你好", "run_choice": harness.run_choice.clone() } }),
     );
     assert!(message.contains("不能留空"), "{message}");
     assert!(
@@ -1554,4 +1684,54 @@ fn a_hotkey_survives_a_round_trip_through_ipc() {
     );
 
     harness.ok::<()>("unregister_capture_hotkey", json!({}));
+}
+
+// ── 鼠标轨迹自检 ────────────────────────────────────────────────────────
+
+/// 真机用例：「画圆」命令真的注册上了，而且回报的数字自洽。
+///
+/// 默认跳过：**它会真的把光标画一圈**（半径是本程序窗口短边的一半，通常两三百
+/// 像素），跑起来会抢走操作者的鼠标 —— 一个会劫持鼠标的自动化用例，比没有用例
+/// 更糟。要跑就明确地跑：
+/// `cargo test -p desktop --features custom-protocol -- --ignored a_circle_trace`
+///
+/// 这个用例的主要价值在**命令注册**：命令靠 `AppHandle<R>` 钉住运行时泛型，
+/// 一旦漏进 `generate_handler!`，前端点了按钮只会拿到 "command not found"，
+/// 而编译期毫无提示。
+///
+/// 圆周本身算得对不对，另有**不碰光标**的纯计算用例钉着
+/// （`platform-windows/src/winapi/tests.rs`）—— 那些才是每次都会跑的。
+#[test]
+#[ignore]
+fn a_circle_trace_comes_back_self_consistent() {
+    let harness = Harness::new("circle-trace", DemoScenario::Happy);
+
+    let trace: desktop_lib::cursor_trace::CircleTraceView =
+        harness.ok("draw_cursor_circle", json!({}));
+
+    // 半径 = 窗口**短边**的一半。这条判据与界面上的文案必须一致，别让两边各自算。
+    let short_side = trace.window_width.min(trace.window_height);
+    assert_eq!(
+        trace.radius,
+        (short_side / 2) as i32,
+        "半径应当是窗口短边 {short_side} 的一半，实得 {}",
+        trace.radius
+    );
+
+    // 步数下限：少于这个数圆周会变成肉眼可见的多边形。
+    assert!(trace.steps >= 24, "步数太少，会看出棱角：{}", trace.steps);
+
+    // 时长夹在 [400ms, 8s]：短于此看不出是圆，长于此看起来像卡死。
+    assert!(
+        (400..=8000).contains(&trace.duration_ms),
+        "一圈的时长跑出界了：{} 毫秒",
+        trace.duration_ms
+    );
+
+    // 速度只有一个来源（平台层默认值），回报出来是为了能核对，不是给人调的。
+    assert!(
+        trace.speed_px_per_sec > 0.0,
+        "速度必须是正数，实得 {}",
+        trace.speed_px_per_sec
+    );
 }

@@ -139,17 +139,31 @@
 不要在里面再添新职责。
 
 超过 500 行的生产文件（7 个）。「基线」是这条规矩的**参照值**，
-「现在」是 2026-09-19 三条工作流那批改动之后的实测值：
+「现在」是 2026-09-19 **当天第四批改动**（T23 收尾：模式也改成运行参数）之后的实测值：
 
 | 文件 | 基线 | 现在 | |
 | --- | --- | --- | --- |
-| `apps/desktop/src-tauri/src/lib.rs` | 1903 | 1847 | ✅ 减 |
+| `apps/desktop/src-tauri/src/lib.rs` | 1903 | 1900 | ✅ **仍低于基线**。T23 收尾时一度涨到 1922（**破了基线**），随后把 `ModeNotices` 搬进 `runtime/mode.rs` 压回来了 |
 | `crates/automation-core/src/runner/mod.rs` | 1395 | 1224 | ✅ 拆成 5 个文件 |
-| `apps/desktop/src-tauri/src/runtime.rs` | 1039 | 893 | ✅ 减 |
+| `apps/desktop/src-tauri/src/runtime.rs` | 1039 | 984 | ✅ **仍低于基线**。T23 收尾时一度涨到 1049（**破了基线**），随后把 `RuntimeMode` + `DemoScenario` + `ModeNotices` 整段搬成 `runtime/mode.rs`(127) 压回来了。见 `docs/todo.md` T17 |
 | `crates/vision/src/template.rs` | 881 | 667 | ✅ 减 |
-| `crates/platform-windows/src/winapi.rs` | 862 | 1094 | ⚠️ +232（其中 +152 是光标轨迹）|
-| `apps/desktop/src/components/IconLibraryPanel.tsx` | 983 | 1064 | ⚠️ +81 |
-| `apps/desktop/src/components/RuntimePanel.tsx` | 596 | 782 | ⚠️ +186 |
+| `crates/platform-windows/src/winapi.rs` | 862 | 796 | ✅ **已拆完**（1215 → 985 → **796**）。两刀：光标轨迹 → `winapi/cursor.rs`(267)、输入原语 → `winapi/input.rs`(228)。见 `docs/todo.md` T17 |
+| `apps/desktop/src/components/IconLibraryPanel.tsx` | 983 | 808 | ✅ **已拆**（1064 → 808）。列表搬成 `IconList.tsx`(225)，两段结果预览搬成 `NavResultSections.tsx`(140)。见 `docs/todo.md` T17 |
+| `apps/desktop/src/components/RuntimePanel.tsx` | 596 | 288 | ✅ **已拆**（858 → 288）。按「归属」拆成四个同级组件：`RunChoiceFields`(270，运行参数) / `TargetWindowSection`(202) / `AdvancedParamsSection`(192) / `TypingTextSection`(87)。见 `docs/todo.md` T17 |
+
+⚠️ **`lib.rs` 这次给出了一个可复用的做法**：新功能有近百行、眼看着要破基线时，
+**先把它整段搬成一个同级模块**（`cursor_trace.rs`，与 `capture_hotkey.rs` 同款），
+而不是硬往里塞。搬移的要点：
+① 命令**仍然只在 `lib.rs` 的 `with_commands` 里注册一处**；
+② 跨模块的命令必须是 `pub`，否则 `E0603: macro import … is private`
+（错指向 `generate_handler!`，看着像宏的问题）；
+③ 模块自己 `use` 它要的（`Manager` 忘了加的表现是 `E0599: no method named
+get_webview_window`）。**搬完 `wc -l` 对一眼**，别信脚本的自报数。
+⚠️ **`RuntimePanel.tsx` 已经拆完**（2026-09-19）：858 → **288**，见 `docs/todo.md` T17。
+★ 拆 `.tsx` **不要用搬运脚本**（`large-file-mechanical-split` skill 里也写了这条）：
+提组件要先设计 props，脚本只能搬、搬完还得改 import，手改更快。
+这次用的判据是**按"归属"分组**，一句话：**凡是要"保存配置"的留在主文件，
+只管"这一次怎么跑"的搬走**。这一刀之后主文件只剩页头提示 + 保存按钮 + 底部说明。
 
 **已移出**：`apps/desktop/src-tauri/src/icon_library.rs`（1030 → 195）
 与 `calibration.rs`（604 → 370），都拆成了「薄接口 + 子模块目录」：
@@ -161,10 +175,23 @@
 | 原文件 | 现在 | 抽出的测试 |
 | --- | --- | --- |
 | `automation-core/src/runner.rs`(1395→2136) | `runner/mod.rs` 1224 + 4 个子模块 | 见下 |
-| `apps/desktop/src-tauri/src/runtime.rs`(1541) | 893 | `runtime/tests.rs` 653 |
+| `apps/desktop/src-tauri/src/runtime.rs`(1541) | 959 | `runtime/tests.rs` 711 |
 | `crates/vision/src/template.rs`(1059) | 667 | `template/tests.rs` 396 |
 | `crates/automation-core/src/state.rs`(532) | 261 | `state/tests.rs` 275 |
-| `apps/desktop/src-tauri/src/lib.rs`(1931) | 1847 | `src/tests.rs` 88 |
+| `apps/desktop/src-tauri/src/lib.rs`(1931) | 1894 | `src/tests.rs` 88 |
+| `apps/desktop/src-tauri/src/lib.rs`(1993) | 1896 | `src/cursor_trace.rs` 117（**不是测试**，是整段功能搬出去；见上面那条 ⚠️）|
+
+★ **同一条思路再来一次**（2026-09-19 第四批）：启动期落日志（`src/startup_log.rs`，165 行）
+也是**整段新功能、不是测试**。⚠️ 但它没能把 `lib.rs` 压下去——同轮又加了 `ModeNotices`
+与"任务日志改记请求里的模式"那几行，净涨 19（1896 → 1922，**破了基线**）。
+
+★★ **然后又把 `ModeNotices` 搬进 `runtime/mode.rs`**，`lib.rs` 1922 → **1900**（✅ 回到基线以下）。
+**教训值得记**：搬出去一大块（`cursor_trace.rs`）之后，**新功能会继续往 `lib.rs` 里填**，
+一两轮就又回去了。所以往 `lib.rs` 加东西之前，**先问一句"这块能不能跟着某个已有的
+子模块走"**——`ModeNotices` 就是这么找到家的：它讲的正是"两种模式各自是什么"，
+跟 `RuntimeMode::notice()` 是同一件事，搬过去不用改任何设计。
+★ `lib.rs` 若还要减，下一个切口是 `start_task`（225 行）：
+把"登记任务 + 落日志快照"整段提成 `task_registry.rs`。那是核心命令，动它要单独一轮。
 
 `runner/` 那四个子模块是**按工作流**分的，不是按"随便切几刀"：
 `search.rs`(440) 搜索式、`list.rs`(261) 列表扫描式、`navigate.rs`(163) 导航图标、
@@ -175,15 +202,61 @@
 ⚠️ `CalibrationPanel.tsx` 一度涨到 529 行（加失效项清理时），已拆出
 `CalibrationSteps.tsx`(132) 与 `StaleMarksNotice.tsx`(48)——那两处拆分确实在，
 但**主文件后来又长回去了**：2026-09-19 实测 **722** 行，本节原先写的「回到 462」是错的。
-同理 `types.ts`（实测 676）**从来没进过上面那张表**。这两处的实测值记在
+同理 `types.ts`（实测 710）**从来没进过上面那张表**。这两处的实测值记在
 `docs/todo.md` T17（不往上面那张表里加：§9 明说那张表是存量）。
 **拆之前先看能不能拆**，别直接把新超标的文件加进上面这张表——
 这张表是**存量**，往里加等于把规矩作废。
 
-⚠️ **还欠着的**（写在 `docs/todo.md` 的 T17）：`RuntimePanel.tsx`(+186)、
-`IconLibraryPanel.tsx`(+81)、`winapi.rs`(+53) 这三处这轮**只涨没拆**。
-它们不是测试撑起来的，得真做拆分设计（提组件 / 拆原语），
-不像抽测试那样机械。**别以为它们已经被处理过了。**
+⚠️ **还欠着的**（写在 `docs/todo.md` 的 T17）：`CalibrationPanel.tsx`(+260)、
+`types.ts`(710，没记过基线)。这两处不是测试撑起来的，得真做拆分设计
+（提组件 / 拆原语），不像抽测试那样机械。**别以为它们已经被处理过了。**
+★ `winapi.rs` 最大的一块（光标轨迹）**已经拆完**（2026-09-19）：见下面 §9 末尾
+「第二次照抄」那一节。剩下的三批各自也能成文件，但**别再照抄一次就完事** ——
+先把「谁依赖谁」列清楚（`mouse_move_input` 这类**被搬走那段用的私有原语**留在
+父模块就行，子模块用 `super::` 拿得到）。
+
+★★ **`runtime.rs` 那一处已经拆完了**（2026-09-19，同一天里破基线又压回来）：
+`RuntimeMode`（含 `platform_label` / `calibrated_window` / `notice`）与 `DemoScenario`
+搬成了 `runtime/mode.rs`(127)，`runtime.rs` 1049 → **984**。
+**这一刀是可以照抄的做法**，下次再有"破基线"的文件可以照这个顺序来：
+
+1. 先找**自成一体的那一块**（这里 = 纯数据 + 纯函数，不碰端口/配置其余部分/装配流程）；
+2. 建**同级子模块**（`runtime/mode.rs`，与 `runtime/tests.rs` 平级）；
+3. ★ 逐个调可见性 —— `pub(super)` 给"只被父模块调用"的，`pub` 给"外面也在用"的
+   （这里 `notice()` 被 `lib.rs` 调 ⇒ `pub`；另两个只被 `runtime.rs` 调 ⇒ `pub(super)`）。
+   **漏了这一步的症状是 `E0624: method is private`，指向调用点而不是定义处**；
+4. ★ **父模块加 `pub use`** 保住原来的公开路径
+   （`pub use mode::{DemoScenario, RuntimeMode};`）。少了它是一堆
+   `E0432: unresolved import`，看着像"文件没编进去"；
+5. 收尾：`cargo check --tests` 会顺手报出**因为搬走而变成未使用的 import**
+   （这次是 `CalibratedWindow`），删掉它。
+
+★★ **第二次照抄：`winapi.rs` 的光标轨迹段**（2026-09-19，同一套顺序，1215 → 985）。
+同款五步，但有**三处只有"跨文件依赖"才会出现**的东西，下次照抄时按顺序检查：
+
+1. ★ **搬走的那段用到的私有原语，留在父模块就好**。`mouse_move_input` 是父模块的
+   **私有 `fn`**，但它**只**被搬走的那段调用 —— 不用跟着搬：**子模块能访问祖先的私有项**
+   （隐私是「定义处 + 其后代」），子模块里 `use super::mouse_move_input;` 就够。
+   判据：**别因为"它只被这块用"就搬**，搬了反而要反过来给父模块开可见性。
+2. ★★ **被搬走的 import 要显式搬，不能只靠 `use super::*`**。
+   `SM_XVIRTUALSCREEN` 等四个常量原本只在父模块 `use`，搬走后在父模块变成
+   **unused import**（`use super::*` **不算**"用掉了父模块的 import"）。
+   做法：子模块**自己写全 import**（`Duration` / `SendInput` / `INPUT` /
+   四个 `SM_*VIRTUALSCREEN` / `super::{cursor_position, mouse_move_input, WinResult}`），
+   父模块把那四个常量从 `use` 里删掉。父模块的 `//!` 文档里
+   「unsafe 都集中在本模块」也要补一句（含子模块）。
+3. ★ **`pub use` 不能给"原本私有"的常量用**。`CIRCLE_MIN_STEPS` 原来是私有
+   `const`，同级测试 `winapi/tests.rs` 靠 `super::` 取它。若把它 `pub use` 出去
+   会**放宽公开面**（父模块 `winapi` 是 `pub`）⇒ 改成 `pub(super) const` +
+   **改测试的 import 路径**为 `use super::cursor::{...}`（`tests` 是 `winapi` 的
+   后代，够得着私有的 `mod cursor`）。只有真正对外的那三个
+   （`move_cursor` / `move_cursor_circle` / `CircleTrace`）才 `pub use`。
+
+★ **搬运脚本的校验要允许"刻意的差异"**。这次的多重集比较报出 4 missing / 31 extra，
+其中 3 处是**我自己有意改的**（文档行、import 两行、`CIRCLE_MIN_STEPS` 那行），
+其余是模块文档 / `use` 行 / 空行。**校验脚本第一次就把它们当"意外"拦下来了** ——
+这正是它该做的：**先把差异全列出来，逐条确认是"有意的"再放行**，
+不要为了让它通过就把 `extra` 一律放过。
 
 超过 80 行的函数（主要几处，`~` 为估算）：
 

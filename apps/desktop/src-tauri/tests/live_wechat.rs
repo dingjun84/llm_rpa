@@ -29,9 +29,7 @@
 //!
 //! 本文件不替操作者猜时机：先试一次，失败就**只读轮询**前台窗口、把话说清楚，
 //! 而不是反复发置前请求（那是"重试到成功"，本项目禁止）。
-//!
 //! 所以跑之前请**手动点一下微信窗口**，让它保持在前台。
-//! 窗口已经是前台时，`focus_wecom` 会跳过置前那一步，直接通过。
 //!
 //! ## 标定文件
 //!
@@ -72,7 +70,6 @@
 //! 而姓名是逐字精确匹配，多一个字就永远找不到人。实测数据见
 //! `automation_core::DEFAULT_CONTACT_PANEL`。
 //!
-//!
 //! 标定流程：把窗口点到前台 → `screen_probe annotate casper out.png` 截图并画上
 //! 四个区域与 10% 网格 → 照着图量出四个区域相对窗口的比例（网格让这件事可以用
 //! 百分比描述）→ 也可以用界面上的「指认窗口」+「截图并标注」按钮做同一件事。
@@ -94,13 +91,26 @@ use automation_core::{
     NavTarget, ProgressSink, Rect, RelativeRegion, SendLedger, SendTask, StateChange, TaskState,
     TextBox, Workflow,
 };
-use desktop_lib::runtime::{RuntimeConfig, RuntimeMode, WindowGeometry};
+use desktop_lib::runtime::{RunChoice, RuntimeConfig, RuntimeMode, WindowGeometry};
 use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
 use storage::{SqliteAuditStore, SqliteSendLedger};
 use uuid::Uuid;
 use vision::ExternalOcr;
 
 /// 默认联系人：微信自带的「文件传输助手」——不用真的打扰任何人。
+/// 用例把"要跑哪条路"写在配置上，装配时照抄成运行参数。
+///
+/// 生产路径上这一步由 `start_task` 从任务请求里取（见 `RunChoice` 的文档）。
+/// 装配函数**不再自己去读配置**——配置里那几个字段只是界面上的初始默认值，
+/// 照抄一份到运行参数里是为了让这些用例保持"改一个地方就换一条路"的写法。
+fn run_choice_from(config: &RuntimeConfig) -> RunChoice {
+    RunChoice {
+        mode: config.mode,
+        workflow: config.workflow,
+        nav_target: config.nav_target,
+    }
+}
+
 const DEFAULT_CONTACT: &str = "文件传输助手";
 
 /// 确认端口：**一旦被调用就 panic**。
@@ -377,6 +387,7 @@ fn live_wechat_finds_contact_by_scrolling_and_types_without_sending() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
+        run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
@@ -489,6 +500,7 @@ fn live_wechat_refuses_when_the_contact_cannot_be_found() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
+        run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
@@ -665,6 +677,7 @@ fn live_wechat_navigates_to_a_view() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
+        run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,

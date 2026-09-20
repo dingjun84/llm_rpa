@@ -19,12 +19,15 @@ rem
 rem  为什么必须在这儿查 winocr：它是**独立进程**，任务跑到第一次识别时才去
 rem  启动它。缺了的话界面照常打开、任务也点得动，一直到 SearchingContact
 rem  才报「系统找不到指定的文件」——那时人已经盯着屏幕等半天了。
+rem
+rem  ★ 启动之后要**等一会儿再确认它还在**，理由见下面「为什么要确认」那段。
 rem ============================================================
 
 setlocal
 set "ROOT=%~dp0"
 set "EXE=%ROOT%target\debug\desktop.exe"
 set "OCR=%ROOT%target\debug\winocr.exe"
+set "LOG=%ROOT%data\startup.log"
 
 set "MISSING="
 if not exist "%EXE%" set "MISSING=%MISSING% desktop.exe"
@@ -50,10 +53,58 @@ if defined MISSING (
 )
 
 pushd "%ROOT%"
+
+rem 上一次的启动日志先删掉：它只描述「这一次」启动，留着旧的会误导排查。
+if exist "%LOG%" del /q "%LOG%" >nul 2>&1
+
 echo [run] 工作目录： %CD%
 echo [run] 数据目录： %CD%\data
 echo [run] 界面    ： %EXE%
 echo [run] OCR 程序： %OCR%
+echo.
+
 start "" "%EXE%"
+
+rem ── 为什么要确认 ────────────────────────────────────────────
+rem  启动期的失败（数据目录建不出来、状态初始化失败、WebView2 起不来）
+rem  全都发生在**窗口出现之前**。那种情况下程序会立刻退出，而这个脚本
+rem  自己也是立刻结束的 —— 两件事叠在一起，操作者看到的就只有「窗口闪了一下」，
+rem  没有任何文字可看。所以这里等 4 秒、确认进程还在，并把它的启动日志打出来。
+rem
+rem  用 ping 而不是 timeout 当延时：timeout 在标准输入被重定向时会直接报错。
+ping -n 5 127.0.0.1 >nul 2>&1
+
+tasklist /FI "IMAGENAME eq desktop.exe" 2>nul | find /I "desktop.exe" >nul
+if errorlevel 1 goto startup_failed
+
+echo [run] 已启动。关掉本窗口不影响它。
 popd
 endlocal
+exit /b 0
+
+:startup_failed
+echo [run] ============================================================
+echo [run] 启动失败：desktop.exe 没起来，或者起来之后立刻退出了。
+echo [run] ============================================================
+echo.
+
+if exist "%LOG%" (
+  echo [run] 它自己的启动日志：%LOG%
+  echo [run] ------------------------------------------------------------
+  type "%LOG%"
+  echo [run] ------------------------------------------------------------
+  echo.
+  echo [run] 日志里最后一条成功记录，就是它走到的地方；再往后那条就是失败原因。
+) else (
+  echo [run] 连 %LOG% 都没生成。
+  echo [run] 说明它在写第一行日志之前就没了 —— 那多半不是本程序自己的问题，
+  echo [run] 而是进程被系统或安全软件拦下了，或者 exe 本身有问题。
+  echo [run] 可以先双击 %EXE% 试一次，看是不是同样结果。
+)
+
+echo.
+echo [run] 把上面这些内容发给开发者即可定位。
+pause
+popd
+endlocal
+exit /b 1

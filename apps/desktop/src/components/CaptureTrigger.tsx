@@ -6,6 +6,7 @@ import {
   registerCaptureHotkey,
   unregisterCaptureHotkey,
 } from "../api";
+import { remainingSeconds, useCountdown } from "../countdown";
 
 /**
  * 截图的三种触发方式：立刻截、延时截、按热键截。
@@ -48,8 +49,10 @@ const DELAY_CAPTURE_SECS = 8;
  *
  * 到点判据看的是**截止时刻**，不是这个值累加出来的结果，所以它只决定显示精度：
  * 定时器被系统降频时，最多也只是"晚一个间隔"，不会越走越慢。
+ *
+ * ★ 这条与「到点判据」一起搬去了 `../countdown`（画圆自检也要用同一份）。
+ * 这里不再留副本——**判据只能有一处**。
  */
-const COUNTDOWN_TICK_MS = 100;
 
 /** 四个修饰键的勾选项。顺序即界面顺序。 */
 const MODIFIERS = [
@@ -82,9 +85,6 @@ export function CaptureTrigger({
   hasPreview,
   onCapture,
 }: Props) {
-  const [counting, setCounting] = useState(false);
-  const [remainingMs, setRemainingMs] = useState(0);
-
   const [mods, setMods] = useState<ModifierState>({
     ctrl: true,
     alt: true,
@@ -96,46 +96,29 @@ export function CaptureTrigger({
   const [hotkeyBusy, setHotkeyBusy] = useState(false);
   const [hotkeyError, setHotkeyError] = useState<string | null>(null);
 
-  // 回调每次渲染都是新函数。放进 ref，免得它一变就把倒计时重置了。
+  // 热键监听只挂一次（见下），拿到的是**首次渲染**那个回调闭包，所以要走 ref
+  // 取最新的一份。倒计时那条路不需要这个——`useCountdown` 内部自己兜了。
   const onCaptureRef = useRef(onCapture);
   useEffect(() => {
     onCaptureRef.current = onCapture;
   }, [onCapture]);
 
-  useEffect(() => {
-    if (!counting) return;
-
-    const deadline = Date.now() + DELAY_CAPTURE_SECS * 1000;
-    setRemainingMs(DELAY_CAPTURE_SECS * 1000);
-
-    let fired = false;
-    const id = window.setInterval(() => {
-      const left = deadline - Date.now();
-      if (left > 0) {
-        setRemainingMs(left);
-        return;
-      }
-      if (fired) return;
-      fired = true;
-      window.clearInterval(id);
-      setCounting(false);
-      setRemainingMs(0);
-      void onCaptureRef.current();
-    }, COUNTDOWN_TICK_MS);
-
-    return () => window.clearInterval(id);
-  }, [counting]);
+  // 倒计时结束后要调的就是这个回调。hook 内部已经把它放进 ref 了，
+  // 这里不用再包一层——**别把它写进依赖数组**，否则每次渲染都会重新计时。
+  const { counting, remainingMs, start, stop } = useCountdown(DELAY_CAPTURE_SECS, () =>
+    void onCapture(),
+  );
 
   // 监听一直挂着，不等"启用热键"时才挂：否则点完启用立刻按组合键会漏掉——
   // 后端已经注册生效了，这边的监听却还没建立。
   useEffect(() => {
     let alive = true;
-    let stop: UnlistenFn | null = null;
+    let detach: UnlistenFn | null = null;
     void onCaptureHotkey(() => {
       void onCaptureRef.current();
     })
       .then((unlisten) => {
-        if (alive) stop = unlisten;
+        if (alive) detach = unlisten;
         else void unlisten();
       })
       .catch(() => {
@@ -144,7 +127,7 @@ export function CaptureTrigger({
       });
     return () => {
       alive = false;
-      if (stop) void stop();
+      if (detach) void detach();
     };
   }, []);
 
@@ -188,7 +171,7 @@ export function CaptureTrigger({
     }
   };
 
-  const seconds = Math.ceil(remainingMs / 1000);
+  const seconds = remainingSeconds(remainingMs);
   const blocked = !windowReady || busy;
 
   return (
@@ -204,7 +187,7 @@ export function CaptureTrigger({
 
         {counting ? (
           <>
-            <button type="button" onClick={() => setCounting(false)}>
+            <button type="button" onClick={stop}>
               取消延时
             </button>
             <span className="picker-countdown" role="status">
@@ -215,7 +198,7 @@ export function CaptureTrigger({
           <button
             type="button"
             disabled={blocked || capturing}
-            onClick={() => setCounting(true)}
+            onClick={start}
           >
             延时截图（{DELAY_CAPTURE_SECS} 秒）
           </button>

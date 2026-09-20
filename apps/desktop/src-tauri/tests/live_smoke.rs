@@ -38,11 +38,24 @@ use automation_core::{
     AuditSink, AutomationError, CancelToken, DesktopPlatform, HumanConfirmation, LocalOcr,
     ProgressSink, Rect, RelativeRegion, SendLedger, SendTask, StateChange, TaskState,
 };
-use desktop_lib::runtime::{RegionConfig, RuntimeConfig, RuntimeMode, WindowGeometry};
+use desktop_lib::runtime::{RegionConfig, RunChoice, RuntimeConfig, RuntimeMode, WindowGeometry};
 use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
 use storage::{SqliteAuditStore, SqliteSendLedger};
 use uuid::Uuid;
 use vision::ExternalOcr;
+
+/// 用例把"要跑哪条路"写在配置上，装配时照抄成运行参数。
+///
+/// 生产路径上这一步由 `start_task` 从任务请求里取（见 `RunChoice` 的文档）。
+/// 装配函数**不再自己去读配置**——配置里那几个字段只是界面上的初始默认值，
+/// 照抄一份到运行参数里是为了让这些用例保持"改一个地方就换一条路"的写法。
+fn run_choice_from(config: &RuntimeConfig) -> RunChoice {
+    RunChoice {
+        mode: config.mode,
+        workflow: config.workflow,
+        nav_target: config.nav_target,
+    }
+}
 
 /// 替代靶标：记事本的窗口类名。
 const TARGET_CLASS: &str = "Notepad";
@@ -305,6 +318,7 @@ fn live_run_against_a_stand_in_window() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
+        run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
@@ -373,6 +387,7 @@ fn live_run_refuses_to_send_when_the_contact_is_absent() {
 
     let runner = desktop_lib::runtime::build_runner(
         &config,
+        run_choice_from(&config),
         &task,
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,

@@ -67,8 +67,18 @@ fn assemble_with_icons(
     config: &RuntimeConfig,
     icons_dir: &std::path::Path,
 ) -> Result<WorkflowRunner, String> {
+    // 用例把"要跑哪条路"写在 `RuntimeConfig` 的那几个**默认值**字段上，
+    // 这里照抄成运行参数。生产路径上这一步由 `start_task` 从任务请求里取
+    // （见 `RunChoice`）——**配置不再是运行时的判据来源**，所以用例必须
+    // 显式地把它转成参数，不能指望装配函数自己去读配置。
+    let choice = RunChoice {
+        mode: config.mode,
+        workflow: config.workflow,
+        nav_target: config.nav_target,
+    };
     build_runner(
         config,
+        choice,
         &sample_task(),
         icons_dir,
         Arc::new(MemoryAudit::new()),
@@ -510,6 +520,143 @@ fn the_list_workflow_does_not_need_the_search_regions() {
     };
     let runner = assemble_with_icons(&config, &icons).expect("列表式不该要求搜索式的区域");
     assert!(runner.config().main_search.is_none());
+}
+
+/// ★ 回归用例：**判据是运行参数，不是配置里的那个默认值**。
+///
+/// 2026-09-19 的 bug —— 界面上把工作流切成别的，跑的还是配置里那条：
+/// 连跑三条任务，三条 `task-*.log` 里记的全是 `SearchContact`。
+/// 修法是把工作流变成运行参数（[`RunChoice`]），这条用例钉的就是
+/// "装配期到底读的是哪一个"。
+///
+/// 手法：配置里放**搜索式**（默认值，且默认配置一块新增区域都没标 ⇒ 装配必拒），
+/// 运行参数放**列表扫描式**（一块都不需要 ⇒ 应当装配成功）。
+/// 装配成功即证明它读的是运行参数；一旦有人把它改回去读配置，这里立刻红。
+#[test]
+fn the_run_choice_decides_the_workflow_not_the_config() {
+    let icons = temp_icons_dir("run-choice-wins");
+    let config = RuntimeConfig {
+        workflow: Workflow::SearchContact,
+        ..RuntimeConfig::default()
+    };
+    // 前提：这份配置按它自己的 `workflow` 装配不起来（缺三块区域）。
+    // 前提不成立的话，下面那条断言什么都证明不了。
+    assert!(
+        assemble_with_icons(&config, &icons).is_err(),
+        "前提：默认配置按搜索式装配应当被拒（缺三块区域）"
+    );
+
+    let choice = RunChoice {
+        mode: config.mode,
+        workflow: Workflow::ScrollListContact,
+        nav_target: NavTarget::Contact,
+    };
+    let runner = build_runner(
+        &config,
+        choice,
+        &sample_task(),
+        &icons,
+        Arc::new(MemoryAudit::new()),
+        Arc::new(MemorySendLedger::new()),
+        Arc::new(MockHumanConfirmation::default()),
+    )
+    .expect("运行参数是列表式时，不该按配置里的搜索式去要求那三块区域");
+
+    // 不只看"装配没报错"：运行器里带的那条路也必须是运行参数给的那条，
+    // 否则会出现"装配按 A 检查、真正跑的是 B"。
+    assert_eq!(
+        runner.config().workflow,
+        Workflow::ScrollListContact,
+        "运行器里那条路必须来自运行参数"
+    );
+    assert_eq!(runner.config().nav_target, NavTarget::Contact);
+}
+
+/// ★ 回归用例：**模式也是运行参数**，不是配置里的那个默认值。
+///
+/// 与工作流那条同一个坑（界面上切成别的、跑的还是配置里那个），但后果更重：
+/// 模式不只是"换一组端口"，它还决定**要不要带标定窗口**、以及**审计里记哪个平台**。
+/// 两个方向都要钉住：
+///
+/// - 请求说**真实**、配置是演练 ⇒ 必须按真实校验：没有标定尺寸就拒；
+/// - 请求说**演练**、配置是真实 ⇒ 必须按演练跑：不要求标定尺寸，
+///   而且核心层拿到的标定窗口必须是 `None`、平台必须是 `dry-run`。
+///
+/// 后一个方向更危险——以为在演练、其实在真实客户端上操作，
+/// 而审计里还记着 `dry-run`，事后根本查不出来。
+#[test]
+fn the_run_choice_decides_the_mode_not_the_config() {
+    let icons = temp_icons_dir("run-choice-mode");
+    let runner_of = |config: &RuntimeConfig, choice: RunChoice| {
+        build_runner(
+            config,
+            choice,
+            &sample_task(),
+            &icons,
+            Arc::new(MemoryAudit::new()),
+            Arc::new(MemorySendLedger::new()),
+            Arc::new(MockHumanConfirmation::default()),
+        )
+    };
+
+    // ── 方向一：配置是演练、请求要真实 ──────────────────────────────
+    let dry_config = RuntimeConfig {
+        mode: RuntimeMode::DryRun,
+        calibrated_window: None,
+        workflow: Workflow::ScrollListContact,
+        ..RuntimeConfig::default()
+    };
+    // 不用 `expect_err`：`WorkflowRunner` 没有实现 `Debug`，报不出成功那个值。
+    let err = match runner_of(
+        &dry_config,
+        RunChoice {
+            mode: RuntimeMode::Live,
+            workflow: Workflow::ScrollListContact,
+            nav_target: NavTarget::Contact,
+        },
+    ) {
+        Err(err) => err,
+        Ok(_) => panic!("请求要真实模式时，没有标定尺寸必须被拒——否则说明它读的是配置里的演练"),
+    };
+    assert!(
+        err.contains("记录窗口尺寸"),
+        "拒绝理由要指向那条记录（否则操作者不知道该做什么）：{err}"
+    );
+
+    // ── 方向二：配置是真实（且记了标定尺寸）、请求要演练 ────────────
+    let live_config = RuntimeConfig {
+        mode: RuntimeMode::Live,
+        calibrated_window: Some(WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale_factor: 1.0,
+        }),
+        workflow: Workflow::ScrollListContact,
+        ..RuntimeConfig::default()
+    };
+    let runner = runner_of(
+        &live_config,
+        RunChoice {
+            mode: RuntimeMode::DryRun,
+            workflow: Workflow::ScrollListContact,
+            nav_target: NavTarget::Contact,
+        },
+    )
+    .expect("请求是演练模式时，不该按配置里的真实模式去要求标定尺寸");
+
+    // 不只看"装配没报错"：交出去的那份必须真的是演练语义，
+    // 否则会出现"按演练装配、真正跑的是真实"。
+    assert_eq!(
+        runner.config().platform_label,
+        "dry-run",
+        "审计里记的平台必须跟着运行参数走"
+    );
+    assert!(
+        runner.config().calibrated_window.is_none(),
+        "演练模式跑的是替身窗口，不该带标定窗口"
+    );
 }
 
 /// 「只做导航」需要**它自己那个目标**的模板，而不是联系人那一组。

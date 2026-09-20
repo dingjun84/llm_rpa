@@ -240,6 +240,12 @@ export interface CalibrationPlan {
 }
 
 export interface RuntimeConfig {
+  /**
+   * **默认**模式 —— 只用来给界面上那个模式选择器**设初值**。
+   *
+   * ★★ 真正跑的是 `RunChoice.mode`（本次任务的运行参数）。命令层**不读**这个字段。
+   * 两者可以不一致（界面上切了模式、没点保存），而不一致时以界面为准。
+   */
   mode: RuntimeMode;
   demo_scenario: DemoScenario;
   wecom_exe: string | null;
@@ -364,9 +370,16 @@ export interface RuntimeConfig {
    * - `scroll_list_contact`：在左侧会话列表里滚动扫描找人。只用「列表区」。
    * - `navigate_only`：**只做导航**——找到图标、点它、结束。不找任何人，
    *   用来单独验证图标匹配准不准。
+   *
+   * ★★ **真正跑的那条路不在这里。** 它是本次任务的运行参数（见 `RunChoice`
+   * 与 `StartTaskRequest.run_choice`）：界面选完就随任务请求发下去，
+   * **不写进配置文件**。这个字段只决定界面打开时默认选中哪一项。
+   *
+   * 之所以拆开：放在配置里就有两处真相——界面改的是草稿、命令层读的是已保存的
+   * 那一份，于是表现为「界面上选了 A、跑的是 B」。
    */
   workflow: Workflow;
-  /** `navigate_only` 要点哪一个图标。其余工作流不读它。 */
+  /** `navigate_only` 要点哪一个图标。其余工作流不读它。**同上：只是初始值。** */
   nav_target: NavTarget;
   /**
    * **聊天历史**图标的模板：图标名，可以多个变体。
@@ -409,7 +422,7 @@ export interface RuntimeConfig {
   search_contact_group_label: string;
 }
 
-/** 工作流。见 `RuntimeConfig.workflow`。 */
+/** 工作流。见 `RunChoice.workflow`。 */
 export type Workflow = "navigate_only" | "search_contact" | "scroll_list_contact";
 
 /** 「只做导航」要点哪一个图标。 */
@@ -581,6 +594,38 @@ export interface NavIconProbe {
   notice: string;
 }
 
+/**
+ * 「画圆」自检的结果。
+ *
+ * 坐标都是**屏幕**坐标（不是窗口内相对坐标）—— 这条功能测的是光标本身，
+ * 与目标客户端窗口无关。
+ */
+export interface CircleTraceView {
+  /** 圆心，就是点按钮那一刻（更准确说：倒计时结束那一刻）的光标位置。 */
+  center: [number, number];
+  radius: number;
+  /**
+   * 半径是拿**这个**窗口尺寸的短边一半算出来的。
+   *
+   * 回给界面是为了让人能核对"半径确实是半个窗口"——顺带也解释了
+   * 「换个窗口大小，圆就跟着变」这件事。
+   */
+  window_width: number;
+  window_height: number;
+  /** 圆周被切成了多少步（步数太少时肉眼能看出多边形）。 */
+  steps: number;
+  /** 实际走完一圈用掉的时长（毫秒）。 */
+  duration_ms: number;
+  /**
+   * 用的是哪个速度（像素/秒）。
+   *
+   * 界面上没有这个字段可配 —— 值只在后端有一处定义（平台层
+   * `WindowsDesktopConfig` 的默认值，也正是任务里用的那个）。
+   * 回给界面是为了能**核对**，而不是靠猜。
+   */
+  speed_px_per_sec: number;
+}
+
 /** 标定时记录的窗口几何（屏幕坐标 + 显示器缩放）。 */
 export interface WindowGeometry {
   x: number;
@@ -616,7 +661,15 @@ export interface RuntimeInfo {
   template_max_side: number;
   audit_entry_count: number;
   is_windows: boolean;
-  notice: string;
+  /**
+   * 演练 / 真实两种模式**各自**那句给操作者看的提示。
+   *
+   * ★ 为什么是一对、而不是"当前模式那一句"：模式现在是**运行参数**，
+   * 界面上选的与配置里存的可以不是同一个。只发一句就必须在两边里选一个，
+   * 而选错的方向恰好是最危险的那个——提示说"演练"、实际在动真窗口。
+   * 所以按**界面上当前选的那个模式**取：`info.mode_notices[activeMode]`。
+   */
+  mode_notices: Record<RuntimeMode, string>;
   /**
    * 启动时那次一次性数据搬迁的结果，**只在真发生过、或搬失败时**才有值。
    *
@@ -663,11 +716,49 @@ export interface PickedWindow {
   is_self: boolean;
 }
 
+/**
+ * 本次任务走哪一条路 —— **运行参数，不进配置文件**。
+ *
+ * 界面上的选择是**即时生效**的：选完直接点「开始任务」，不需要先点「保存配置」。
+ * 后端 `start_task` 只认这份参数，既不去读配置里那几个同名字段，也不把它们写回去。
+ *
+ * 为什么不做成配置：配置回答的是"这台机器怎么配"，这份回答的是"这一次要做什么"。
+ * 混在一起必然出现两处真相（界面改的是草稿、命令层读的是已保存的那份），
+ * 2026-09-19 实测的表现就是「界面上选了别的、跑的还是搜索式」。
+ */
+export interface RunChoice {
+  /**
+   * 这一次跑**演练还是真实**。
+   *
+   * ★ 它和 `RuntimeConfig.mode` 是同一个值域，但回答的是不同的问题：
+   * 配置里那个是"这台机器默认怎么跑"（只用来给界面**设初值**），
+   * 这里是"这一次怎么跑"。
+   *
+   * 它不只是"换一组端口"——还决定要不要带标定窗口（演练模式没有"真实窗口
+   * 尺寸"这回事）、以及审计里记的平台字段。所以它必须跟着请求走，
+   * 否则会出现"界面切成真实、实际按演练跑"，反方向更危险。
+   */
+  mode: RuntimeMode;
+  workflow: Workflow;
+  nav_target: NavTarget;
+}
+
 export interface StartTaskRequest {
   external_contact_name: string;
   text: string;
   created_by?: string | null;
+  /** 本次走哪条路。**必填**——后端没有兜底，缺了会被直接拒掉。 */
+  run_choice: RunChoice;
 }
+
+/**
+ * 「新建任务」表单能填的那部分。
+ *
+ * `run_choice` 不在里面：它由 `App` 在提交时补上（界面上的选择活在 `App` 里，
+ * 与表单无关）。用 `Omit` 而不是把字段重抄一遍，是为了让 `StartTaskRequest`
+ * 以后加字段时**这里会编译失败**——逼着人想清楚"新字段该由表单填、还是由 App 补"。
+ */
+export type TaskFormValues = Omit<StartTaskRequest, "run_choice">;
 
 export interface ConfirmationRequest {
   task_id: string;

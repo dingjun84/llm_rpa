@@ -20,6 +20,9 @@ dist-ssr/
 # 清空 dist 的动作（见项目记忆第 8 条），所以验证打包时改用这个全新目录。
 dist-verify/
 **/dist-verify/
+# Vite 读配置时写的临时文件（`vite.config.ts.timestamp-*.mjs`）。
+# 构建**失败**或被中断时不会自己清掉，于是每次 `git status` 都冒出来一批。
+vite.config.ts.timestamp-*
 
 # ---------- 沙箱改写受阻时的过渡目录 ----------
 # 助手在沙箱里改不动工作区已存在的文件（`ModifyBackup failed: path index collision`），

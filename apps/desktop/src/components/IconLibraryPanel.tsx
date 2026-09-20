@@ -16,17 +16,18 @@ import {
   probeNavIcon,
   saveIconFromCrop,
 } from "../api";
+import { normalizeName } from "../iconNames";
 import type {
   IconClickResult,
   IconEntry,
   IconVariant,
-  NavIconHit,
   NavIconProbe,
-  Rect,
   RuntimeConfig,
   RuntimeInfo,
   WindowPreview,
 } from "../types";
+import { IconList } from "./IconList";
+import { NavResultSections } from "./NavResultSections";
 
 interface Props {
   info: RuntimeInfo;
@@ -58,14 +59,6 @@ const MIN_DRAG_PX = 3;
 
 /** 框选结果放大显示的倍数。图标只有二十几像素，不放大看不出框得准不准。 */
 const CROP_ZOOM = 4;
-
-/**
- * 图标名的比较键。
- *
- * Windows 的文件系统不区分大小写，`Chat` 与 `chat` 指的是同一个目录。
- * 直接字符串比较会把"同一个图标"判成两个，于是「用于导航」的勾选状态会莫名跳回去。
- */
-const normalizeName = (name: string) => name.trim().toLowerCase();
 
 const clamp = (value: number, low: number, high: number) =>
   Math.min(high, Math.max(low, value));
@@ -100,66 +93,6 @@ const toWindowBox = (box: Box, preview: WindowPreview): Box => {
     height: map(box.y + box.height) - y,
   };
 };
-
-/** 只读的结果预览：整窗画面 + 搜索区（蓝虚线）+ 命中框（绿/红）+ 点击点。 */
-function ShotOverlay({
-  image,
-  width,
-  height,
-  strip,
-  hit,
-  clicked,
-}: {
-  image: string;
-  width: number;
-  height: number;
-  strip?: Rect | null;
-  hit?: NavIconHit | null;
-  clicked?: { x: number; y: number } | null;
-}) {
-  return (
-    <div className="shot-wrap">
-      <img className="shot-image" src={image} alt="目标窗口画面" draggable={false} />
-      {/* 用 SVG + viewBox 而不是按比例算像素：坐标直接用**图像坐标系**，
-          画布缩放由浏览器负责，界面怎么缩都不会算错。 */}
-      <svg
-        className="shot-overlay"
-        viewBox={`0 0 ${width} ${height}`}
-        preserveAspectRatio="none"
-      >
-        {strip && (
-          <rect
-            className="shot-strip"
-            x={strip.x}
-            y={strip.y}
-            width={strip.width}
-            height={strip.height}
-            vectorEffect="non-scaling-stroke"
-          />
-        )}
-        {hit && (
-          <rect
-            className={hit.accepted ? "shot-hit" : "shot-hit is-low"}
-            x={hit.x}
-            y={hit.y}
-            width={hit.width}
-            height={hit.height}
-            vectorEffect="non-scaling-stroke"
-          />
-        )}
-        {clicked && (
-          <circle
-            className="shot-click"
-            cx={clicked.x}
-            cy={clicked.y}
-            r={4}
-            vectorEffect="non-scaling-stroke"
-          />
-        )}
-      </svg>
-    </div>
-  );
-}
 
 /**
  * 「图标库」页。
@@ -209,16 +142,6 @@ export function IconLibraryPanel({
   const [probingLabel, setProbingLabel] = useState<string | null>(null);
   const [clicking, setClicking] = useState<string | null>(null);
   const [click, setClick] = useState<IconClickResult | null>(null);
-  /** 已经"上了膛"的那张图标：点一次变成「再点一次确认」，点第二次才真的点。 */
-  const [armed, setArmed] = useState<string | null>(null);
-  /**
-   * 已经"上了膛"的**删除整组**按钮。
-   *
-   * 删一整组图标会连带它底下全部变体一起走，而每一张都是人对着屏幕框出来的——
-   * 攒一组不容易，所以它要两下。单张的「删除这张」不要二次确认：那一下只丢一张，
-   * 重截一张的成本很低，加确认反而让人每次都要点两遍。
-   */
-  const [armDelete, setArmDelete] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -390,7 +313,6 @@ export function IconLibraryPanel({
   const remove = async (entry: IconEntry) => {
     setError(null);
     setNotice(null);
-    setArmDelete(null);
     try {
       const count = entry.variants.length;
       await deleteIcon(entry.name);
@@ -463,7 +385,6 @@ export function IconLibraryPanel({
 
   const runClick = async (names: string[], label: string) => {
     setClicking(label);
-    setArmed(null);
     setClick(null);
     setProbe(null);
     setError(null);
@@ -492,11 +413,6 @@ export function IconLibraryPanel({
     const value = Number(raw);
     return Number.isFinite(value) ? clamp(value, 0, 1) : fallback;
   };
-
-  /** 图上那条蓝虚线对应的位置，用窗口内相对坐标表示（点击结果要减掉窗口原点）。 */
-  const clickedInWindow = click
-    ? { x: click.clicked.x - click.window.x, y: click.clicked.y - click.window.y }
-    : null;
 
   return (
     <section className="panel">
@@ -713,148 +629,21 @@ export function IconLibraryPanel({
           <p className="muted-line">还是空的。上面截一张图、框一个图标就有了。</p>
         )}
 
-        <ul className="icon-list">
-          {entries.map((entry) => {
-            const key = normalizeName(entry.name);
-            const usedForContact = configuredNames.some(
-              (name) => normalizeName(name) === key,
-            );
-            const usedForHistory = historyNames.some(
-              (name) => normalizeName(name) === key,
-            );
-            const broken = !entry.usable;
-            const isArmed = armed === entry.name;
-            const isArmedDelete = armDelete === entry.name;
-            const sizes = entry.variants
-              .filter((variant) => variant.problem === null)
-              .map((variant) => `${variant.width}×${variant.height}`);
-            const distinct = Array.from(new Set(sizes));
-            return (
-              <li key={entry.name} className={broken ? "icon-row is-broken" : "icon-row"}>
-                <div className="icon-meta">
-                  <span className="icon-name">{entry.name}</span>
-                  <span className="field-hint">
-                    {entry.variants.length} 张
-                    {distinct.length === 1 ? ` · ${distinct[0]}` : ""}
-                    {broken ? " · 有读不出来的" : ""}
-                  </span>
-                </div>
-
-                <ul className="icon-variants">
-                  {entry.variants.map((variant) => (
-                    <li
-                      key={variant.relative}
-                      className={variant.problem ? "icon-variant is-broken" : "icon-variant"}
-                    >
-                      {variant.image ? (
-                        <img
-                          className="icon-thumb"
-                          src={variant.image}
-                          alt={variant.relative}
-                          title={variant.relative}
-                        />
-                      ) : (
-                        <span className="icon-thumb icon-thumb-empty">?</span>
-                      )}
-                      <span className="icon-variant-meta">
-                        {variant.problem ? "读不出来" : `${variant.width}×${variant.height}`}
-                      </span>
-                      <button
-                        type="button"
-                        className="ghost icon-variant-remove"
-                        disabled={disabled}
-                        title={`删除 ${variant.relative}（同一个名字下的其他图不动）`}
-                        onClick={() => void removeVariant(entry, variant)}
-                      >
-                        删除这张
-                      </button>
-                      {variant.problem && (
-                        <span className="icon-variant-problem">
-                          这张现在不能当模板：{variant.problem}
-                        </span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-
-                <div className="icon-actions">
-                  {/* 两组分开勾：联系人图标与聊天历史图标长得不一样，模板不能通用。
-                      勾错一组不会报错——只会拿另一个图标的模板去匹配，然后以
-                      一次分数不高的匹配转人工。分开之后配错的那一组是空的，
-                      装配期就能直接拒绝并说清是哪一组。 */}
-                  <label className="field-check icon-use">
-                    <input
-                      type="checkbox"
-                      checked={usedForContact}
-                      disabled={disabled || broken}
-                      onChange={(event) =>
-                        toggleUse("nav_icon_templates", entry, event.target.checked)
-                      }
-                    />
-                    <span>用于联系人导航</span>
-                  </label>
-                  <label className="field-check icon-use">
-                    <input
-                      type="checkbox"
-                      checked={usedForHistory}
-                      disabled={disabled || broken}
-                      onChange={(event) =>
-                        toggleUse("history_icon_templates", entry, event.target.checked)
-                      }
-                    />
-                    <span>用于聊天历史导航</span>
-                  </label>
-                  <button
-                    type="button"
-                    disabled={disabled || broken || !windowReady || probing !== null}
-                    title={`把「${entry.name}」的 ${entry.variants.length} 张图都拿去匹配一遍`}
-                    onClick={() => runProbe([entry.name], entry.name)}
-                  >
-                    {probing === entry.name ? "匹配中…" : "测试匹配"}
-                  </button>
-                  <button
-                    type="button"
-                    className={isArmed ? "danger" : undefined}
-                    disabled={disabled || broken || !windowReady || clicking !== null}
-                    title="会真的在客户端窗口上点一下鼠标"
-                    onClick={() => {
-                      if (isArmed) void runClick([entry.name], entry.name);
-                      else setArmed(entry.name);
-                    }}
-                  >
-                    {clicking === entry.name
-                      ? "点击中…"
-                      : isArmed
-                        ? "再点一次＝真的点下去"
-                        : "定位并点击"}
-                  </button>
-                  <button
-                    type="button"
-                    className={isArmedDelete ? "danger" : "ghost"}
-                    disabled={disabled}
-                    title={`删除「${entry.name}」以及它底下的 ${entry.variants.length} 张图`}
-                    onClick={() => {
-                      if (isArmedDelete) void remove(entry);
-                      else setArmDelete(entry.name);
-                    }}
-                  >
-                    {isArmedDelete
-                      ? `再点一次＝删掉全部 ${entry.variants.length} 张`
-                      : "删除整个图标"}
-                  </button>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-
-        {dangling.length > 0 && (
-          <p className="notice notice-warn">
-            配置里引用了 {dangling.length} 个<strong>不在图标库里</strong>的图标
-            （{dangling.join("、")}——被删了，或者图标库目录被改过）。
-            任务装配时会直接报错，建议在这里重新勾选，或者把它们从配置里去掉。
-          </p>
-        )}
+        <IconList
+          entries={entries}
+          configuredNames={configuredNames}
+          historyNames={historyNames}
+          dangling={dangling}
+          disabled={disabled}
+          windowReady={windowReady}
+          probing={probing}
+          clicking={clicking}
+          onToggleUse={toggleUse}
+          onProbe={runProbe}
+          onClick={runClick}
+          onRemove={remove}
+          onRemoveVariant={removeVariant}
+        />
 
         <div className="calibration-actions">
           <button
@@ -1013,52 +802,7 @@ export function IconLibraryPanel({
       {notice && <p className="notice">{notice}</p>}
 
       {/* ── 五、结果 ─────────────────────────────────────────────────── */}
-      {probe && (
-        <section className="calibration">
-          <div className="calibration-head">
-            <h3>匹配结果{probingLabel ? `（${probingLabel}）` : ""}</h3>
-          </div>
-          <p className={probe.hit?.accepted ? "notice" : "notice notice-warn"}>
-            {probe.notice}
-          </p>
-          <ShotOverlay
-            image={probe.image}
-            width={probe.width}
-            height={probe.height}
-            strip={probe.strip}
-            hit={probe.hit}
-          />
-          <span className="field-hint">
-            蓝虚线 = 搜索区，{probe.hit?.accepted ? "绿" : "红"}实线 = 匹配到的位置。
-            <strong>红框也要看</strong>——它标的是「它认为最像的地方」，
-            那个位置对不对才是判断模板对不对的依据。框住的不是那个图标，
-            就说明模板截错了、或者搜索区没盖住它。
-          </span>
-        </section>
-      )}
-
-      {click && (
-        <section className="calibration">
-          <div className="calibration-head">
-            <h3>点击结果</h3>
-          </div>
-          <p className={click.changed ? "notice" : "notice notice-warn"}>
-            {click.notice}
-          </p>
-          <ShotOverlay
-            image={click.image}
-            width={click.width}
-            height={click.height}
-            strip={click.strip}
-            hit={click.hit}
-            clicked={clickedInWindow}
-          />
-          <span className="field-hint">
-            蓝虚线 = 搜索区，绿实线 = 命中的图标，圆圈 = 鼠标实际落下的位置。
-            这张图是<strong>点击之后</strong>截的，所以图标上可能已经带着选中态的高亮。
-          </span>
-        </section>
-      )}
+      <NavResultSections probe={probe} probingLabel={probingLabel} click={click} />
     </section>
   );
 }

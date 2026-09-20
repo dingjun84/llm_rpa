@@ -1,13 +1,20 @@
 import { useState } from "react";
 
-import type { StartTaskRequest } from "../types";
+import type { TaskFormValues } from "../types";
 
 interface Props {
   disabled: boolean;
-  onStart: (request: StartTaskRequest) => void;
+  onStart: (values: TaskFormValues) => void;
   error: string | null;
 }
 
+/**
+ * 「新建发送任务」。
+ *
+ * ★ 它**不碰「走哪条路」**（工作流 / 导航目标）：那是 `App` 里的一份运行参数，
+ * 由 `App.handleStart` 在提交时补进请求里。理由见 `TaskFormValues` 的注释——
+ * 表单只管"发给谁、发什么"，"怎么跑"不归它管。
+ */
 export function TaskForm({ disabled, onStart, error }: Props) {
   const [contact, setContact] = useState("");
   const [text, setText] = useState("");

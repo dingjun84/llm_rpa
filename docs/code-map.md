@@ -21,7 +21,7 @@
 | `crates/platform-windows` | 真实平台：Win32 截屏/焦点/鼠标/键盘/剪贴板 + **全局热键** + 只读探针 | 改系统动作、排查「鼠标不动」 |
 | `crates/platform-mock` | 演练替身：五个端口的假实现 + 场景注入 | 加演练场景、改故障注入 |
 | `crates/storage` | SQLite：审计、发送台账、证据落盘 | 改落库结构、改清理策略 |
-| `apps/desktop/src-tauri` | **IPC 命令层 + 装配**：23 个命令、配置草稿/持久化、`build_runner` | 加界面按钮、加配置项（改这里最多） |
+| `apps/desktop/src-tauri` | **IPC 命令层 + 装配**：24 个命令、配置草稿/持久化、`build_runner`、**启动日志** | 加界面按钮、加配置项（改这里最多） |
 | `apps/desktop/src` | React 界面：配置面板、任务、图标库 | 改界面 |
 | `tools/winocr` | 独立 OCR 子进程（`Windows.Media.Ocr`） | 改 OCR 输出格式或放大倍数 |
 | `apps/webview-probe` | 独立渲染探针，**与主应用零代码依赖**，删掉不影响主应用 | 排查「界面出不来」 |
@@ -127,7 +127,10 @@
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `src/winapi.rs` | 915 | Win32 原语：BitBlt 截屏、`SetForegroundWindow`、`SetCursorPos`、`SendInput`、剪贴板 |
+| `src/winapi.rs` | 796 | Win32 原语：BitBlt 截屏、窗口枚举/定位、`SetForegroundWindow`、剪贴板、进程启动、显示器指标。★ 光标轨迹与输入原语已搬出（此处只留 `pub use` 再导出，`winapi::move_cursor` / `winapi::left_click` 等路径不变） |
+| `src/winapi/cursor.rs` | 267 | ★ **光标轨迹**：`move_cursor`（smoothstep 缓动）/ `move_cursor_circle` / `circle_points`（纯计算）+ `move_cursor_absolute` / `mouse_move_input`（`SendInput` 绝对坐标）。**不用 `SetCursorPos`、不注入随机抖动** —— 理由写在文件头 |
+| `src/winapi/input.rs` | 228 | ★ **输入原语**：`key_input` / `mouse_input(_with)` / `scroll_wheel`（逐格发）/ `left_click` / `send_ctrl_*` / `send_delete` / `send_enter` / `send_unicode_text`（按 UTF-16 码元逐字发）。**一律走 `SendInput`**。`mouse_move_input` 是 `pub(super)`：只给同级的 `cursor.rs` 用 |
+| `src/winapi/tests.rs` | 87 | 圆周点的**纯计算**用例（**不碰光标**：会劫持鼠标的用例比没有用例更糟）。⚠️ 它 `use super::cursor::{...}`，搬东西时别忘了改这里 |
 | `src/hotkey.rs` | 319 | ★ **全局热键**：`RegisterHotKey` + 独立线程消息循环 + 注销。按键解析与虚拟键码换算也在这里 |
 | `src/hotkey/tests.rs` | 165 | 按键解析、虚拟键码区间、修饰键位、失败文案（测试文件不限行数） |
 | `src/desktop.rs` | 426 | `WindowsDesktop` 实现 `DesktopPlatform`（含 `is_responsive` → `IsHungAppWindow`） |
@@ -148,11 +151,14 @@
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `src/lib.rs` | 1853 | **23 个 IPC 命令** + `with_commands` 注册（含**托管状态**）+ 任务日志落盘 |
+| `src/lib.rs` | 1900 | **24 个 IPC 命令** + `with_commands` 注册（含**托管状态**）+ 任务日志落盘 |
+| `src/cursor_trace.rs` | 117 | ★ **「画圆」自检**（`draw_cursor_circle` + `CircleTraceView`）。单独成模块是为了让 `lib.rs` 不破基线；命令**仍注册在 `lib.rs`**。⚠️ 跨模块的命令必须是 `pub`（私有 ⇒ `E0603: macro import ... is private`）。见 `docs/todo.md` T24 |
+| `src/startup_log.rs` | 165 | ★★ **启动期落文件日志**（`data/startup.log`）。GUI 没有控制台，而"窗口还没出现就退出"这类故障的现场**全在窗口出现之前**——这是唯一的现场。第一行截断、之后追加；**写失败一律静默**（观测手段不该成为新的失败点）；数据目录建不出来时**退回工作目录**记。另装了一个 panic 钩子（**包一层原钩子，不替换**）。见 `docs/todo.md` T25 |
 | `src/tests.rs` | 88 | `lib.rs` 的用例（测试文件不限行数） |
 | `src/capture_hotkey.rs` | 138 | 「一键截屏」全局热键的接线：`attach` 挂托管状态 + 持有注册句柄 + 命中时只发事件（**不自己截图**，理由见文件头） |
-| `src/runtime.rs` | 893 | `RuntimeConfig`（草稿与已保存）、`build_runner` 装配、模式校验、**按工作流列出所需标定区域** |
-| `src/runtime/tests.rs` | 653 | 装配期校验的用例（哪些配置必须在登记任务之前就被拒） |
+| `src/runtime.rs` | 984 | `RuntimeConfig`（草稿与已保存）、**`RunChoice`（本次怎么跑：模式 + 工作流 + 导航目标，运行参数）**、`build_runner` 装配、模式校验、**按工作流列出所需标定区域**。★★ **`RunChoice` 的字段一律由请求带**，`build_runner` 的**第一件事**就是把 `config.mode` 换成请求里的那个，让后面所有"模式相关"的判断仍然只读 `config.mode`（判据只有一处）。见 `docs/todo.md` T23 |
+| `src/runtime/mode.rs` | 127 | ★ 「演练还是真实」这件事本身：`RuntimeMode`（+ `platform_label` / `calibrated_window` / `notice`）、`DemoScenario`、`ModeNotices`（两种模式各自的提示文案，成对下发）。**纯数据 + 纯函数**，自成一类，从 `runtime.rs` / `lib.rs` 搬出来压回行数基线。⚠️ 父模块有 `pub use mode::{…};` —— 少了它是一堆 `E0432: unresolved import`，看着像"文件没编进去" |
+| `src/runtime/tests.rs` | 800 | 装配期校验的用例（哪些配置必须在登记任务之前就被拒） |
 | `src/calibration.rs` | 370 | 标定清单的**数据结构 / 存取 / 视图组装**（清单内容在 `calibration/catalog.rs`） |
 | `src/calibration/catalog.rs` | 198 | **清单本身**：4 个场景、14 个标定项，纯数据 |
 | `src/calibration/tests.rs` | 287 | 清单内容与失效项清理的测试（测试文件不限行数） |
@@ -163,7 +169,7 @@
 | `src/icon_library/tests.rs` | 470 | 图标库测试（名字校验、定位、读写、坏文件） |
 | `src/confirmation.rs` | 127 | `HumanConfirmation` 实现（oneshot 等待界面确认） |
 
-**23 个 IPC 命令清单**（`lib.rs` 里搜 `#[tauri::command]`；
+**24 个 IPC 命令清单**（`lib.rs` 里搜 `#[tauri::command]`；
 前端调用点见 `apps/desktop/src/api.ts`，**两边名字一一对应**）：
 
 ```text
@@ -173,6 +179,7 @@ pick_target_window    launch_client        record_window_geometry  probe_nav_ico
 list_icons            delete_icon          delete_icon_variant  save_icon_from_crop
 click_icon            list_calibration_plan  validate_area_mark  prune_stale_marks
 workflow_requirements register_capture_hotkey  unregister_capture_hotkey
+draw_cursor_circle
 ```
 
 最后两个在 `capture_hotkey.rs` 里（不在 `lib.rs`），注册句柄由 `HotkeyState` 托管。
@@ -212,18 +219,27 @@ workflow_requirements register_capture_hotkey  unregister_capture_hotkey
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `App.tsx` | 341 | **持有配置草稿 `draft`**（三个页签改同一份）+ 页签切换 |
-| `api.ts` | 363 | 所有 `invoke` 封装 + 事件订阅。**要改命令名先看这里** |
-| `types.ts` | 676 | 与 Rust 侧 serde 结构对应的类型（含 `Workflow` / `NavTarget` / `HotkeyRequest`） |
+| `App.tsx` | 452 | **持有配置草稿 `draft`**（四个页签改同一份）+ **持有运行参数 `runChoice`**（不进草稿、不置 `dirty`）+ 页签切换 |
+| `api.ts` | 381 | 所有 `invoke` 封装 + 事件订阅。**要改命令名先看这里** |
+| `types.ts` | 742 | 与 Rust 侧 serde 结构对应的类型（含 `Workflow` / `NavTarget` / **`RunChoice`** / `StartTaskRequest` / `TaskFormValues` / `CircleTraceView` / `HotkeyRequest`） |
+| `countdown.ts` | 92 | ★ **「先倒数、到点再动手」的唯一实现**（`useCountdown` / `COUNTDOWN_TICK_MS` / `remainingSeconds`）。**到点判据是「现在 ≥ 截止时刻」**，别在任何调用点改成"把间隔累加起来"。秒数留在各调用点（截图 8 秒 / 画圆 3 秒） |
 | `calibration.css` | 470 | 「界面标定」页与区域画布的样式（自成一套） |
-| `components/RuntimePanel.tsx` | 782 | 整组运行配置表单（**配置项都显示，不按模式隐藏**）+ 启动搬迁提示。⚠️ 超基线，见 `docs/todo.md` T17 |
-| `components/IconLibraryPanel.tsx` | 1064 | 图标库：截图 → 框选 → 命名 → 存模板 → 勾「用于导航」并选**导航目标**。⚠️ 超基线，见 T17 |
+| `components/RuntimePanel.tsx` | 288 | 「任务」页配置面板的**骨架**：页头三条提示（模式说明 / 未保存警告 / 搬迁结果）+ 四个开关 + 确认有效期与置信度 + 保存按钮 + 数据目录说明。★ **表单按"归属"拆给了四个同级组件**，见下面四行；加东西前先问"它属于哪一组" |
+| `components/RunChoiceFields.tsx` | 270 | ★★ **运行参数那一组**：模式 / 演练场景 / 工作流 / 要点哪个图标 / 还缺哪块标定。**绑 `runChoice` 而不是 `draft`**（选完直接点开始就生效，不用保存）。它拿 `draft` 只为两件事：演练场景（唯一一个配置字段）与标定结果签名。⚠️ 判据一句话：**要"保存配置"的留在 `RuntimePanel`，只管"这一次怎么跑"的搬这里** |
+| `components/TargetWindowSection.tsx` | 202 | **目标窗口**那一组：指认窗口 / 可执行文件路径与哈希 / 启动客户端 / 窗口类名 / 记录窗口尺寸 / OCR 程序路径。自带「启动中」「读取中」两份局部状态。★ 全是**配置**，要保存 |
+| `components/AdvancedParamsSection.tsx` | 192 | **超时 + 滚动查找**两组旋钮（含 `ratioFromInput`：清空输入框时**保留原值**，别退回 0）。平时不动，机器慢/列表长才来调 |
+| `components/TypingTextSection.tsx` | 87 | **逐字输入间隔 + 靶标文字**（资料页入口文字、搜索下拉「联系人」分组标题）。这几个值**随客户端版本变**，改动理由相同，所以归到一起 |
+| `components/IconLibraryPanel.tsx` | 808 | 图标库页**主面板**：截一张窗口图 → 在图上框住图标 → 起名字存下来（一个名字可存多张变体）；再加匹配参数与保存按钮。★ 列表与结果预览已拆出，见下面两行 |
+| `components/IconList.tsx` | 225 | 图标库**列表**：一行一个图标 + 全部变体缩略图 + 「用于联系人/聊天历史导航」勾选 + 测试匹配 / 定位并点击 / 删除。★ 它**自带两个"两下确认"状态**（`armed` / `armDelete`）—— 主面板不必知道"哪个按钮上了膛" |
+| `components/NavResultSections.tsx` | 140 | 「匹配结果」「点击结果」两段**只读预览**（含 `ShotOverlay`：整窗图 + 搜索区蓝虚线 + 命中框 + 点击点）。★ 纯展示，**不判断结果对不对**——那句话是后端 `probe.notice` / `click.notice` 下发的 |
+| `iconNames.ts` | 15 | ★ **`normalizeName`（图标名的比较键）**。它是**判据**（"算不算同一个图标"），只能有一处 —— 主面板与 `IconList` 都从这里取 |
 | `components/CalibrationPanel.tsx` | 722 | 界面标定页：左栏场景 + 项清单，右栏截图与画布；含失效项清理出口。⚠️ 超基线，见 T17 |
-| `components/CaptureTrigger.tsx` | 297 | **截图的三种触发方式**：立刻 / 延时倒计时 / 全局热键。为什么必须有后两种见 `windows-mvp-interface.md` |
+| `components/CaptureTrigger.tsx` | 280 | **截图的三种触发方式**：立刻 / 延时倒计时 / 全局热键。倒计时走 `countdown.ts`。为什么必须有后两种见 `windows-mvp-interface.md` |
+| `components/CursorMotionPanel.tsx` | 147 | 「轨迹自检」页：点按钮 → 倒计时 3 秒 → 光标画一圈。半径 = 本程序窗口**短边**的一半。见 `docs/todo.md` T24 |
 | `components/RegionCanvas.tsx` | 323 | 可拖拽画布：移动 / 八向缩放 / 空白处拉新框 |
-| `components/RegionCalibration.tsx` | 284 | 四个核心区域的百分比表单（嵌在「任务」页里） |
-| `components/WindowPicker.tsx` | 172 | 倒计时悬停取窗口 |
-| `components/TaskForm.tsx` / `TaskHistory.tsx` / `StateTimeline.tsx` / `ConfirmationDialog.tsx` | 70 / 72 / 66 / 59 | 任务发起、历史、状态轨迹、人工确认 |
+| `components/RegionCalibration.tsx` | 83 | ★ **不再是组件**：只剩 `DEFAULT_REGIONS`（四块区域的默认比例，后端是单一来源、这里只能手抄）与 `regionsAreValid`（保存前校验）。四个区域**只在「界面标定」页标**，旧的手填数字面板已删 |
+| `components/WindowPicker.tsx` | 172 | 倒计时悬停取窗口。⚠️ **它不用 `countdown.ts`**：那个定时器每跳一次还要顺便采一次"光标下是哪个窗口"，数与采必须同一拍 |
+| `components/TaskForm.tsx` / `TaskHistory.tsx` / `StateTimeline.tsx` / `ConfirmationDialog.tsx` | 77 / 72 / 66 / 59 | 任务发起、历史、状态轨迹、人工确认。`TaskForm` **不碰「走哪条路」**，那是 `App.handleStart` 补进请求的 |
 
 ## 4. ★ 需求 → 文件（反向索引）
 
@@ -236,6 +252,8 @@ workflow_requirements register_capture_hotkey  unregister_capture_hotkey
 | **改「只做导航」**（工作流 1 / 2） | `runner/navigate.rs`（判据与点击）+ `vision/src/template.rs`（匹配算法） |
 | **改「在哪一步停下 / 要不要发」** | `runner/message.rs` 的 `prepare_message`。搜索式与「只填不发」都停在 `Prepared` |
 | 改三条工作流各自要求先标哪些区域 | `src-tauri/src/runtime.rs` 的 `required_marks`。**判据只有这一处**，界面通过 `workflow_requirements` 命令读它 |
+| **改「本次走哪条路」怎么传到后端**（**模式** / 工作流 / 导航目标） | `runtime.rs` 的 `RunChoice` + `lib.rs::start_task`（读 `request.run_choice`，**不读也不写配置**）+ `App.tsx::handleStart`（补进请求）+ **`components/RunChoiceFields.tsx`** 的三个选择器（绑 `runChoice`）。★★ **这是运行参数、不是配置项**——别改回读 `state.config`，那正是 2026-09-19「选了 A 跑的是 B」那个 bug |
+| 改**模式**（演练 / 真实）影响到的行为 | ① 挑哪组端口 ② 真实模式没标定尺寸就拒 ③ 审计里的平台字段（`RuntimeMode::platform_label`）④ 要不要带标定窗口（`RuntimeMode::calibrated_window`）。★ 上面四条**全部**通过 `build_runner` 开头那句 `config.mode = choice.mode` 跟随本次运行参数，**判据只有一处**。界面侧：页头徽标 / `canSave` / 演练场景显隐一律看 `App` 的 `activeMode`，**别用 `draft.mode`**。提示文案只有一处：`RuntimeMode::notice()`，后端成对下发（`RuntimeInfo.mode_notices`）。★ 这几样**全在 `src-tauri/src/runtime/mode.rs`** 里，改模式相关的东西先开它 |
 | 改区域比例默认值 / 加一个区域 | `automation-core/src/regions.rs` + `src-tauri/src/runtime.rs` 的 `RegionConfig` + `components/RegionCalibration.tsx` |
 | 加一个**界面标定**要标的区域 / 改引导语 | `src-tauri/src/calibration/catalog.rs` 的 `ITEMS` / `SCENES`（**清单只有这一处**）+ `components/CalibrationPanel.tsx`。加一项**不必**动 Rust 结构体、TS 类型和界面元数据表 |
 | 改标定框的校验规则（最小尺寸等） | `automation-core/src/regions.rs` 的 `RelativeRegion::validate`。**判据只有这一处**，`calibration::validate_rect` 与 `lib.rs` 都是转调它 |
@@ -246,11 +264,13 @@ workflow_requirements register_capture_hotkey  unregister_capture_hotkey
 | 改滚动行为（次数/落点/停稳） | 列表滚动 → `runner/list.rs`；资料页滚动 → `runner/search.rs`。**两套刻意不复用**，别合并 |
 | 改导航图标匹配 | `vision/src/template.rs`（算法）+ `runner/navigate.rs`（判据与点击）+ `icon_library.rs`（模板存取） |
 | 改 OCR 调用方式或输出解析 | `vision/src/ocr.rs`（契约与解析）+ `tools/winocr/src/main.rs`（实现） |
-| 改 Win32 动作（点击/滚动/粘贴） | `platform-windows/src/desktop.rs`（契约实现）+ `winapi.rs`（原语） |
+| 改 Win32 动作（点击/滚动/粘贴） | `platform-windows/src/desktop.rs`（契约实现）+ `winapi/input.rs`（键鼠/滚轮/文本原语）+ `winapi.rs`（窗口、截屏、剪贴板、进程） |
+| **改光标怎么走 / 快慢 / 画圆** | 全在 `platform-windows/src/winapi/cursor.rs`：缓动在 `move_cursor`，圆周在 `circle_points` + `move_cursor_circle`。**纯计算部分另有用例**（`winapi/tests.rs`）—— 轨迹错了 `SendInput` 照样返回成功，只有用例拦得住。入口：命令 `draw_cursor_circle` → `api.ts::drawCursorCircle` → `CursorMotionPanel.tsx` |
 | 改**截图的触发方式**（延时秒数、热键界面） | `components/CaptureTrigger.tsx`（界面）→ `src-tauri/src/capture_hotkey.rs`（命令）→ `platform-windows/src/hotkey.rs`（注册与消息循环）。⚠️ 延时秒数**刻意写死**，理由在该组件顶部 |
 | 改**全局热键允许哪些键** | `platform-windows/src/hotkey.rs` 的 `HotkeyKey`。**判据只有这一处**：界面故意用自由文本输入而**不列候选表**，就是为了不出现第二处 |
 | 排查「按了热键没反应」 | 先看界面上「已生效：Ctrl+Alt+S」在不在（不在 = 没注册成功，错误文案就在旁边）；再看 `capture_hotkey.rs` 的事件是否发到了界面 |
-| 排查「鼠标不动 / 点了没反应」 | 先看 `task-<ID前8位>.log`（`REFERENCE.md` §11.2 的排查顺序），再动 `winapi.rs` |
+| 排查「鼠标不动 / 点了没反应」 | 先看 `task-<ID前8位>.log`（`REFERENCE.md` §11.2 的排查顺序）；再动 `winapi/input.rs`（点击/滚轮）或 `winapi/cursor.rs`（光标怎么走） |
+| **排查「窗口一闪就退出」/ 启动不起来** | 先看 `data/startup.log`（`startup_log.rs` 写的）。启动期故障**全发生在窗口出现之前**，这是唯一现场。★ 若连它都没有 ⇒ 程序根本没跑到 `run()`（缺 DLL、被拦、双击的不是这个 exe）。`run.cmd` 现在会**等 4 秒确认进程还活着**，失败就把这份日志打出来 |
 | 改审计字段 / 加发送台账 | `storage/src/{db,store}.rs` + `automation-core/src/audit.rs` |
 | 改证据脱敏方式 | `vision/src/evidence.rs`（涂灰逻辑）+ `storage/src/evidence.rs`（落盘与清理） |
 | 加演练场景 / 故障注入 | `platform-mock/src/scenario.rs` + `fault.rs` |
@@ -263,7 +283,10 @@ workflow_requirements register_capture_hotkey  unregister_capture_hotkey
 
 1. `apps/desktop/src-tauri/src/runtime.rs` → `RuntimeConfig` 加字段（带 `#[serde(default)]`）
 2. `apps/desktop/src/types.ts` → 同名字段（**注意 serde 的命名转换**）
-3. `apps/desktop/src/components/RuntimePanel.tsx` → 表单控件
+3. `apps/desktop/src/components/` → 表单控件。**放哪个文件看归属**：
+   要"保存配置"的 → `RuntimePanel.tsx` / `TargetWindowSection.tsx` /
+   `AdvancedParamsSection.tsx` / `TypingTextSection.tsx`；
+   只管"这一次怎么跑"的 → `RunChoiceFields.tsx`（绑 `runChoice`）
 4. `apps/desktop/src-tauri/src/runtime.rs` 的 `build_runner` → 映射进 `RunnerConfig`
    （若该字段属于编排层，还要在 `automation-core/src/runner/mod.rs` 的 `RunnerConfig` 加一份）
 
@@ -292,16 +315,27 @@ workflow_requirements register_capture_hotkey  unregister_capture_hotkey
 5. `apps/desktop/src-tauri/src/runtime.rs` → `RuntimeConfig.workflow` 的
    **`required_marks`** 加一行（这条工作流要先标哪几块区域）。
    ⚠️ 这是**判据唯一的一处**，界面通过 `workflow_requirements` 命令读它，
-   **不许**在 `RuntimePanel.tsx` 里另列一张表
-6. `apps/desktop/src/types.ts` 的 `Workflow` 联合类型 + `RuntimePanel.tsx` 的
+   **不许**在界面里另列一张表（渲染它在 `RunChoiceFields.tsx`）
+6. `apps/desktop/src/types.ts` 的 `Workflow` 联合类型 + `RunChoiceFields.tsx` 的
    `WORKFLOWS` / `WORKFLOW_LABELS` 下拉项
 
 ⚠️ 第 5 步漏了的表现是「界面说齐了、点开始却被拒」——装配期会用 `required_marks`
 拒绝，而人只会去怀疑标定本身。`ipc_flow.rs::the_requirement_list_matches_what_assembly_enforces`
 就是拦这个的。
 
+⚠️ **运行参数那条线不用动**：新工作流是随 `StartTaskRequest.run_choice` 走的
+（`RunChoice.workflow` 是个枚举，加一项自动就通了）。要动的是上面第 6 步的下拉项——
+它绑的是 `runChoice`，不是配置草稿（见 `docs/windows-mvp-interface.md`）。
+
 **加一个 IPC 命令 —— 3 处**：`lib.rs` 写 `#[tauri::command]` → `with_commands` 里注册
-（`lib.rs:1571` 的 `generate_handler!`，**漏了会在运行时才报「命令不存在」**）→ `api.ts` 加封装。
+（`lib.rs:1846` 的 `generate_handler!`，**漏了会在运行时才报「命令不存在」**）→ `api.ts` 加封装。
+⚠️ **注册点是唯一的一处**：命令写在别的模块里（`capture_hotkey.rs` / `cursor_trace.rs`）
+也照样注册在这里，**别在那边另挂一个 `invoke_handler`**。跨模块的命令必须 `pub`，
+否则报 `E0603: macro import … is private`（错指向 `generate_handler!`，看着像宏的问题）。
+命令带 `AppHandle<R>` 时，**顺手补一条"能调通"的用例**（`ipc_flow.rs` 里已有五条先例）：
+漏注册的表现是前端拿到 "command not found"，而**编译期毫无提示**。
+⚠️ 用例会**真的产生副作用**时（动鼠标、占热键），加 `#[ignore]` 并在文档注释里写清
+"为什么默认不跑 + 怎么手动跑" —— 一个会劫持操作者鼠标的用例比没有用例更糟。
 
 **加一个任务状态 —— 4 处**：`state.rs` 枚举 + 合法迁移表 → `execute()` 里的迁移 →
 `types.ts` 的 `TaskState` 联合类型 → `StateTimeline.tsx` 的终态判断

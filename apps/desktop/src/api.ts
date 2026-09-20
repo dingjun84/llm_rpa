@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
   CalibrationPlan,
+  CircleTraceView,
   ConfirmationRequest,
   HotkeyRequest,
   IconClickResult,
@@ -348,6 +349,23 @@ export function clickIcon(
  */
 export function pickTargetWindow(): Promise<PickedWindow> {
   return invoke<PickedWindow>("pick_target_window");
+}
+
+/**
+ * 让光标以**当前光标位置**为圆心，沿圆周走满一圈。
+ *
+ * 纯轨迹自检：不点击、不输入、不抢前台，所以演练模式下也能用。
+ *
+ * ⚠️ **调用期间界面不会有任何反馈**：这个命令是同步跑完整圈才返回的。
+ * 所以界面要**先倒计时再调它**，让操作者有时间把鼠标挪到想当圆心的位置，
+ * 也免得他把"界面没反应"当成"没生效"。
+ *
+ * ★ **不收速度参数**：速度只在后端有一处定义（平台层 `WindowsDesktopConfig`
+ * 的默认值，也正是任务里用的那个）。让界面传值就等于在 TS 里再抄一份，
+ * 以后改了默认值两边会对不上，而且**两边都看不出来**。
+ */
+export function drawCursorCircle(): Promise<CircleTraceView> {
+  return invoke<CircleTraceView>("draw_cursor_circle");
 }
 
 export function onTaskUpdated(handler: (task: TaskView) => void): Promise<UnlistenFn> {

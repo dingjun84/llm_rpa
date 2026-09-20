@@ -1,6 +1,6 @@
 //! Win32 调用的最小封装。
 //!
-//! 所有 `unsafe` 都集中在本模块，上层只看到 `Result`。
+//! 所有 `unsafe` 都集中在本模块（含 `cursor` 子模块），上层只看到 `Result`。
 //! 这里不做任何策略判断，策略在 [`crate::desktop`] 中。
 
 use std::ffi::OsString;
@@ -29,19 +29,12 @@ use windows::Win32::System::Threading::{
     CreateProcessW, OpenProcess, QueryFullProcessImageNameW, PROCESS_INFORMATION,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_A,
-    VK_CONTROL, VK_DELETE, VK_RETURN, VK_V,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
     GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible,
     SetForegroundWindow, SetWindowPos, ShowWindow, WindowFromPoint, GA_ROOT, PW_RENDERFULLCONTENT,
-    SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_RESTORE,
+    SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_RESTORE,
 };
 
 /// `CF_UNICODETEXT`：Win32 中稳定的剪贴板格式常量。
@@ -657,318 +650,22 @@ pub fn fingerprint_of(pixels: &[u8], width: u32, height: u32) -> String {
 }
 
 // ── 输入 ────────────────────────────────────────────────────────────────
+//
+// 键盘 / 鼠标 / 滚轮 / 逐字输入的原语都搬到 `input.rs` 了。
+// 这里只留再导出，`winapi::left_click` 等原路径不变。
+mod input;
 
-fn key_input(vk: VIRTUAL_KEY, up: bool) -> INPUT {
-    let mut input = INPUT::default();
-    input.r#type = INPUT_KEYBOARD;
-    input.Anonymous.ki = KEYBDINPUT {
-        wVk: vk,
-        wScan: 0,
-        dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
-        time: 0,
-        dwExtraInfo: 0,
-    };
-    input
-}
-
-fn mouse_input(flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS) -> INPUT {
-    mouse_input_with(flags, 0)
-}
-
-fn mouse_input_with(
-    flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
-    mouse_data: i32,
-) -> INPUT {
-    let mut input = INPUT::default();
-    input.r#type = INPUT_MOUSE;
-    input.Anonymous.mi = MOUSEINPUT {
-        dx: 0,
-        dy: 0,
-        mouseData: mouse_data as u32,
-        dwFlags: flags,
-        time: 0,
-        dwExtraInfo: 0,
-    };
-    input
-}
-
-/// 一次绝对坐标的鼠标移动。
-///
-/// `dx` / `dy` 是**已归一化**到 0..=65535 的坐标（见 [`move_cursor_absolute`]），
-/// 不是像素——所以这里不能复用按像素说话的 [`mouse_input_with`]。
-fn mouse_move_input(dx: i32, dy: i32) -> INPUT {
-    let mut input = INPUT::default();
-    input.r#type = INPUT_MOUSE;
-    input.Anonymous.mi = MOUSEINPUT {
-        dx,
-        dy,
-        mouseData: 0,
-        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-        time: 0,
-        dwExtraInfo: 0,
-    };
-    input
-}
-
-/// Win32 的 `WHEEL_DELTA`：滚轮一格对应的 `mouseData` 增量。
-const WHEEL_DELTA_UNITS: i32 = 120;
-
-/// 逐格发送滚轮事件之间的间隔。
-///
-/// 把多格合并成一次 `SendInput`（`mouseData = ±360`）在多数程序里可用，
-/// 但 WebView 类界面（微信 4.x 就是）可能只当作一次滚动，实际滚动量不足。
-/// 逐格发送更接近真实滚轮——这是**为了稳妥的刻意选择**，不是在真机上对比测出的结论。
-const WHEEL_STEP_DELAY: Duration = Duration::from_millis(15);
-
-/// 在光标当前位置滚动鼠标滚轮。
-///
-/// `notches > 0` 表示**向下滚动内容**（看列表里更靠后的项），`< 0` 表示向上。
-/// 注意 Win32 的约定与直觉相反：`mouseData` 为**正**表示滚轮向远离用户的方向转，
-/// 内容向上移动；所以向下滚要传负值。
-///
-/// 调用方必须先把光标移到目标控件上——滚轮事件只会送给光标下的窗口。
-pub fn scroll_wheel(notches: i32) -> WinResult<()> {
-    if notches == 0 {
-        return Ok(());
-    }
-    let step = if notches > 0 { -WHEEL_DELTA_UNITS } else { WHEEL_DELTA_UNITS };
-    for index in 0..notches.unsigned_abs() {
-        let input = mouse_input_with(MOUSEEVENTF_WHEEL, step);
-        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-        if sent != 1 {
-            return Err(format!("发送滚轮事件失败（第 {} 格）", index + 1));
-        }
-        if index + 1 < notches.unsigned_abs() {
-            std::thread::sleep(WHEEL_STEP_DELAY);
-        }
-    }
-    Ok(())
-}
+pub use input::{
+    left_click, scroll_wheel, send_ctrl_a, send_ctrl_v, send_delete, send_enter, send_unicode_text,
+};
 
 // ── 光标轨迹 ────────────────────────────────────────────────────────────
+//
+// 轨迹那段（纯几何 + 一个 SendInput 原语）自成一类，已整体搬到 `cursor.rs`。
+// 这里只留再导出，`winapi::move_cursor` 等原路径不变。
+mod cursor;
 
-/// 光标轨迹相邻两步之间的间隔。
-///
-/// 8ms ≈ 125Hz，正是最常见 USB 鼠标的**默认回报率**：真鼠标每秒只向系统报告约
-/// 125 次位置，系统的鼠标消息也按这个节奏合并。按它走，轨迹在系统里留下的痕迹
-/// 与真鼠标是同一种东西。
-///
-/// 写死而不做成配置，是因为它描述的是"真鼠标长什么样"，**不随机器变**
-/// （换台机器，USB 鼠标还是 125Hz）。该由人调的是**速度**，那个是配置。
-const POINTER_STEP_INTERVAL: Duration = Duration::from_millis(8);
-
-/// 一次移动的最短耗时。
-///
-/// 低于这个时长，人眼看到的仍是一次瞬移——正是要消除的那个现象。
-const POINTER_MIN_DURATION: Duration = Duration::from_millis(120);
-
-/// 一次移动的最长耗时。
-///
-/// 人做一次大幅度移动也就是这个量级；再长就不像"移动"而像"卡住"，
-/// 而且每个点击都要多等这么久。
-///
-/// **代价**：真正超长的距离（跨多个显示器）会被压缩到这个时长，轨迹会显得偏快。
-/// 这是刻意的取舍——「看得见」比「严格按速度走完」更重要，而且速度本身是可配的。
-const POINTER_MAX_DURATION: Duration = Duration::from_millis(800);
-
-/// 把光标沿一条**人形轨迹**移到 `(x, y)`。
-///
-/// ## 为什么要走轨迹
-///
-/// 一步跳过去（`SetCursorPos`）在系统里留下的是"光标凭空出现在别处"：操作者
-/// 看不出发生了什么，目标程序的悬停/移入事件也只收到一个终态。按真鼠标那样分步
-/// 走，光标是**看得见地飞过去**的，目标程序依次收到的也是与真鼠标同型的移动消息。
-///
-/// ## 轨迹形状
-///
-/// 用 smoothstep（`3t² - 2t³`）缓动：起步慢、中间快、收尾慢，与人手做指向动作
-/// 时的速度曲线同型。**不用随机抖动**——那会把「同一个点击为什么这次成功那次
-/// 失败」变成查不清的问题，而本项目要求行为可复现。
-///
-/// ## 参数怎么来的
-///
-/// 总时长只由**距离与速度**算出（`距离 ÷ 速度`），再按 [`POINTER_STEP_INTERVAL`]
-/// 切成若干步。速度由调用方从配置传入，所以"快慢"可调，"像不像人手"是算出来的。
-pub fn move_cursor(x: i32, y: i32, speed_px_per_sec: f64) -> WinResult<()> {
-    if !speed_px_per_sec.is_finite() || speed_px_per_sec <= 0.0 {
-        return Err(format!("光标速度必须是正数，收到 {speed_px_per_sec}"));
-    }
-
-    let (from_x, from_y) = cursor_position()?;
-    let dx = (x - from_x) as f64;
-    let dy = (y - from_y) as f64;
-    let distance = (dx * dx + dy * dy).sqrt();
-    // 已经在那儿了（或差不到一个像素）就直接落位：别为了"像人"在原地抖满最短时长。
-    if distance < 1.0 {
-        return move_cursor_absolute(x, y);
-    }
-
-    let duration = Duration::from_secs_f64(distance / speed_px_per_sec)
-        .clamp(POINTER_MIN_DURATION, POINTER_MAX_DURATION);
-    let steps =
-        ((duration.as_secs_f64() / POINTER_STEP_INTERVAL.as_secs_f64()).round() as u32).max(1);
-    let step_delay = duration / steps;
-
-    for step in 1..=steps {
-        let t = step as f64 / steps as f64;
-        let eased = t * t * (3.0 - 2.0 * t);
-        let px = (from_x as f64 + dx * eased).round() as i32;
-        let py = (from_y as f64 + dy * eased).round() as i32;
-        move_cursor_absolute(px, py)?;
-        // 最后一步之后不再睡：位置已经到位，多等一帧只是拖慢每个点击。
-        if step < steps {
-            std::thread::sleep(step_delay);
-        }
-    }
-    Ok(())
-}
-
-/// 发一次绝对坐标的鼠标移动。
-///
-/// 走 `SendInput` 而不是 `SetCursorPos`：前者是**真实输入管线**，返回值就是系统
-/// 实际接受的事件数——被拦下时是 0，我们能当场发现。后者存在"返回成功、光标却没动"
-/// 的情形（前台窗口属于更高完整性的进程等），而"鼠标没动"正是最难查的成因：
-/// 后面那次点击会落到光标**实际停着**的地方。
-fn move_cursor_absolute(x: i32, y: i32) -> WinResult<()> {
-    let (left, top, width, height) = virtual_screen_rect();
-    if width <= 1 || height <= 1 {
-        return Err(format!("虚拟桌面尺寸异常（{width}x{height}），拒绝发送绝对坐标"));
-    }
-    // 绝对坐标要归一化到 0..=65535，且 65535 对应虚拟桌面的**右下角像素**，
-    // 所以分母是 (尺寸 - 1)：用尺寸会让整条轨迹往右下偏一格。
-    let nx = ((x - left) as i64 * 65_535 / (width as i64 - 1)) as i32;
-    let ny = ((y - top) as i64 * 65_535 / (height as i64 - 1)) as i32;
-
-    let input = mouse_move_input(nx, ny);
-    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-    if sent != 1 {
-        return Err(format!(
-            "移动鼠标到 ({x}, {y}) 失败：系统没有接受这次输入（目标窗口可能属于更高权限的进程）"
-        ));
-    }
-    Ok(())
-}
-
-/// 虚拟桌面（所有显示器合起来）的左上角与尺寸。
-///
-/// 多显示器下主屏左上角不一定是 (0,0)——左侧或上方的显示器会让坐标为负。
-/// 而 `MOUSEEVENTF_ABSOLUTE` 的归一化基准是整个**虚拟桌面**，不是主屏；
-/// 按主屏算，副屏上的坐标会整体偏移。
-fn virtual_screen_rect() -> (i32, i32, i32, i32) {
-    // SAFETY: `GetSystemMetrics` 是纯只读查询，无指针、无所有权。
-    unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        )
-    }
-}
-
-pub fn left_click() -> WinResult<()> {
-    let inputs = [mouse_input(MOUSEEVENTF_LEFTDOWN), mouse_input(MOUSEEVENTF_LEFTUP)];
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent != inputs.len() as u32 {
-        return Err("发送鼠标事件失败".to_string());
-    }
-    Ok(())
-}
-
-pub fn send_ctrl_v() -> WinResult<()> {
-    send_ctrl_key(VK_V, "粘贴快捷键")
-}
-
-/// Ctrl+A：仅用于诊断工具清空测试输入框。
-pub fn send_ctrl_a() -> WinResult<()> {
-    send_ctrl_key(VK_A, "全选快捷键")
-}
-
-/// Delete：仅用于诊断工具清空测试输入框。
-pub fn send_delete() -> WinResult<()> {
-    let inputs = [key_input(VK_DELETE, false), key_input(VK_DELETE, true)];
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent != inputs.len() as u32 {
-        return Err("发送删除键失败".to_string());
-    }
-    Ok(())
-}
-
-fn send_ctrl_key(key: VIRTUAL_KEY, what: &str) -> WinResult<()> {
-    let inputs = [
-        key_input(VK_CONTROL, false),
-        key_input(key, false),
-        key_input(key, true),
-        key_input(VK_CONTROL, true),
-    ];
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent != inputs.len() as u32 {
-        return Err(format!("发送{what}失败"));
-    }
-    Ok(())
-}
-
-/// 一个 Unicode 字符（UTF-16 码元）的按下 / 抬起事件。
-fn unicode_input(unit: u16, up: bool) -> INPUT {
-    let mut input = INPUT::default();
-    input.r#type = INPUT_KEYBOARD;
-    input.Anonymous.ki = KEYBDINPUT {
-        // 走 `KEYEVENTF_UNICODE` 时 `wVk` 必须为 0，字符本身放在 `wScan` 里。
-        wVk: VIRTUAL_KEY(0),
-        wScan: unit,
-        dwFlags: if up { KEYEVENTF_KEYUP | KEYEVENTF_UNICODE } else { KEYEVENTF_UNICODE },
-        time: 0,
-        dwExtraInfo: 0,
-    };
-    input
-}
-
-/// 逐字符输入文本，**不经过剪贴板**。
-///
-/// ## 为什么用 `KEYEVENTF_UNICODE` 而不是虚拟键码
-///
-/// 虚拟键码只能表达键盘上**真实存在**的键，中文根本没有对应的键。
-/// `KEYEVENTF_UNICODE` 直接把一个 UTF-16 码元交给目标窗口的键盘消息处理，
-/// 与输入法上屏走的是同一条路——这是逐字输入中文唯一可行的办法。
-///
-/// ## 为什么按 UTF-16 码元而不是 `char`
-///
-/// BMP 之外的字符（emoji 等）在 Windows 上是**代理对**，占两个码元。
-/// 按 `char` 发会让目标窗口收到半个代理对，显示成一个方块。
-///
-/// ## 为什么字符之间要等
-///
-/// 客户端的搜索框是**联想式**的：收到一个字符就发一次查询、刷新下拉列表。
-/// 连珠炮式地发完，联想请求会互相打断，下拉列表可能只按第一个字符的结果定格——
-/// 而现象是"搜出来的东西不对"，不会让人想到是**输入太快**。
-/// 间隔由调用方给（平台侧配置），这里不写死。
-pub fn send_unicode_text(text: &str, interval: Duration) -> WinResult<()> {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    for (index, unit) in units.iter().enumerate() {
-        let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        if sent != inputs.len() as u32 {
-            return Err(format!(
-                "发送第 {} 个字符失败（共 {} 个）",
-                index + 1,
-                units.len()
-            ));
-        }
-        if !interval.is_zero() && index + 1 < units.len() {
-            std::thread::sleep(interval);
-        }
-    }
-    Ok(())
-}
-
-pub fn send_enter() -> WinResult<()> {
-    let inputs = [key_input(VK_RETURN, false), key_input(VK_RETURN, true)];
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent != inputs.len() as u32 {
-        return Err("发送回车键失败".to_string());
-    }
-    Ok(())
-}
+pub use cursor::{move_cursor, move_cursor_circle, CircleTrace};
 
 // ── 剪贴板 ──────────────────────────────────────────────────────────────
 
@@ -1092,3 +789,8 @@ fn hex_lower(bytes: &[u8]) -> String {
     }
     out
 }
+
+// 用例放在 `winapi/tests.rs`（与 `hotkey.rs` + `hotkey/tests.rs` 同一套写法）：
+// 测试文件不计入规模上限，而这个源文件已经超标了。
+#[cfg(test)]
+mod tests;
