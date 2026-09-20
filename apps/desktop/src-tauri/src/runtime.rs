@@ -4,7 +4,7 @@
 //!
 //! - **演练模式**（`DryRun`）：全部使用 `platform-mock` 的替身端口，
 //!   不接触真实桌面、不启动企业微信、不产生任何输入事件。用于演示与自检。
-//! - **真实模式**（`Live`）：使用 `platform-windows` 与本地 OCR 进程。
+//! - **真实模式**（`Live`）：使用 `platform-windows` / `platform-macos` 与本地 OCR 进程。
 //!   所有敏感参数都必须由使用者在界面上显式配置。
 
 use std::sync::Arc;
@@ -546,14 +546,23 @@ fn build_matcher(relaxed: bool) -> Arc<dyn automation_core::ContactMatcher> {
     }
 }
 
-/// 真实模式：装配 Windows 平台与本地 OCR。
+/// 真实模式：装配当前操作系统的平台适配层与本地 OCR。
 fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
-    #[cfg(windows)]
-    {
-        use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
-        use vision::{ExternalOcr, UnconfiguredOcr};
+    use vision::{ExternalOcr, UnconfiguredOcr};
 
-        let desktop = WindowsDesktop::new(WindowsDesktopConfig {
+    let ocr: Arc<dyn LocalOcr> = match config.ocr_command.as_ref() {
+        Some(command) if !command.trim().is_empty() => Arc::new(
+            ExternalOcr::new(command.trim())
+                .with_args(config.ocr_args.clone())
+                .with_timeout(Duration::from_millis(config.ocr_timeout_ms.max(500))),
+        ),
+        _ => Arc::new(UnconfiguredOcr),
+    };
+
+    #[cfg(windows)]
+    let platform: Arc<dyn automation_core::DesktopPlatform> = {
+        use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
+        Arc::new(WindowsDesktop::new(WindowsDesktopConfig {
             wecom_exe: config.wecom_exe.as_ref().map(std::path::PathBuf::from),
             wecom_exe_sha256: config.wecom_exe_sha256.clone(),
             window_matcher: platform_windows::WindowMatcher::ClassName(config.window_class.clone()),
@@ -563,19 +572,32 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
             typing_interval: Duration::from_millis(config.typing_interval_ms),
             // 其余取默认值：粘贴后清空剪贴板、600ms 剪贴板读取等待、4M 像素捕获上限。
             ..WindowsDesktopConfig::default()
-        });
+        }))
+    };
 
-        let ocr: Arc<dyn LocalOcr> = match config.ocr_command.as_ref() {
-            Some(command) if !command.trim().is_empty() => Arc::new(
-                ExternalOcr::new(command.trim())
-                    .with_args(config.ocr_args.clone())
-                    .with_timeout(Duration::from_millis(config.ocr_timeout_ms.max(500))),
-            ),
-            _ => Arc::new(UnconfiguredOcr),
-        };
+    #[cfg(target_os = "macos")]
+    let platform: Arc<dyn automation_core::DesktopPlatform> = {
+        use platform_macos::{MacOSDesktop, MacOSDesktopConfig};
+        Arc::new(MacOSDesktop::new(MacOSDesktopConfig {
+            wecom_exe: config.wecom_exe.as_ref().map(std::path::PathBuf::from),
+            wecom_exe_sha256: config.wecom_exe_sha256.clone(),
+            // macOS 上 window_class 表示「所有者名」（应用显示名），见 platform-macos 文档。
+            window_matcher: platform_macos::WindowMatcher::ClassName(config.window_class.clone()),
+            typing_interval: Duration::from_millis(config.typing_interval_ms),
+            ..MacOSDesktopConfig::default()
+        }))
+    };
 
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (config, ocr);
+        return Err("真实模式目前只支持 Windows 与 macOS".to_string());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    {
         Ok(RunnerPorts {
-            platform: Arc::new(desktop),
+            platform,
             ocr,
             // 真实模式的姓名匹配器在这里选型。
             // 放宽层是**临时**的，理由与风险见 `ContainsNameMatcher` 与 `docs/todo.md`。
@@ -585,11 +607,6 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
             icons: Arc::new(vision::TemplateLocator),
             confirmation: Arc::new(MockHumanConfirmation::default()),
         })
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = config;
-        Err("真实模式目前只支持 Windows".to_string())
     }
 }
 

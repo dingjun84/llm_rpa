@@ -494,6 +494,8 @@ fn runtime_info_reports_the_dry_run_notice_and_audit_count() {
         "真实模式必须有醒目提示"
     );
     assert_eq!(before.is_windows, cfg!(windows));
+    assert_eq!(before.is_macos, cfg!(target_os = "macos"));
+    assert_eq!(before.live_supported, cfg!(windows) || cfg!(target_os = "macos"));
 
     let id = harness.start("张三", BODY);
     harness.wait_until(&id, "进入等待人工确认", |view| {

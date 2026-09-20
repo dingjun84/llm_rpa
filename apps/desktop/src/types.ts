@@ -676,6 +676,10 @@ export interface RuntimeInfo {
   template_max_side: number;
   audit_entry_count: number;
   is_windows: boolean;
+  /** 当前是否运行在 macOS 上。 */
+  is_macos: boolean;
+  /** 真实模式是否可用（Windows 或 macOS）。 */
+  live_supported: boolean;
   /**
    * 演练 / 真实两种模式**各自**那句给操作者看的提示。
    *

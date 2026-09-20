@@ -127,6 +127,10 @@ pub struct RuntimeInfo {
     pub template_max_side: u32,
     pub audit_entry_count: u64,
     pub is_windows: bool,
+    /// 当前是否运行在 macOS 上。
+    pub is_macos: bool,
+    /// 真实模式是否可用（Windows 或 macOS）。
+    pub live_supported: bool,
     /// 演练 / 真实两种模式各自的显式提示，避免被误当成真实发送。
     /// 前端按**界面上当前选的那个模式**取（见 [`ModeNotices`]）。
     pub mode_notices: ModeNotices,
@@ -744,6 +748,8 @@ fn runtime_info<R: Runtime>(
         template_max_side: vision::MAX_TEMPLATE_SIDE,
         audit_entry_count: state.audit.count().unwrap_or(0),
         is_windows: cfg!(windows),
+        is_macos: cfg!(target_os = "macos"),
+        live_supported: cfg!(windows) || cfg!(target_os = "macos"),
         mode_notices: ModeNotices::all(),
         migration_note: state.migration_note.clone(),
     })
@@ -822,12 +828,13 @@ fn prune_stale_marks<R: Runtime>(
     Ok(removed)
 }
 
-/// 按「窗口类名 +（可选）可执行文件路径」构造桌面适配器。
+/// 按「窗口类名/所有者名 +（可选）可执行文件路径」构造桌面适配器。
 ///
 /// 标定类的命令（预览、量图标、截图标模板、试点击）**全都走它**，
-/// 这样定位规则与任务执行时是同一套。为什么要强调这一点：Qt 系程序
-/// （微信 4.x 就是）所有顶层窗口共用同一个类名，只按类名定位可能选中**登录窗**，
-/// 那样标定就全白做了——而标定结果看起来完全正常。
+/// 这样定位规则与任务执行时是同一套。
+///
+/// - Windows：`window_class` = Win32 类名；
+/// - macOS：`window_class` = 所有者名（应用显示名，`CGWindowOwnerName`）。
 #[cfg(windows)]
 fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_windows::WindowsDesktop {
     use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
@@ -842,6 +849,20 @@ fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_windows:
     })
 }
 
+#[cfg(target_os = "macos")]
+fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_macos::MacOSDesktop {
+    use platform_macos::{MacOSDesktop, MacOSDesktopConfig};
+
+    MacOSDesktop::new(MacOSDesktopConfig {
+        wecom_exe: wecom_exe
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from),
+        window_matcher: platform_macos::WindowMatcher::ClassName(window_class.to_string()),
+        ..MacOSDesktopConfig::default()
+    })
+}
+
 /// 把一帧窗口画面压成界面能直接塞进 `<img src>` 的 `data:` URL，并返回它的像素尺寸。
 ///
 /// 先缩到 [`PREVIEW_MAX_WIDTH`] 再编码：4K 窗口的原始 PNG + base64 能到几十 MB，
@@ -850,7 +871,7 @@ fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_windows:
 /// ⚠️ 缩过的图**只能用来给人看**。要拿来做模板必须回原始分辨率重截一次——
 /// 这里是 Triangle 滤波的重采样，裁出来的图案边缘会带上插值出来的杂色，
 /// 拿去匹配真实画面自然对不准，而且分数不会低到让人起疑。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn preview_data_url(shot: &Screenshot) -> Result<(String, u32, u32), String> {
     use base64::Engine;
 
@@ -900,7 +921,7 @@ fn preview_target_window<R: Runtime>(
         return Err("窗口类名为空，无法定位目标窗口。先点「指认窗口」或手工填写类名。".into());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let desktop = desktop_for(&class, wecom_exe.as_deref());
 
@@ -918,10 +939,10 @@ fn preview_target_window<R: Runtime>(
             fingerprint: shot.fingerprint,
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (class, wecom_exe);
-        Err("区域标定目前只支持 Windows".to_string())
+        Err("区域标定目前只支持 Windows 与 macOS".to_string())
     }
 }
 
@@ -963,9 +984,34 @@ fn pick_target_window<R: Runtime>(_app: AppHandle<R>) -> Result<PickedWindow, St
             is_self,
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        Err("指认窗口目前只支持 Windows".to_string())
+        use platform_macos::macosapi;
+
+        let (x, y) = macosapi::cursor_position()?;
+        let w = macosapi::window_from_point(x, y)
+            .ok_or_else(|| format!("光标位置 ({x}, {y}) 下没有窗口"))?;
+
+        let window = macosapi::window_rect(w)?;
+        let exe_path = macosapi::window_process_path(w).ok();
+
+        let is_self = match (&exe_path, std::env::current_exe()) {
+            (Some(picked), Ok(own)) => picked == own,
+            _ => false,
+        };
+
+        // macOS：class_name 字段填所有者名（应用显示名），与配置语义一致。
+        Ok(PickedWindow {
+            class_name: macosapi::window_owner_name(w),
+            title: macosapi::window_title(w),
+            exe_path: exe_path.map(|path| path.display().to_string()),
+            window,
+            is_self,
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err("指认窗口目前只支持 Windows 与 macOS".to_string())
     }
 }
 
@@ -1004,10 +1050,22 @@ fn launch_client<R: Runtime>(
         });
         desktop.launch_wecom().map_err(|err| err.to_string())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        use automation_core::DesktopPlatform;
+        use platform_macos::{MacOSDesktop, MacOSDesktopConfig};
+
+        let desktop = MacOSDesktop::new(MacOSDesktopConfig {
+            wecom_exe: Some(std::path::PathBuf::from(path)),
+            wecom_exe_sha256: wecom_exe_sha256.filter(|value| !value.trim().is_empty()),
+            ..MacOSDesktopConfig::default()
+        });
+        desktop.launch_wecom().map_err(|err| err.to_string())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (path, wecom_exe_sha256);
-        Err("启动客户端目前只支持 Windows".to_string())
+        Err("启动客户端目前只支持 Windows 与 macOS".to_string())
     }
 }
 
@@ -1028,19 +1086,9 @@ fn record_window_geometry<R: Runtime>(
         return Err("窗口类名为空，无法定位目标窗口。先点「指认窗口」或手工填写类名。".into());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
-        use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
-
-        let desktop = WindowsDesktop::new(WindowsDesktopConfig {
-            wecom_exe: wecom_exe
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(std::path::PathBuf::from),
-            window_matcher: platform_windows::WindowMatcher::ClassName(class.clone()),
-            ..WindowsDesktopConfig::default()
-        });
+        let desktop = desktop_for(&class, wecom_exe.as_deref());
 
         let (window, metrics) = desktop
             .measure()
@@ -1054,10 +1102,10 @@ fn record_window_geometry<R: Runtime>(
             scale_factor: metrics.scale_factor,
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (class, wecom_exe);
-        Err("记录窗口尺寸目前只支持 Windows".to_string())
+        Err("记录窗口尺寸目前只支持 Windows 与 macOS".to_string())
     }
 }
 
@@ -1208,7 +1256,7 @@ fn probe_nav_icon<R: Runtime>(
     // 由界面选，这里不必猜——报错要人做的事（去图标库补一张）对两组都一样。
     let templates = runtime::load_nav_icon_templates(&state.icons_dir(), &templates, "导航")?;
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let desktop = desktop_for(&class, wecom_exe.as_deref());
 
@@ -1288,10 +1336,10 @@ fn probe_nav_icon<R: Runtime>(
             notice,
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (class, region, min_score, templates);
-        Err("图标匹配测试目前只支持 Windows".to_string())
+        Err("图标匹配测试目前只支持 Windows 与 macOS".to_string())
     }
 }
 
@@ -1442,7 +1490,7 @@ fn save_icon_from_crop<R: Runtime>(
     // 名字不合法就不该去截一张图，用户改了名字再点就是了。
     icon_library::validate_name(&name)?;
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let desktop = desktop_for(&class, wecom_exe.as_deref());
         let (_window, shot) = desktop
@@ -1475,10 +1523,10 @@ fn save_icon_from_crop<R: Runtime>(
         let rect = window_rect_from_preview(rect, preview, shot.width, shot.height)?;
         icon_library::save(&state.icons_dir(), &name, &shot, rect)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (class, wecom_exe, rect, preview, name, state);
-        Err("图标模板目前只能在 Windows 上截取".to_string())
+        Err("图标模板目前只能在 Windows 与 macOS 上截取".to_string())
     }
 }
 
@@ -1565,7 +1613,7 @@ fn click_icon<R: Runtime>(
     // 目标名传「导航」的理由同 `probe_nav_icon`：量的是哪一组由界面选，这里不猜。
     let templates = runtime::load_nav_icon_templates(&state.icons_dir(), &templates, "导航")?;
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         use automation_core::{DesktopPlatform, IconLocator};
 
@@ -1713,10 +1761,10 @@ fn click_icon<R: Runtime>(
             notice,
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (class, wecom_exe, min_score, templates, settle_ms);
-        Err("图标点击测试目前只支持 Windows".to_string())
+        Err("图标点击测试目前只支持 Windows 与 macOS".to_string())
     }
 }
 

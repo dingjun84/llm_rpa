@@ -41,6 +41,9 @@ uuid.workspace = true
 [target.'cfg(windows)'.dependencies]
 platform-windows = { path = "../../../crates/platform-windows" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+platform-macos = { path = "../../../crates/platform-macos" }
+
 [dev-dependencies]
 # `test` 特性提供 `tauri::test::mock_builder` / `MockRuntime`，
 # 让命令层可以在不启动真实窗口的前提下被自动化验证。

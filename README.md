@@ -6,7 +6,7 @@
 所有识别与决策都在本机完成：不联网、不注入、不 Hook、不读取客户端内存。
 **每一条消息都必须由操作者在界面上确认后才会发出。**
 
-当前处于 **Windows MVP** 阶段：单条纯文本任务，仅 Windows。
+当前支持 **Windows** 与 **macOS**：同一套业务流程，平台适配层分立。
 
 ## 安全边界
 
@@ -27,6 +27,7 @@ apps/desktop/              Tauri 2 + React 18 界面（任务、确认、标定�
 crates/automation-core/    状态机、端口 trait、匹配与核验策略、编排
 crates/platform-mock/      替身端口，供全流程测试与故障注入
 crates/platform-windows/   真实 Win32：窗口定位、GDI 截屏、SendInput、剪贴板
+crates/platform-macos/     真实 macOS：CGWindow / 截屏 / CGEvent / 剪贴板
 crates/vision/             局部裁切、预处理、离线 OCR 适配器
 crates/storage/            SQLite 审计与证据清理
 tools/winocr/              本地 OCR 子进程（包住 Windows 自带的 Windows.Media.Ocr）
@@ -165,6 +166,22 @@ CARGO_INCREMENTAL=0 cargo build -p winocr
 已知限制：该引擎对中文按字切词（工具内已做 CJK 空格归并），
 且**不提供逐词置信度**，统一输出 `confidence = 1.0`——
 所以真实模式下 `min_confidence` 拦不住东西。要真正的置信度门控需换 PaddleOCR。
+
+## macOS 设置
+
+1. **系统设置 → 隐私与安全性**：为本应用（或启动它的终端）打开 **屏幕录制** 与 **辅助功能**，然后重启应用。
+2. 用界面「指认窗口」写入所有者名（应用显示名）与 `.app` 路径；Mac 上配置里的「窗口类名」表示所有者名，不是 Win32 类名。
+3. 编译本地 OCR：
+
+```bash
+cd tools/macosocr
+swiftc -O -framework Vision -framework CoreGraphics \
+  -o ../../target/debug/macosocr macosocr.swift
+```
+
+把得到的路径填进配置的 `ocr_command`。
+
+更完整的说明见 [`docs/macos.md`](docs/macos.md)。
 
 ## 构建与测试
 

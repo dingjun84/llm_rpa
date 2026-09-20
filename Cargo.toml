@@ -3,6 +3,7 @@ members = [
   "crates/automation-core",
   "crates/platform-mock",
   "crates/platform-windows",
+  "crates/platform-macos",
   "crates/storage",
   "crates/vision",
   "apps/desktop/src-tauri",
@@ -10,6 +11,7 @@ members = [
   # 与主应用没有任何代码依赖，删掉它（连同这一行）不影响主应用。
   "apps/webview-probe",
   "tools/winocr",
+  "tools/macosocr",
 ]
 resolver = "2"
 

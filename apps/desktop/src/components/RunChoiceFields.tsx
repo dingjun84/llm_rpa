@@ -166,9 +166,9 @@ export function RunChoiceFields({
         >
           {runChoice === null && <option value="">（正在读取运行配置…）</option>}
           <option value="dry_run">{MODE_LABELS.dry_run}</option>
-          <option value="live" disabled={!info.is_windows}>
+          <option value="live" disabled={!info.live_supported}>
             {MODE_LABELS.live}
-            {info.is_windows ? "" : "（仅 Windows）"}
+            {info.live_supported ? "" : "（仅 Windows / macOS）"}
           </option>
         </select>
         <span className="field-hint">
