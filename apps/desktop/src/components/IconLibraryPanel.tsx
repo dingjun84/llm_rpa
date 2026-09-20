@@ -426,6 +426,14 @@ export function IconLibraryPanel({
         <strong>一个名字可以存多张图</strong>：同一个图标在选中 / 未选中 / 带气泡提醒 /
         气泡里数字不一样时长得都不一样，而它们指的是同一个图标。名字填一样的再存一次就是
         <strong>给它补一张</strong>，这一个名字下的所有图都会参与匹配。
+        <br />
+        ⚠️ <strong>「选中」和「未选中」是两套字形，不是换个颜色而已</strong>——
+        未选中时是<strong>灰色描边线稿</strong>（中间是空的），选中时是<strong>实心填充</strong>。
+        它们互相之间的匹配分数只有 <strong>0.55 左右</strong>，远低于阈值，所以
+        <strong>截错状态就等于这个图标永远找不到</strong>。
+        任务里要点的那一个图标<strong>通常正处在未选中状态</strong>，
+        ⇒ <strong>模板要在它没被选中时截</strong>：先点一下别的图标让它变回未选中，再截。
+        两种状态各存一张最稳。
       </p>
 
       {!windowReady && (
@@ -790,7 +798,7 @@ export function IconLibraryPanel({
         </div>
       </section>
 
-      {error && <p className="notice notice-error">{error}</p>}
+      {error && <p className="notice notice-error failure-detail">{error}</p>}
       {notice && <p className="notice">{notice}</p>}
 
       {/* ── 五、结果 ─────────────────────────────────────────────────── */}

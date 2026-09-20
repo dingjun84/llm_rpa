@@ -146,7 +146,7 @@
 | `apps/desktop/src-tauri/src/lib.rs` | 1903 | 1793 | ✅ **减了 110**。T27 把**开跑前那份配置快照**（一百来行，纯写日志）整段搬成 `task_log.rs`(159) —— 它本来就是一段"写日志"的活，与命令层"装配 / 登记 / 起线程"不是一回事。见 `docs/todo.md` T27 |
 | `crates/automation-core/src/runner/mod.rs` | 1395 | 1224 | ✅ 拆成 5 个文件 |
 | `apps/desktop/src-tauri/src/runtime.rs` | 1039 | 927 | ✅ **减了 85**。T27 把「这条工作流要什么」那一组（`required_marks` / `missing_marks` / `WorkflowRequirement` / `workflow_inputs`）整段搬成 `runtime/requirements.rs`(171)，父模块 `pub use` 再导出（同 `mode.rs` 的做法）。见 `docs/todo.md` T17 / T27 |
-| `crates/vision/src/template.rs` | 881 | 793 | ✅ **仍低于基线**。T28 加失败诊断（`top_candidates` / `candidate_report`）时涨了 126 行——它们**只在失败路径上跑**，与"逐位置取最高分"那条热路径无关，所以留在同一文件里；见 `docs/todo.md` T28 |
+| `crates/vision/src/template.rs` | 881 | 796 | ✅ **仍低于基线**。T28 加失败诊断（`top_candidates` / `candidate_report`）时涨了 129 行——它们**只在失败路径上跑**，与"逐位置取最高分"那条热路径无关，所以留在同一文件里；见 `docs/todo.md` T28 |
 | `crates/platform-windows/src/winapi.rs` | 862 | 796 | ✅ **已拆完**（1215 → 985 → **796**）。两刀：光标轨迹 → `winapi/cursor.rs`(267)、输入原语 → `winapi/input.rs`(228)。见 `docs/todo.md` T17 |
 | `apps/desktop/src/components/IconLibraryPanel.tsx` | 983 | 800 | ✅ **已拆**（1064 → 808 → 800）。列表搬成 `IconList.tsx`(204)，两段结果预览搬成 `NavResultSections.tsx`(140)。T26 删掉「用于聊天历史导航」那一组后又减了 8 行 |
 | `apps/desktop/src/components/RuntimePanel.tsx` | 596 | 288 | ✅ **已拆**（858 → 288）。按「归属」拆成四个同级组件：`RunChoiceFields`(270，运行参数) / `TargetWindowSection`(202) / `AdvancedParamsSection`(192) / `TypingTextSection`(87)。见 `docs/todo.md` T17 |
@@ -176,7 +176,7 @@ get_webview_window`）。**搬完 `wc -l` 对一眼**，别信脚本的自报数
 | --- | --- | --- |
 | `automation-core/src/runner.rs`(1395→2136) | `runner/mod.rs` 1224 + 4 个子模块 | 见下 |
 | `apps/desktop/src-tauri/src/runtime.rs`(1541) | 959 | `runtime/tests.rs` 711 |
-| `crates/vision/src/template.rs`(1059) | 793 | `template/tests.rs` 453 |
+| `crates/vision/src/template.rs`(1059) | 796 | `template/tests.rs` 453 |
 | `crates/automation-core/src/state.rs`(532) | 261 | `state/tests.rs` 275 |
 | `apps/desktop/src-tauri/src/lib.rs`(1931) | 1894 | `src/tests.rs` 88 |
 | `apps/desktop/src-tauri/src/lib.rs`(1993) | 1896 | `src/cursor_trace.rs` 141（**不是测试**，是整段功能搬出去；见上面那条 ⚠️）|

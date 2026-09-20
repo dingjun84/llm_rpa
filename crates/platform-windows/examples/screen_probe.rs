@@ -612,10 +612,10 @@ fn find_icon(args: &[String]) -> Result<(), String> {
     let strip = match args.len() {
         3 | 4 => automation_core::DEFAULT_NAV_STRIP,
         _ => automation_core::RelativeRegion::new(
-            number(args, 4, "搜索区 x")? as f32,
-            number(args, 5, "搜索区 y")? as f32,
-            number(args, 6, "搜索区 宽度")? as f32,
-            number(args, 7, "搜索区 高度")? as f32,
+            ratio(args, 4, "搜索区 x")?,
+            ratio(args, 5, "搜索区 y")?,
+            ratio(args, 6, "搜索区 宽度")?,
+            ratio(args, 7, "搜索区 高度")?,
         ),
     };
     let min_score: f32 = match args.get(3) {
@@ -939,4 +939,15 @@ fn number(args: &[String], index: usize, name: &str) -> Result<i32, String> {
     arg(args, index, name)?
         .parse::<i32>()
         .map_err(|_| format!("参数 {name} 必须是整数"))
+}
+
+/// **比例**参数（`RelativeRegion` 的那四个）。
+///
+/// ⚠️ 不能用 [`number`]：它按 `i32` 解析，于是"搜索区宽度 0.1"会被拒成
+/// "必须是整数"，探针就**量不了配置里真的在用的那个区域**（默认 0.075，
+/// 用户改成 0.1 是常事）——量不到真区域，量出来的分数就没有意义。
+fn ratio(args: &[String], index: usize, name: &str) -> Result<f32, String> {
+    arg(args, index, name)?
+        .parse::<f32>()
+        .map_err(|_| format!("参数 {name} 必须是 0–1 的比例（例如 0.1）"))
 }

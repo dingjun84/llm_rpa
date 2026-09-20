@@ -540,6 +540,18 @@ button.ghost {
   color: var(--bad);
 }
 
+/*
+ * 长诊断文本（例如图标匹配失败时那段"各模板前几名候选"）。
+ *
+ * 它靠**换行**分段，而 `<p>` / `<span>` 默认会把换行压成一个空格 ——
+ * 不写这一条，几行候选会挤成一整行，恰好把"要读的那几个数"埋掉。
+ * `overflow-wrap` 是因为候选坐标这种长串没有空格可断。
+ */
+.failure-detail {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .calibration {
   margin: 18px 0 14px;
   padding-top: 14px;

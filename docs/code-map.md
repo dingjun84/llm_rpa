@@ -135,7 +135,7 @@
 | `src/hotkey/tests.rs` | 165 | 按键解析、虚拟键码区间、修饰键位、失败文案（测试文件不限行数） |
 | `src/desktop.rs` | 426 | `WindowsDesktop` 实现 `DesktopPlatform`（含 `is_responsive` → `IsHungAppWindow`） |
 | `src/config.rs` | 82 | 平台侧配置 |
-| `examples/screen_probe.rs` | 900 | **只读探针 CLI**，标定/排查全靠它（命令表见 `REFERENCE.md` §1） |
+| `examples/screen_probe.rs` | 953 | **只读探针 CLI**，标定/排查全靠它（命令表见 `REFERENCE.md` §1）。★ **`findicon` 是"模板分数为什么低"最快的判据**：只读、不跑任务、几秒出结果（T28 就是靠它定的案） |
 
 ### 3.4 `crates/platform-mock` —— 演练替身
 

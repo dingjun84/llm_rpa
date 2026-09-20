@@ -55,7 +55,7 @@ export function TaskHistory({ tasks, activeId, onSelect }: Props) {
               {task.failure && (
                 <div className="history-failure">
                   <code>{task.failure.code}</code>
-                  <span>{task.failure.reason}</span>
+                  <span className="failure-detail">{task.failure.reason}</span>
                 </div>
               )}
               {task.evidence_artifacts.length > 0 && (

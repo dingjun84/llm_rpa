@@ -432,7 +432,7 @@ export function App() {
                   <section className="panel panel-danger">
                     <h2>停止原因</h2>
                     <p className="failure-code">{activeTask.failure.code}</p>
-                    <p>{activeTask.failure.reason}</p>
+                    <p className="failure-detail">{activeTask.failure.reason}</p>
                   </section>
                 )}
 
