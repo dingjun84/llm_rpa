@@ -686,6 +686,46 @@ struct Run<'a> {
     failure: Option<Failure>,
 }
 
+/// 把 OCR 返回的文字框从**截图物理像素坐标**换算成**区域逻辑坐标**。
+///
+/// Retina / 高 DPI 屏上 `capture` 返回的截图是物理像素（2x），但传入的
+/// `region` 是逻辑坐标（点）。OCR 在物理像素图上识别，bounds 自然是物理像素。
+/// 不换算就直接 `to_screen`（加逻辑坐标的 region origin），点击位置会偏移一倍。
+///
+/// `navigate_to_view` 里图标定位也做了同样的事（`frame.width / strip.width`），
+/// 但那是每个调用点各算一遍。这里放在 `capture_and_recognize` 的出口统一做，
+/// 让所有 OCR 调用方拿到的都是逻辑坐标。
+fn scale_boxes_to_logical(
+    shot: Screenshot,
+    boxes: Vec<TextBox>,
+    region: Rect,
+) -> (Screenshot, Vec<TextBox>) {
+    if region.width <= 0 || region.height <= 0 {
+        return (shot, boxes);
+    }
+    let scale_x = shot.width as f32 / region.width as f32;
+    let scale_y = shot.height as f32 / region.height as f32;
+    // 缩放接近 1（非 Retina 屏或截图本身就是逻辑尺寸）时直接返回，
+    // 避免引入浮点误差。
+    if (scale_x - 1.0).abs() < 0.01 && (scale_y - 1.0).abs() < 0.01 {
+        return (shot, boxes);
+    }
+    let scaled: Vec<TextBox> = boxes
+        .into_iter()
+        .map(|b| TextBox {
+            text: b.text,
+            confidence: b.confidence,
+            bounds: Rect {
+                x: (b.bounds.x as f32 / scale_x).round() as i32,
+                y: (b.bounds.y as f32 / scale_y).round() as i32,
+                width: (b.bounds.width as f32 / scale_x).round() as i32,
+                height: (b.bounds.height as f32 / scale_y).round() as i32,
+            },
+        })
+        .collect();
+    (shot, scaled)
+}
+
 impl<'a> Run<'a> {
     fn new(
         runner: &'a WorkflowRunner,
@@ -1031,9 +1071,19 @@ impl<'a> Run<'a> {
             let (boxes, raw) = self.runner.ports.ocr.recognize_with_raw(&shot)?;
             Ok((shot, boxes, raw))
         })?;
-        self.last_frame = Some((value.0.clone(), value.1.clone()));
-        self.report(step, region, &value.0, &value.1, Some(&value.2));
-        Ok((value.0, value.1))
+        // ★ Retina / 高 DPI 屏上 `capture` 返回的截图是**物理像素**（2x），
+        // 但 `region` 是**逻辑坐标**（点）。OCR 引擎在物理像素图上识别，
+        // 返回的 bounds 自然是物理像素坐标——直接拿去 `to_screen`（加逻辑坐标
+        // 的 region origin）会偏移一倍，表现为「下拉里那行文字点不准」。
+        //
+        // 这里在返回前把 bounds 统一换算成逻辑坐标：scale = frame / region。
+        // 之后所有调用方（下拉点击、资料页点击、联系人列表点击）都不用再关心
+        // 物理/逻辑差异——与 `navigate_to_view` 里图标定位的校正同思路，但
+        // 放在源头，避免每个调用点各写一遍。
+        let (shot, boxes) = scale_boxes_to_logical(value.0, value.1, region);
+        self.last_frame = Some((shot.clone(), boxes.clone()));
+        self.report(step, region, &shot, &boxes, Some(&value.2));
+        Ok((shot, boxes))
     }
 
     /// 卡死守卫：系统必须认为客户端窗口**正在响应**。
