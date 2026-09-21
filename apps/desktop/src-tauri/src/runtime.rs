@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use automation_core::{
-    AuditSink, ContainsNameMatcher, HumanConfirmation, IconTemplate, LocalOcr, RelativePoint,
-    RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask, StrictContactMatcher, Workflow,
-    WorkflowRunner, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
+    AuditSink, CalibratedWindow, ContainsNameMatcher, HumanConfirmation, IconTemplate, LocalOcr,
+    RelativePoint, RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask,
+    StrictContactMatcher, Workflow, WorkflowRunner, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
     DEFAULT_MIN_CONFIDENCE, DEFAULT_NAV_ICON_MIN_SCORE, DEFAULT_NAV_STRIP,
     DEFAULT_PROFILE_CHAT_ENTRY_TEXT, DEFAULT_PROFILE_SCROLL_ANCHOR, DEFAULT_REGIONS,
     DEFAULT_SCROLL_ANCHOR, DEFAULT_SEARCH_CONTACT_GROUP_LABEL,
@@ -460,6 +460,17 @@ impl RuntimeConfig {
             // 这里读的是**配置里的默认模式**。真正开跑时 `build_runner` 会用
             // 请求带来的模式重算一遍——判断只有 `RuntimeMode::calibrated_window` 一处。
             calibrated_window: self.mode.calibrated_window(self.calibrated_window),
+            // 备选标定：按其他缩放保存的窗口几何。`ensure_calibrated_size` 在
+            // 装配期与执行期缩放不一致时自动从中重选，而不是直接转人工。
+            calibration_alts: self
+                .calibrations
+                .iter()
+                .map(|snap| CalibratedWindow {
+                    width: snap.window.width,
+                    height: snap.window.height,
+                    scale_factor: snap.window.scale_factor,
+                })
+                .collect(),
             max_search_sweeps: self.max_search_sweeps.clamp(1, 20),
             liveness_check: self.liveness_check,
             // 刻意**不设上限**：这是"最多等多久"的上限值，操作者愿意等多久是他的选择。
@@ -924,7 +935,15 @@ pub fn build_runner(
             .platform
             .measure_target_window()
             .map_err(|err| format!("读取目标窗口所在显示器缩放失败：{err}"))?;
+        eprintln!(
+            "[build_runner] measure_target_window: scale={:.2}, window={}x{}",
+            metrics.scale_factor, _rect.width, _rect.height
+        );
         let snap = config.pick_calibration(metrics.scale_factor)?.clone();
+        eprintln!(
+            "[build_runner] picked calibration: scale={:.2}, window={}x{}",
+            snap.scale_factor, snap.window.width, snap.window.height
+        );
         config.apply_snapshot(&snap);
     }
 

@@ -347,6 +347,17 @@ pub struct RunnerConfig {
     /// 调不动（客户端有最小尺寸限制）才转人工，绝不按错的尺寸去点。
     /// 见 [`Run::ensure_calibrated_size`]。
     pub calibrated_window: Option<CalibratedWindow>,
+    /// 按其他显示器缩放保存的备选标定窗口。
+    ///
+    /// `build_runner` 在命令线程上量缩放、挑标定；`enter_client` 在任务线程上
+    /// 再量一次。同一段 macOS NSScreen API 在不同线程上偶尔返回不同值，
+    /// 导致装配期挑了 scale=1.0 的标定、执行期量到 scale=2.0——直接报错。
+    ///
+    /// 这份备选列表让 [`Run::ensure_calibrated_size`] 在缩放不匹配时**自动重选**
+    /// 一份匹配当前 `screen_metrics` 的标定，而不是直接转人工。
+    /// 列表里只放 `CalibratedWindow`（窗口几何 + 缩放），区域比例在所有缩放下
+    /// 相同（同一套 `RelativeRegion`），所以不需要随重选更新区域。
+    pub calibration_alts: Vec<CalibratedWindow>,
     /// 联系人列表最多**完整**扫描几轮（每轮 = 从列表顶部一路向下扫到底）。
     ///
     /// 为什么需要多轮：列表按"最近有消息"排序，扫描过程中到达的新消息会把目标
@@ -487,6 +498,7 @@ impl Default for RunnerConfig {
             scroll_notches_per_step: 3,
             scroll_anchor: DEFAULT_SCROLL_ANCHOR,
             calibrated_window: None,
+            calibration_alts: Vec::new(),
             // 两轮：一轮从当前位置扫到底，一轮回顶重扫。第二轮专门兜
             // "扫描期间新消息把目标顶到列表最上面"这种情况。
             max_search_sweeps: 2,
@@ -1087,7 +1099,7 @@ impl<'a> Run<'a> {
         window: Rect,
         metrics: ScreenMetrics,
     ) -> Result<Rect, AutomationError> {
-        let Some(expected) = self.cfg().calibrated_window else {
+        let Some(mut expected) = self.cfg().calibrated_window else {
             return Ok(window);
         };
         if Self::size_matches(window, metrics, &expected) {
@@ -1097,13 +1109,29 @@ impl<'a> Run<'a> {
         let scale_ok =
             (metrics.scale_factor - expected.scale_factor).abs() <= SCALE_FACTOR_TOLERANCE;
         if !scale_ok {
-            return Err(AutomationError::NeedsHumanReview(format!(
-                "显示器缩放与标定记录不一致：记录 {:.2}，当前 {:.2}。\
-                 缩放不同意味着同一物理尺寸下的界面布局本来就不同，\
-                 调整窗口尺寸解决不了——请把窗口移回标定时那块显示器，\
-                 或重新点「记录窗口尺寸」并保存配置。",
-                expected.scale_factor, metrics.scale_factor
-            )));
+            // 装配期（命令线程）与执行期（任务线程）量到的缩放偶尔不同——
+            // 同一段 macOS NSScreen API 在不同线程上可能返回不同的值。
+            // 从备选标定里挑一份匹配当前 `screen_metrics` 的，自动切换。
+            if let Some(&alt) = self
+                .cfg()
+                .calibration_alts
+                .iter()
+                .find(|alt| (alt.scale_factor - metrics.scale_factor).abs() <= SCALE_FACTOR_TOLERANCE)
+            {
+                self.evidence.push(format!(
+                    "缩放重选 : 装配期 {:.2} → 执行期 {:.2}，已自动切换到匹配的标定 {}×{}",
+                    expected.scale_factor, metrics.scale_factor, alt.width, alt.height
+                ));
+                expected = alt;
+            } else {
+                return Err(AutomationError::NeedsHumanReview(format!(
+                    "显示器缩放与标定记录不一致：记录 {:.2}，当前 {:.2}。\
+                     缩放不同意味着同一物理尺寸下的界面布局本来就不同，\
+                     调整窗口尺寸解决不了——请把窗口移回标定时那块显示器，\
+                     或重新点「记录窗口尺寸」并保存配置。",
+                    expected.scale_factor, metrics.scale_factor
+                )));
+            }
         }
 
         // 尺寸不符、缩放一致 ⇒ 把窗口调回标定尺寸。成不成看**量出来的**结果。
@@ -1176,6 +1204,10 @@ impl<'a> Run<'a> {
             ));
         }
         let metrics = self.runner.ports.platform.screen_metrics()?;
+        eprintln!(
+            "[enter_client] screen_metrics: scale={:.2}, window={}x{}",
+            metrics.scale_factor, window.width, window.height
+        );
         // 先校验尺寸、再把它当成本次运行的基准：基准错了，后面每一次换算都错。
         // 尺寸不符时这里会**先尝试自动调回去**，调成了就用调完的尺寸当基准。
         let original = window;
