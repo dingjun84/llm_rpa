@@ -21,7 +21,9 @@ pub mod icon_library;
 pub mod legacy_data;
 pub mod runtime;
 pub mod startup_log;
+pub mod task_diagnostics;
 pub mod task_log;
+pub mod task_replay;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,13 +36,15 @@ use automation_core::{
 use serde::{Deserialize, Serialize};
 use storage::{EvidenceStore, RedactedImage, SqliteAuditStore, SqliteSendLedger};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use tauri_plugin_opener::OpenerExt as _;
 use uuid::Uuid;
 use vision::RedactionPlan;
 
 use crate::confirmation::UiConfirmation;
 use crate::icon_library::IconEntry;
 use crate::runtime::{ModeNotices, RunChoice, RuntimeConfig, WindowGeometry};
-use crate::task_log::{append_task_log, write_start_header};
+use crate::task_diagnostics::{overview_title, TaskDiagnostics};
+use crate::task_log::{append_task_log, task_dir, task_log_path, write_start_header};
 
 pub const EVENT_TASK_UPDATED: &str = "task://updated";
 const EVIDENCE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -103,6 +107,10 @@ pub struct TaskView {
     pub history: Vec<HistoryEntry>,
     pub awaiting_confirmation: bool,
     pub evidence_artifacts: Vec<EvidenceView>,
+    /// 本次任务的过程日志路径（`data/task-xxxxxxxx.log`）。
+    pub log_path: Option<String>,
+    /// 是否从磁盘日志恢复出来的（进程重启后内存任务表是空的）。
+    pub from_log: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +198,7 @@ pub struct TaskRecord {
     pub evidence: Vec<String>,
     pub history: Vec<StateChange>,
     pub evidence_artifacts: Vec<EvidenceView>,
+    pub log_path: Option<std::path::PathBuf>,
 }
 
 impl TaskRecord {
@@ -217,6 +226,8 @@ impl TaskRecord {
                 .collect(),
             awaiting_confirmation,
             evidence_artifacts: self.evidence_artifacts.clone(),
+            log_path: self.log_path.as_ref().map(|p| p.display().to_string()),
+            from_log: false,
         }
     }
 }
@@ -317,6 +328,25 @@ pub struct AppState<R: Runtime> {
     migration_note: Option<String>,
 }
 
+/// 把数据目录放进 asset 协议的放行范围，让界面能读到过程诊断图。
+///
+/// ## 为什么放在这里、而不是写进 `tauri.conf.json`
+///
+/// asset 协议只肯读**被显式放行**的目录，而数据目录是「程序运行当前路径下的
+/// `data/`」（见 [`data_dir`]）——启动前根本不知道它在哪，
+/// 静态 scope（`tauri.conf.json` 的 `assetProtocol.scope`）里写不出来。
+/// 所以那边只开开关、范围留空，路径在运行时按真实值放行。
+///
+/// ## 为什么失败只记一条、不往上抛
+///
+/// 放开的是**看图的权限**，属于观测手段。它没成功只是"过程重放里显示不了图"，
+/// 而启动失败是整个程序都用不了——两者不对等（同 [`migrate_legacy_data`] 那条理由）。
+fn allow_process_images<R: Runtime>(app: &AppHandle<R>, data_dir: &std::path::Path) {
+    if let Err(err) = app.asset_protocol_scope().allow_directory(data_dir, true) {
+        startup_log::note(&format!("过程重放的图片目录没能放行：{err}"));
+    }
+}
+
 /// 搬一次旧版留在 AppData 里的数据，并把它变成**一句给界面看的话**。
 ///
 /// 返回 `None` 表示没什么可搬的（旧位置不存在、或者已经搬过）——
@@ -349,6 +379,7 @@ impl<R: Runtime> AppState<R> {
         // 图标库的默认位置也从那儿取。
         let data_dir = data_dir::ensure()?;
         let migration_note = migrate_legacy_data(app, &data_dir);
+        allow_process_images(app, &data_dir);
 
         let db_path = data_dir.join("audit.sqlite");
         let audit = SqliteAuditStore::open(&db_path).map_err(|err| err.to_string())?;
@@ -427,10 +458,11 @@ impl<R: Runtime> AppState<R> {
         evidence: Arc<EvidenceStore>,
     ) -> Self {
         let config_path = data_dir.join("config.json");
-        let config = std::fs::read_to_string(&config_path)
+        let mut config = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|text| serde_json::from_str::<RuntimeConfig>(&text).ok())
             .unwrap_or_default();
+        config.ensure_calibrations_migrated();
 
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -556,6 +588,20 @@ fn start_task<R: Runtime>(
     // 三条日志里记的全是 `SearchContact`）。现在判据只有一个来源：请求。
     let choice = request.run_choice;
 
+    // 这次任务的过程诊断：每一步的截图 + 识别到的文字，落在任务目录里。
+    // 它**不打码**，与上面那条脱敏证据是两回事（见 `task_diagnostics`）。
+    let diagnostics = Arc::new(TaskDiagnostics::new(
+        task_dir(&state.data_dir, task_id),
+        overview_title(
+            task_id,
+            &if task.external_contact_name.trim().is_empty() {
+                choice.nav_target.clone()
+            } else {
+                task.external_contact_name.clone()
+            },
+        ),
+    ));
+
     let runner = runtime::build_runner(
         &config,
         &choice,
@@ -565,7 +611,27 @@ fn start_task<R: Runtime>(
         state.ledger.clone(),
         state.confirmation.clone(),
     )?
-    .with_evidence_recorder(Arc::new(RedactingRecorder { store: state.evidence.clone() }));
+    .with_evidence_recorder(Arc::new(RedactingRecorder { store: state.evidence.clone() }))
+    .with_diagnostic_recorder(diagnostics.clone());
+
+    // 每次任务单独一个目录：`data/tasks/<任务ID>/task.log`。
+    // 开头先落一份**配置快照**——排查时第一个要问的就是"当时到底按哪份配置跑的"，
+    // 而配置随时可能被改，事后再读 config.json 未必是当时那份。
+    let log_path = task_log_path(&state.data_dir, task_id);
+    {
+        let config = state
+            .config
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        write_start_header(&log_path, task_id, &task, &choice, &config, &state.icons_dir());
+        if !log_path.is_file() {
+            return Err(format!(
+                "任务日志没能写到 {} —— 请确认数据目录可写（界面「运行参数」底部有数据目录路径）。",
+                log_path.display()
+            ));
+        }
+    }
 
     {
         let mut tasks = state.tasks.lock().map_err(|_| "任务表锁已中毒".to_string())?;
@@ -579,6 +645,7 @@ fn start_task<R: Runtime>(
                 evidence: Vec::new(),
                 history: Vec::new(),
                 evidence_artifacts: Vec::new(),
+                log_path: Some(log_path.clone()),
             },
         );
     }
@@ -594,22 +661,6 @@ fn start_task<R: Runtime>(
         .lock()
         .map_err(|_| "取消表锁已中毒".to_string())?
         .insert(task_id, cancel.clone());
-
-    // 每次任务单独一个日志文件，文件名用 ID 前 8 位。
-    // 开头先落一份**配置快照**——排查时第一个要问的就是"当时到底按哪份配置跑的"，
-    // 而配置随时可能被改，事后再读 config.json 未必是当时那份。
-    let log_path = state
-        .data_dir
-        .join(format!("task-{}.log", &task_id.to_string()[..8]));
-    {
-        let config = state
-            .config
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        write_start_header(&log_path, task_id, &task, &choice, &config, &state.icons_dir());
-    }
-
     let progress = TaskProgress {
         app: app.clone(),
         tasks: state.tasks.clone(),
@@ -637,6 +688,9 @@ fn start_task<R: Runtime>(
             }
         }
         append_task_log(&log_path, &format!("日志文件 : {}", log_path.display()));
+        // 单步图已经在每一步就落盘了（崩了也留得住），这里只是补上那张拼图，
+        // 并把这批诊断材料的去处记进日志。
+        diagnostics.finish();
 
         let artifacts = evidence
             .list_for(task_id)
@@ -677,6 +731,81 @@ fn start_task<R: Runtime>(
     Ok(task_id.to_string())
 }
 
+
+#[tauri::command]
+fn read_task_log<R: Runtime>(
+    state: State<'_, AppState<R>>,
+    _app: AppHandle<R>,
+    task_id: String,
+) -> Result<String, String> {
+    let trimmed = task_id.trim();
+    if trimmed.is_empty() {
+        return Err("任务 ID 为空".into());
+    }
+    // 内存里有完整路径就用它；否则按约定拼路径。
+    // 新布局是 `data/tasks/<任务ID>/task.log`，旧布局是 `data/task-<前8位>.log`
+    // ——两个都要试，否则升级前留下的历史任务在界面上点开会是空的。
+    let path = {
+        let tasks = state.tasks.lock().map_err(|_| "任务表锁已中毒".to_string())?;
+        if let Ok(uuid) = trimmed.parse::<Uuid>() {
+            if let Some(record) = tasks.get(&uuid) {
+                if let Some(p) = &record.log_path {
+                    return task_log::read_task_log(p);
+                }
+            }
+        }
+        let current = state.data_dir.join(task_log::TASKS_DIR).join(trimmed).join(task_log::LOG_FILE_NAME);
+        if current.is_file() {
+            current
+        } else {
+            let short = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
+            state.data_dir.join(format!("task-{short}.log"))
+        }
+    };
+    task_log::read_task_log(&path)
+}
+
+/// 读出一次任务的过程事件流（界面「过程重放」用）。
+///
+/// 与 [`read_task_log`] 的分工：那个给的是**给人读**的叙述，
+/// 这个给的是**每一步看到什么、怎么判的**（见 [`task_replay`]）。
+#[tauri::command]
+fn read_task_events<R: Runtime>(
+    state: State<'_, AppState<R>>,
+    _app: AppHandle<R>,
+    task_id: String,
+) -> Result<task_replay::TaskReplay, String> {
+    Ok(task_replay::read_task_replay(&state.data_dir, &task_id))
+}
+
+/// 在系统文件管理器里打开这次任务的过程诊断目录（`data/tasks/<任务ID>/`）。
+///
+/// 排查时总要看 `raw/` 那几张未标注的输入图、或者把 `events.jsonl` 拖给
+/// `tools/replay` 重跑，而任务目录藏在数据目录里、ID 还是一串 UUID——
+/// 让人自己拼路径是白费一道工。
+///
+/// 旧布局的任务没有目录，这时**明确说一句**，而不是打开一个空目录
+/// （打开 `data/` 会让人以为材料就在那儿）。
+///
+/// 走 Rust 侧的 `tauri-plugin-opener`（不是前端 JS 那套）：插件命令从 WebView
+/// 调要配 capability 放行，而这里只需要打开一个后端自己算出来的路径。
+#[tauri::command]
+fn open_task_dir<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState<R>>,
+    task_id: String,
+) -> Result<String, String> {
+    let Some(dir) = task_replay::task_dir_for(&state.data_dir, &task_id) else {
+        return Err(format!(
+            "这次任务没有过程诊断目录（「{task_id}」来自旧版本：那时一次任务只留一个日志文件）"
+        ));
+    };
+    if let Err(err) = app.opener().reveal_item_in_dir(&dir) {
+        return Err(format!("没能打开 {}：{err}", dir.display()));
+    }
+    Ok(dir.display().to_string())
+}
+
 #[tauri::command]
 fn list_tasks<R: Runtime>(
     state: State<'_, AppState<R>>,
@@ -684,11 +813,32 @@ fn list_tasks<R: Runtime>(
 ) -> Result<Vec<TaskView>, String> {
     let order = state.order.lock().map_err(|_| "任务顺序锁已中毒".to_string())?.clone();
     let tasks = state.tasks.lock().map_err(|_| "任务表锁已中毒".to_string())?;
-    Ok(order
+    let mut views: Vec<TaskView> = order
         .iter()
         .filter_map(|id| tasks.get(id))
         .map(|record| record.to_view(state.confirmation.is_pending(record.task.id)))
-        .collect())
+        .collect();
+    let live_ids: std::collections::HashSet<String> =
+        views.iter().map(|v| v.id.clone()).collect();
+    // 进程一重启内存任务表就空了；把 data/task-*.log 解析回来，历史才留得住。
+    for path in task_log::list_task_log_paths(&state.data_dir) {
+        let Some(view) = task_log::summary_from_log(&path) else {
+            continue;
+        };
+        if live_ids.contains(&view.id) {
+            continue;
+        }
+        // 短 ID（文件名那 8 位）也可能对上完整 UUID 前缀
+        if live_ids.iter().any(|id| {
+            id.starts_with(&view.id)
+                || (id.len() >= 8 && view.id.starts_with(&id[..8]))
+                || (view.id.len() >= 8 && id.starts_with(&view.id[..8]))
+        }) {
+            continue;
+        }
+        views.push(view);
+    }
+    Ok(views)
 }
 
 #[tauri::command]
@@ -769,18 +919,33 @@ fn set_runtime_config<R: Runtime>(
 /// [`set_runtime_config`] 与 [`prune_stale_marks`] 都走这里。抽出来是为了让
 /// 「**落到盘上的配置一定过了这一关**」只有一处实现——两条写入路径各写一份的话，
 /// 迟早有一条会漏掉校验，而漏掉的表现是配置里安静地躺着一个没人读的键。
-fn persist_config<R: Runtime>(state: &AppState<R>, config: RuntimeConfig) -> Result<(), String> {
+fn persist_config<R: Runtime>(state: &AppState<R>, mut config: RuntimeConfig) -> Result<(), String> {
+    // 旧配置只有顶层字段时先迁进 `calibrations`；再把当前工作副本 upsert 进去，
+    // 这样「界面标定」页改完点保存，对应缩放那份一定落盘。
+    config.ensure_calibrations_migrated();
+    config.upsert_working_snapshot();
+
     // 兜底校验。界面在拖完框、以及保存前会调 `validate_area_mark` 先问一遍，
     // 但那条路挡不住**手改配置文件**——拼错的 key 会安静地躺在配置里，
     // `plan()` 读不到、任务也读不到，**不报任何错**，
     // 只表现为"框明明拖了却不起作用"。所以落盘前再过一遍。
     // 判据取自 `calibration`（键问 `find_item`、矩形问 `validate_rect`），
-    // 这里不另写一份。
-    for (key, mark) in &config.area_marks {
-        if calibration::find_item(key).is_none() {
+    // 这里不另写一份。工作副本与每一份快照都要验。
+    let mut marks_to_check: Vec<(String, [f32; 4])> = config
+        .area_marks
+        .iter()
+        .map(|(k, m)| (k.clone(), m.rect))
+        .collect();
+    for snap in &config.calibrations {
+        for (k, m) in &snap.area_marks {
+            marks_to_check.push((k.clone(), m.rect));
+        }
+    }
+    for (key, rect) in marks_to_check {
+        if calibration::find_item(&key).is_none() {
             return Err(format!("界面标定里有未知的项 `{key}`——它不会被任何流程读到"));
         }
-        calibration::validate_rect(mark.rect)
+        calibration::validate_rect(rect)
             .map_err(|err| format!("界面标定项 `{key}` 的坐标不合法：{err}"))?;
     }
 
@@ -861,6 +1026,77 @@ fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_macos::M
         window_matcher: platform_macos::WindowMatcher::ClassName(window_class.to_string()),
         ..MacOSDesktopConfig::default()
     })
+}
+
+
+/// 窗口内相对矩形（与 `window` 同单位）→ 截图像素。
+///
+/// macOS Retina：`kCGWindowBounds` 多为逻辑点，截屏常为物理像素，`shot` 可能是窗口的 2 倍。
+/// Windows 上通常 1:1。
+#[cfg(any(windows, target_os = "macos"))]
+fn window_rect_to_shot(rect: Rect, window: Rect, shot_w: u32, shot_h: u32) -> Rect {
+    let sx = if window.width > 0 {
+        shot_w as f32 / window.width as f32
+    } else {
+        1.0
+    };
+    let sy = if window.height > 0 {
+        shot_h as f32 / window.height as f32
+    } else {
+        1.0
+    };
+    Rect {
+        x: (rect.x as f32 * sx).round() as i32,
+        y: (rect.y as f32 * sy).round() as i32,
+        width: (rect.width as f32 * sx).round() as i32,
+        height: (rect.height as f32 * sy).round() as i32,
+    }
+}
+
+/// 截图像素 → 窗口内相对（逻辑点），用于换算到屏幕点击。
+#[cfg(any(windows, target_os = "macos"))]
+fn shot_point_to_screen(
+    x: i32,
+    y: i32,
+    window: Rect,
+    shot_w: u32,
+    shot_h: u32,
+) -> Point {
+    let sx = if shot_w > 0 {
+        window.width as f32 / shot_w as f32
+    } else {
+        1.0
+    };
+    let sy = if shot_h > 0 {
+        window.height as f32 / shot_h as f32
+    } else {
+        1.0
+    };
+    Point {
+        x: window.x + (x as f32 * sx).round() as i32,
+        y: window.y + (y as f32 * sy).round() as i32,
+    }
+}
+
+/// 截图像素 → 预览图像素（`preview_data_url` 可能把宽压到 [`PREVIEW_MAX_WIDTH`]）。
+#[cfg(any(windows, target_os = "macos"))]
+fn shot_rect_to_preview(rect: Rect, shot_w: u32, shot_h: u32, preview_w: u32, preview_h: u32) -> Rect {
+    let sx = if shot_w > 0 {
+        preview_w as f32 / shot_w as f32
+    } else {
+        1.0
+    };
+    let sy = if shot_h > 0 {
+        preview_h as f32 / shot_h as f32
+    } else {
+        1.0
+    };
+    Rect {
+        x: (rect.x as f32 * sx).round() as i32,
+        y: (rect.y as f32 * sy).round() as i32,
+        width: (rect.width as f32 * sx).round() as i32,
+        height: (rect.height as f32 * sy).round() as i32,
+    }
 }
 
 /// 把一帧窗口画面压成界面能直接塞进 `<img src>` 的 `data:` URL，并返回它的像素尺寸。
@@ -1190,8 +1426,19 @@ pub struct NavIconProbe {
     pub strip: Rect,
     /// 最佳命中。`None` 表示所有模板都放不进搜索区。
     pub hit: Option<NavIconHit>,
+    /// 每张参与匹配的模板各自的最高分（按分数降序）。
+    pub scores: Vec<NavIconScore>,
     /// 面向操作者的一句话结论（含分数与是否过阈值）。
     pub notice: String,
+}
+
+/// 一张模板在当前画面上的最高分。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NavIconScore {
+    pub template: String,
+    pub score: f32,
+    /// 是否达到了最低分数。
+    pub accepted: bool,
 }
 
 /// 一次图标命中的位置与分数（坐标均为**窗口内相对坐标**）。
@@ -1258,8 +1505,11 @@ fn probe_nav_icon<R: Runtime>(
 
     #[cfg(any(windows, target_os = "macos"))]
     {
+        use automation_core::DesktopPlatform;
         let desktop = desktop_for(&class, wecom_exe.as_deref());
 
+        // 先置前再截：避免 focus 导致窗口微移后，仍按旧矩形算点击坐标。
+        let _ = desktop.focus_wecom();
         let (window, shot) = desktop
             .preview()
             .map_err(|err| format!("未能截取目标窗口（类名「{class}」）：{err}"))?;
@@ -1269,70 +1519,180 @@ fn probe_nav_icon<R: Runtime>(
         let strip_screen = region
             .resolve_within(window)
             .map_err(|err| format!("导航图标搜索区越出了窗口：{err}"))?;
-        let strip_in_image = Rect {
+        let strip_in_window = Rect {
             x: strip_screen.x - window.x,
             y: strip_screen.y - window.y,
             width: strip_screen.width,
             height: strip_screen.height,
         };
+        let strip_in_image =
+            window_rect_to_shot(strip_in_window, window, shot.width, shot.height);
         let strip_shot =
             vision::crop(&shot, strip_in_image).map_err(|err| format!("裁出搜索区失败：{err}"))?;
 
         let mut best: Option<(f32, Rect, String)> = None;
+        let mut scores: Vec<NavIconScore> = Vec::with_capacity(templates.len());
         for template in &templates {
             // 这里用 `match_template` 而不是 `TemplateLocator::locate`：
             // 后者会把"低于阈值"变成一个错误，而这个按钮要的正是**分数**本身。
             match vision::match_template(&strip_shot, template) {
                 Ok(Some((bounds, score))) => {
+                    scores.push(NavIconScore {
+                        template: template.label.clone(),
+                        score,
+                        accepted: score >= min_score,
+                    });
                     if best.as_ref().map(|(current, _, _)| score > *current).unwrap_or(true) {
                         best = Some((score, bounds, template.label.clone()));
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    scores.push(NavIconScore {
+                        template: template.label.clone(),
+                        score: -1.0,
+                        accepted: false,
+                    });
+                }
                 Err(err) => return Err(format!("模板「{}」无法匹配：{err}", template.label)),
             }
         }
-
-        let hit = best.map(|(score, bounds, template)| NavIconHit {
-            // 换算到窗口内相对坐标，界面才能画在整窗预览图上。
-            x: strip_in_image.x + bounds.x,
-            y: strip_in_image.y + bounds.y,
-            width: bounds.width,
-            height: bounds.height,
-            score,
-            template,
-            accepted: score >= min_score,
+        scores.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let notice = match &hit {
-            Some(found) if found.accepted => format!(
-                "命中：模板「{}」分数 {:.3}（阈值 {:.3}），位置 窗口内 ({}, {}) {}x{}。",
-                found.template, found.score, min_score, found.x, found.y, found.width, found.height
-            ),
-            Some(found) => format!(
-                "分数不足：模板「{}」最高 {:.3}，低于阈值 {:.3}。\
-                 位置 窗口内 ({}, {}) 是它认为最像的地方——对着预览图看看那里是不是图标；\
-                 如果不是，说明模板截错了或者搜索区没盖住图标。",
-                found.template, found.score, min_score, found.x, found.y
-            ),
-            None => "所有模板都放不进搜索区：模板比搜索区还大，先把搜索区调宽或把模板截小一点。"
-                .to_string(),
+        let hit_in_shot = best.map(|(score, bounds, template)| {
+            (
+                score,
+                Rect {
+                    x: strip_in_image.x + bounds.x,
+                    y: strip_in_image.y + bounds.y,
+                    width: bounds.width,
+                    height: bounds.height,
+                },
+                template,
+            )
+        });
+
+        // 测试匹配也要把光标滑到命中中心（不点击），否则操作者只能看预览框、
+        // 看不到真实屏幕上的定位过程。「定位并点击」走 guarded_click，本身已含移动。
+        if let Some((_, bounds, _)) = &hit_in_shot {
+            let hit_tl = shot_point_to_screen(
+                bounds.x,
+                bounds.y,
+                window,
+                shot.width,
+                shot.height,
+            );
+            let hit_br = shot_point_to_screen(
+                bounds.x + bounds.width,
+                bounds.y + bounds.height,
+                window,
+                shot.width,
+                shot.height,
+            );
+            let target = Point {
+                x: (hit_tl.x + hit_br.x) / 2,
+                y: (hit_tl.y + hit_br.y) / 2,
+            };
+            #[cfg(target_os = "macos")]
+            {
+                use platform_macos::{macosapi, MacOSDesktopConfig};
+                let speed = MacOSDesktopConfig::default().pointer_speed_px_per_sec;
+                macosapi::move_cursor(target.x, target.y, speed).map_err(|err| {
+                    format!(
+                        "已算出命中位置屏幕 ({}, {})，但鼠标没能滑过去：{err}",
+                        target.x, target.y
+                    )
+                })?;
+            }
+            #[cfg(windows)]
+            {
+                use platform_windows::{winapi, WindowsDesktopConfig};
+                let speed = WindowsDesktopConfig::default().pointer_speed_px_per_sec;
+                winapi::move_cursor(target.x, target.y, speed).map_err(|err| {
+                    format!(
+                        "已算出命中位置屏幕 ({}, {})，但鼠标没能滑过去：{err}",
+                        target.x, target.y
+                    )
+                })?;
+            }
+        }
+
+        let coord_diag = {
+            let sx = if window.width > 0 {
+                shot.width as f32 / window.width as f32
+            } else {
+                1.0
+            };
+            let sy = if window.height > 0 {
+                shot.height as f32 / window.height as f32
+            } else {
+                1.0
+            };
+            format!(
+                "坐标诊断：窗口 ({},{}) {}x{}；截图 {}x{}；缩放 {:.2}x{:.2}",
+                window.x, window.y, window.width, window.height, shot.width, shot.height, sx, sy
+            )
         };
 
+        let score_lines: String = scores
+            .iter()
+            .map(|row| {
+                if row.score < 0.0 {
+                    format!("「{}」放不进搜索区", row.template)
+                } else {
+                    format!(
+                        "「{}」{:.3}{}",
+                        row.template,
+                        row.score,
+                        if row.accepted { " ✓" } else { "" }
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("；");
+
+        let notice = match &hit_in_shot {
+            Some((score, bounds, template)) if *score >= min_score => format!(
+                "命中：模板「{template}」分数 {score:.3}（阈值 {min_score:.3}），位置 截图像素 ({}, {}) {}x{}。已把光标滑到命中中心（未点击）。\n各模板分数：{score_lines}",
+                bounds.x, bounds.y, bounds.width, bounds.height,
+            ),
+            Some((score, bounds, template)) => format!(
+                "分数不足：模板「{template}」最高 {score:.3}，低于阈值 {min_score:.3}。                 位置 截图像素 ({}, {}) 是它认为最像的地方——对着预览图看看那里是不是图标；                 如果不是，说明模板截错了或者搜索区没盖住图标。\n各模板分数：{score_lines}",
+                bounds.x, bounds.y,
+            ),
+            None => format!(
+                "所有模板都放不进搜索区：模板比搜索区还大，先把搜索区调宽或把模板截小一点。\n各模板：{score_lines}"
+            ),
+        };
+
+        let notice = format!("{notice}\n{coord_diag}");
+
         let (image, width, height) = preview_data_url(&shot)?;
+        let strip = shot_rect_to_preview(strip_in_image, shot.width, shot.height, width, height);
+        let hit = hit_in_shot.map(|(score, bounds, template)| {
+            let preview = shot_rect_to_preview(bounds, shot.width, shot.height, width, height);
+            NavIconHit {
+                x: preview.x,
+                y: preview.y,
+                width: preview.width,
+                height: preview.height,
+                score,
+                template,
+                accepted: score >= min_score,
+            }
+        });
 
         Ok(NavIconProbe {
             window,
             width,
             height,
             image,
-            strip: Rect {
-                x: strip_in_image.x,
-                y: strip_in_image.y,
-                width: strip_in_image.width,
-                height: strip_in_image.height,
-            },
+            strip,
             hit,
+            scores,
             notice,
         })
     }
@@ -1620,7 +1980,7 @@ fn click_icon<R: Runtime>(
         let desktop = desktop_for(&class, wecom_exe.as_deref());
 
         // 先接管窗口：点击必须落在客户端上，而 `guarded_click` 还会核对前台窗口。
-        let window = desktop.focus_wecom().map_err(|err| {
+        desktop.focus_wecom().map_err(|err| {
             format!(
                 "把目标窗口带到前台失败：{err}。\
                  先手动点一下客户端窗口（有时前台锁定会挡掉程序发起的置前），再点这个按钮。"
@@ -1643,19 +2003,22 @@ fn click_icon<R: Runtime>(
             }
         }
 
-        let (_win, shot) = desktop
+        // 必须用与截图同一帧的窗口矩形做守卫；focus 时的旧矩形稍变就会在移动前被拦住。
+        let (window, shot) = desktop
             .preview()
             .map_err(|err| format!("未能截取目标窗口（类名「{class}」）：{err}"))?;
 
         let strip_screen = strip_region
             .resolve_within(window)
             .map_err(|err| format!("导航图标搜索区越出了窗口：{err}"))?;
-        let strip_in_image = Rect {
+        let strip_in_window = Rect {
             x: strip_screen.x - window.x,
             y: strip_screen.y - window.y,
             width: strip_screen.width,
             height: strip_screen.height,
         };
+        let strip_in_image =
+            window_rect_to_shot(strip_in_window, window, shot.width, shot.height);
         let strip_shot =
             vision::crop(&shot, strip_in_image).map_err(|err| format!("裁出搜索区失败：{err}"))?;
 
@@ -1672,10 +2035,33 @@ fn click_icon<R: Runtime>(
             )
             .map_err(|err| format!("这一次没有执行任何点击——先得能确定图标在哪，才谈得上点它：{err}"))?;
 
-        let hit_screen = found.bounds.to_screen(Point {
-            x: strip_screen.x,
-            y: strip_screen.y,
-        });
+        // found.bounds 在截图像素里；先加回搜索区原点，再按 shot/window 比例换到屏幕点。
+        let hit_in_shot = Rect {
+            x: strip_in_image.x + found.bounds.x,
+            y: strip_in_image.y + found.bounds.y,
+            width: found.bounds.width,
+            height: found.bounds.height,
+        };
+        let hit_top_left = shot_point_to_screen(
+            hit_in_shot.x,
+            hit_in_shot.y,
+            window,
+            shot.width,
+            shot.height,
+        );
+        let hit_bottom_right = shot_point_to_screen(
+            hit_in_shot.x + hit_in_shot.width,
+            hit_in_shot.y + hit_in_shot.height,
+            window,
+            shot.width,
+            shot.height,
+        );
+        let hit_screen = Rect {
+            x: hit_top_left.x,
+            y: hit_top_left.y,
+            width: (hit_bottom_right.x - hit_top_left.x).max(1),
+            height: (hit_bottom_right.y - hit_top_left.y).max(1),
+        };
         let target = hit_screen.center();
 
         let panel_screen = panel_region
@@ -1712,11 +2098,14 @@ fn click_icon<R: Runtime>(
         }
         let changed = after != before;
 
+        let (image, width, height) = preview_data_url(&shot)?;
+        let strip = shot_rect_to_preview(strip_in_image, shot.width, shot.height, width, height);
+        let hit_preview = shot_rect_to_preview(hit_in_shot, shot.width, shot.height, width, height);
         let hit = NavIconHit {
-            x: strip_in_image.x + found.bounds.x,
-            y: strip_in_image.y + found.bounds.y,
-            width: found.bounds.width,
-            height: found.bounds.height,
+            x: hit_preview.x,
+            y: hit_preview.y,
+            width: hit_preview.width,
+            height: hit_preview.height,
             score: found.score,
             template: found.template_label.clone(),
             // 能走到这里就说明分数过了阈值——阈值不够时上面那行 locate 已经返回错误了。
@@ -1725,36 +2114,22 @@ fn click_icon<R: Runtime>(
 
         let notice = if changed {
             format!(
-                "已点击：模板「{}」分数 {:.3}，点击屏幕 ({}, {})。\
-                 点击后联系人候选区的画面变了——这一步确实生效了。",
+                "已点击：模板「{}」分数 {:.3}，点击屏幕 ({}, {})。                 点击后联系人候选区的画面变了——这一步确实生效了。",
                 hit.template, hit.score, target.x, target.y
             )
         } else {
             format!(
-                "已点击：模板「{}」分数 {:.3}，点击屏幕 ({}, {})。\
-                 但点击后联系人候选区的画面没有变化。两种可能：\
-                 ①界面本来就已经停在这个视图上（正常，上次点完就留在这儿了）；\
-                 ②这次点击没有生效（客户端卡住、图标被别的窗口挡住、\
-                 或者框到的那块位置根本不响应点击）。\
-                 想区分它们：先手动把界面切到别的视图，再点一次这个按钮——\
-                 这次要是变了，就说明模板和坐标都是好的。",
+                "已点击：模板「{}」分数 {:.3}，点击屏幕 ({}, {})。                 但点击后联系人候选区的画面没有变化。两种可能：                 ①界面本来就已经停在这个视图上（正常，上次点完就留在这儿了）；                 ②点偏了或客户端没反应（搜索区 / 模板 / 阈值要再核）。",
                 hit.template, hit.score, target.x, target.y
             )
         };
-
-        let (image, width, height) = preview_data_url(&shot)?;
 
         Ok(IconClickResult {
             window,
             width,
             height,
             image,
-            strip: Rect {
-                x: strip_in_image.x,
-                y: strip_in_image.y,
-                width: strip_in_image.width,
-                height: strip_in_image.height,
-            },
+            strip,
             hit,
             clicked: target,
             changed,
@@ -1785,6 +2160,9 @@ pub fn with_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R
     capture_hotkey::attach(builder).invoke_handler(tauri::generate_handler![
         start_task,
         list_tasks,
+        read_task_log,
+        read_task_events,
+        open_task_dir,
         get_task,
         confirm_task,
         cancel_task,

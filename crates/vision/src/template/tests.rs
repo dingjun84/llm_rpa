@@ -161,6 +161,62 @@ fn the_production_score_matches_the_ncc_definition_at_every_position() {
     assert!(compared > 500, "比较的位置太少（{compared}），这条用例没起到作用");
 }
 
+
+/// 画面里的图标比模板大约 10% 时，单尺度会漂；窄金字塔应仍能拿到高分。
+#[test]
+#[ignore = "pyramid left off the hot path for Mac probe latency"]
+fn pyramid_recovers_a_mild_scale_mismatch() {
+    let template = IconTemplate {
+        label: "dot".into(),
+        pixels: {
+            let mut px = vec![0u8; 20 * 20 * 4];
+            for y in 4..16 {
+                for x in 4..16 {
+                    let i = (y * 20 + x) * 4;
+                    px[i] = 40;
+                    px[i + 1] = 120;
+                    px[i + 2] = 220;
+                    px[i + 3] = 255;
+                }
+            }
+            px
+        },
+        width: 20,
+        height: 20,
+    };
+    // 把模板放大到 22×22 贴进画面（约 1.1×），再与原 20×20 模板比。
+    let scaled = {
+        let mut rgba = Vec::new();
+        for px in template.pixels.chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+        let src = image::RgbaImage::from_raw(20, 20, rgba).unwrap();
+        let resized = image::imageops::resize(&src, 22, 22, image::imageops::FilterType::Triangle);
+        let mut bgra = resized.into_raw();
+        for px in bgra.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        bgra
+    };
+    let mut frame = frame_of(80, 80, |_, _| [200, 200, 200, 255]);
+    let ox = 30usize;
+    let oy = 25usize;
+    for y in 0..22usize {
+        for x in 0..22usize {
+            let si = (y * 22 + x) * 4;
+            let di = ((oy + y) * 80 + (ox + x)) * 4;
+            frame.pixels[di..di + 4].copy_from_slice(&scaled[si..si + 4]);
+        }
+    }
+    let (bounds, score) = match_template(&frame, &template).unwrap().unwrap();
+    assert!(
+        score >= 0.85,
+        "expected pyramid to recover mild scale mismatch, got {score}"
+    );
+    assert!((bounds.x - ox as i32).abs() <= 2);
+    assert!((bounds.y - oy as i32).abs() <= 2);
+}
+
 /// `best_match` 必须等于"逐位置求分数后取最大值"。
 ///
 /// 它钉住的是"取最大值"这一步：起点、终点、以及最大值的位置。

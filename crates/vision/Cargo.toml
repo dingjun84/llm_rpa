@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 automation-core = { path = "../automation-core" }
+ab_glyph.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde.workspace = true
 serde_json.workspace = true

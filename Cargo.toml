@@ -12,6 +12,9 @@ members = [
   "apps/webview-probe",
   "tools/winocr",
   "tools/macosocr",
+  # 离线重放：拿 `data/tasks/<id>/events.jsonl` 里记下的那一帧重跑判据，
+  # 回答「它为什么这么判」（见 `docs/todo.md` T29）。
+  "tools/replay",
 ]
 resolver = "2"
 
@@ -26,6 +29,13 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# 过程诊断图要在 PNG 上写中文（步骤名 / 识别到的文字 / 置信度）。
+# `image` 只管像素，不带字形栅格化，所以单独引一个。为什么不是 `imageproc`：
+# 我们只需要"把一行字画上去"和"量一下这行字多宽"，那是个几万行的大包。
+ab_glyph = "0.2"
+# 任务日志的时间戳要**本地可读**（`2026-09-21 17:52:01.123`）。
+# 标准库只给 Unix 时间戳，取本地时区偏移在 std 里没有对应物。
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # 本机（MSVC 14.44 + Windows SDK 10.0.26100）反复出现**依赖 rlib 的调试信息损坏**：
 # 链接期报 LNK1103 / LNK1143 / LNK1223，报错点名的却是 `libsyn` / `libweb_atoms`

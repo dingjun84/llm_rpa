@@ -7,9 +7,12 @@
 //! - 识别结果必须带文字、边界框与置信度。
 
 pub mod evidence;
+pub mod layout;
 pub mod ocr;
 pub mod pixels;
+pub mod render;
 pub mod template;
+pub mod text;
 
 use std::time::Duration;
 
@@ -57,6 +60,12 @@ pub enum VisionError {
     OcrParse(String),
     #[error("文件或进程 IO 失败：{0}")]
     Io(#[from] std::io::Error),
+    /// 本机找不到能写中文的字体。
+    ///
+    /// 这**不是**"图渲染失败"的笼统错误：它单列出来，是因为处置办法完全不同——
+    /// 去装一个中文字体（或把候选路径补进 [`text`]），而不是去查识别为什么不准。
+    #[error("找不到可用的中文字体，过程诊断图上的文字写不出来。试过：{tried}")]
+    FontUnavailable { tried: String },
 }
 
 impl From<VisionError> for AutomationError {
@@ -79,7 +88,8 @@ impl From<VisionError> for AutomationError {
 
 pub use evidence::{redact, RedactionPlan};
 pub use ocr::{ExternalOcr, UnconfiguredOcr};
-pub use pixels::{binarize, crop, downscale_to_max_width, encode_png, to_grayscale, to_rgba};
+pub use pixels::{binarize, crop, decode_png, downscale_to_max_width, encode_png, to_grayscale, to_rgba};
+pub use layout::{detect_three_pane_splits, suggested_nav_strip_width, ThreePaneSplits};
 pub use template::{
     crop_template, load_icon_template, match_template, TemplateLocator, MAX_TEMPLATE_SIDE,
     MIN_TEMPLATE_SIDE,

@@ -30,10 +30,17 @@ automation-core = { path = "../../../crates/automation-core" }
 platform-mock = { path = "../../../crates/platform-mock" }
 storage = { path = "../../../crates/storage" }
 vision = { path = "../../../crates/vision" }
-tauri = { version = "2.0.0", features = [] }
+# `protocol-asset`：让界面能通过 Tauri 的 asset 协议直接读盘上的图。
+#
+# 「过程重放」要显示那一步的原图（`data/tasks/<任务ID>/steps/*.png`）。
+# 不用它就得把 PNG 读成 base64 从 IPC 回传：一张 200KB 的图变成 270KB 的字符串，
+# 逐帧翻看时这点开销全压在 IPC 上。asset 协议由 WebView 自己去取，只走 URL。
+tauri = { version = "2.0.0", features = ["protocol-asset"] }
 tauri-plugin-opener = "2.0.0"
 # 仅用于把标定预览的 PNG 以 base64 回传给界面。
 base64 = "0.22"
+# 任务日志的时间戳要本地可读（`task_log::now_stamp`）。
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

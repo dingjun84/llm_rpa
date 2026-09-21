@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use automation_core::{
-    AuditEntry, CalibratedWindow, CancelToken, IconLocator, IconTemplate, MemoryAudit,
-    MemorySendLedger, ProgressSink, Rect, RunOutcome, RunnerConfig, RunnerPorts, ScreenMetrics,
-    SendTask, StateChange, TaskState, Workflow, WorkflowRunner, DEFAULT_NAV_STRIP,
+    AuditEntry, CalibratedWindow, CancelToken, DiagnosticRecorder, IconLocator, IconTemplate,
+    MemoryAudit, MemorySendLedger, Observation, ProgressSink, Rect, RunOutcome, RunnerConfig,
+    RunnerPorts, ScreenMetrics, SendTask, StateChange, TaskId, TaskState, Workflow, WorkflowRunner,
+    DEFAULT_NAV_STRIP,
 };
 use platform_mock::{
     tb, ConfirmationOutcome, Fault, MockDesktop, MockHumanConfirmation, MockIconLocator, MockOcr,
@@ -30,11 +31,25 @@ const MESSAGE: &str = "这是一条测试消息";
 /// 「搜索框区还没标定」上，而那条报错看起来像是流程坏了。
 ///
 /// 搜索式那条路本身另有专门的用例，见文件末尾。
+/// 造一张"图标模板"。内容不重要——编排层只把它转交给图标定位端口。
+fn nav_template() -> IconTemplate {
+    IconTemplate {
+        label: "聊天历史图标".into(),
+        pixels: vec![200; 24 * 24 * 4],
+        width: 24,
+        height: 24,
+    }
+}
+
 fn list_config() -> RunnerConfig {
     RunnerConfig {
         platform_label: "test".into(),
         retry_backoff: Duration::ZERO,
         workflow: Workflow::ScrollListContact,
+        // 列表扫描式**总是**先切到聊天历史；核心层测这条路时也要带上模板，
+        // 否则会在导航那一步就转人工，而现象看起来像列表查找坏了。
+        nav_icon_templates: vec![nav_template()],
+        nav_target_label: "聊天历史".into(),
         ..Default::default()
     }
 }
@@ -62,7 +77,37 @@ struct Fixture {
     ocr: Arc<MockOcr>,
     confirmation: Arc<MockHumanConfirmation>,
     audit: Arc<MemoryAudit>,
+    diagnostics: Arc<RecordingDiagnostics>,
     progress: RecordingProgress,
+}
+
+/// 内存版诊断记录器：只记「哪一步、看了哪块区域、读到几个字块」。
+///
+/// 这里钉的是**接线**——`DiagnosticRecorder::observe` 到底有没有被 runner 调用。
+/// 真正把画面渲染成 PNG 的实现在 `apps/desktop` 的 `task_diagnostics.rs`，
+/// 那里另有它自己的单测（渲染、拼图、字体缺失退化）。
+///
+/// 为什么不复用那个实现：它在测试环境里既没有数据目录也没有字体，
+/// 而且会往盘上写图；端到端用例要的是"上报有没有发生"，不是"图好不好看"。
+#[derive(Default)]
+struct RecordingDiagnostics {
+    seen: Mutex<Vec<(String, Rect, usize)>>,
+}
+
+impl RecordingDiagnostics {
+    fn seen(&self) -> Vec<(String, Rect, usize)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl DiagnosticRecorder for RecordingDiagnostics {
+    fn observe(&self, _task_id: TaskId, observation: &Observation<'_>) {
+        self.seen.lock().unwrap().push((
+            observation.label.to_string(),
+            observation.region,
+            observation.text_boxes.len(),
+        ));
+    }
 }
 
 impl Fixture {
@@ -138,6 +183,7 @@ impl Fixture {
         let confirmation = Arc::new(confirmation);
         let audit = Arc::new(MemoryAudit::new());
         let ledger = Arc::new(MemorySendLedger::new());
+        let diagnostics = Arc::new(RecordingDiagnostics::default());
 
         let runner = WorkflowRunner::new(
             RunnerPorts {
@@ -150,7 +196,8 @@ impl Fixture {
             config,
         )
         .with_audit(audit.clone())
-        .with_ledger(ledger.clone());
+        .with_ledger(ledger.clone())
+        .with_diagnostic_recorder(diagnostics.clone());
 
         Self {
             runner,
@@ -158,6 +205,7 @@ impl Fixture {
             ocr,
             confirmation,
             audit,
+            diagnostics,
             progress: RecordingProgress::default(),
         }
     }
@@ -214,6 +262,7 @@ fn happy_path_visits_every_documented_state_in_order() {
         vec![
             TaskState::LaunchingClient,
             TaskState::WaitingForClient,
+            TaskState::NavigatingToView,
             TaskState::SearchingContact,
             TaskState::VerifyingCandidate,
             TaskState::VerifyingChatHeader,
@@ -244,8 +293,8 @@ fn click_lands_on_the_matched_contact_centre_in_screen_coordinates() {
     fixture.run(&fixture.task());
 
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
-    // 两次受守卫的点击：先点联系人，再点消息输入框。
-    assert_eq!(clicks.len(), 2, "应先在联系人上点击，再聚焦消息输入框");
+    // 三次受守卫的点击：导航图标 → 联系人 → 消息输入框。
+    assert_eq!(clicks.len(), 3, "应先点导航，再点联系人，再聚焦消息输入框");
 
     // 期望值由**配置算出来**，不写死屏幕坐标。
     //
@@ -255,12 +304,12 @@ fn click_lands_on_the_matched_contact_centre_in_screen_coordinates() {
     // 而候选区默认值本身是会变的（左边界从 0.0 挪到 0.14 就是一次，为了让开
     // 头像列），写死的数字必然过期；区域默认值由 `runtime.rs` 里的用例单独钉住。
     let panel = RunnerConfig::default().contact_panel.resolve(DEFAULT_WINDOW);
-    assert_eq!(clicks[0].x, panel.x + 108, "点击横坐标应含候选区原点偏移");
-    assert_eq!(clicks[0].y, panel.y + 34, "点击纵坐标应含候选区原点偏移");
+    assert_eq!(clicks[1].x, panel.x + 108, "联系人点击横坐标应含候选区原点偏移");
+    assert_eq!(clicks[1].y, panel.y + 34, "联系人点击纵坐标应含候选区原点偏移");
     // 输入框区默认标定 [0.28,0.82,0.72,0.18]，窗口 1280x720
     // → 区域 (358,590,922,130)，中心 (819,655)
-    assert_eq!(clicks[1].x, 819);
-    assert_eq!(clicks[1].y, 655);
+    assert_eq!(clicks[2].x, 819);
+    assert_eq!(clicks[2].y, 655);
 }
 
 #[test]
@@ -272,7 +321,7 @@ fn the_message_input_box_is_focused_before_pasting() {
     // 输入框必须**先**被点击，粘贴才会落到正确位置。
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
     let pasted = fixture.desktop.pasted.lock().unwrap().clone();
-    assert_eq!(clicks.len(), 2);
+    assert_eq!(clicks.len(), 3, "导航 + 联系人 + 输入框");
     assert_eq!(pasted.len(), 1, "只应粘贴一次");
     assert!(fixture.desktop.send_count() >= 1);
 }
@@ -301,7 +350,12 @@ fn duplicate_contact_names_stop_the_task_before_any_input() {
     assert_eq!(outcome.state, TaskState::NeedsHumanReview);
     assert_eq!(outcome.failure.as_ref().unwrap().code, "AMBIGUOUS_VISION");
     assert_eq!(fixture.desktop.send_count(), 0);
-    assert!(fixture.desktop.clicks.lock().unwrap().is_empty(), "不得点击");
+    // 列表式总会先点一次导航图标；但不得再点联系人或输入框。
+    assert_eq!(
+        fixture.desktop.clicks.lock().unwrap().len(),
+        1,
+        "歧义时只允许导航那一次点击，不得点联系人/输入框"
+    );
 }
 
 /// **严格匹配器**会拒绝近似名。
@@ -814,6 +868,38 @@ fn every_sweep_step_records_what_the_ocr_actually_read() {
     );
 }
 
+/// 每一步「看了哪块区域、读到了什么」都必须交到诊断记录器手里。
+///
+/// **为什么钉住它**：诊断图（`data/tasks/<id>/steps/*.png`）是失败现场唯一的复盘手段，
+/// 而它完全依赖 runner 主动上报。漏报不会让任何测试变红，只会让盘上的图
+/// **少几步**——而少了哪几步恰恰是看不出来的，人只会以为"任务就是这么跑的"。
+///
+/// 这里同时钉住区域**不是整窗**：诊断图要回答的是"区域标定偏了没有"，
+/// 画一块整窗等于把这个问题抹掉。
+#[test]
+fn every_read_step_reaches_the_diagnostic_recorder() {
+    let scenario = MockScenario::happy(CONTACT, MESSAGE);
+    let fixture = Fixture::new(&scenario);
+
+    let outcome = fixture.run(&fixture.task());
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
+
+    let seen = fixture.diagnostics.seen();
+    assert!(!seen.is_empty(), "runner 一次都没把观察交给诊断记录器");
+    assert!(
+        seen.iter().any(|(_, _, boxes)| *boxes > 0),
+        "没有任何一步带上 OCR 文字块——那样渲染出来的图上会一个字都没有，实际：{seen:#?}"
+    );
+    for (label, region, _) in &seen {
+        assert!(!region.is_degenerate(), "步骤「{label}」报上来的区域是空的：{region:?}");
+        assert!(
+            region.width < DEFAULT_WINDOW.width as i32
+                || region.height < DEFAULT_WINDOW.height as i32,
+            "步骤「{label}」报上来的是整窗 {region:?}——诊断图的价值就在于显示「只看了这一块」"
+        );
+    }
+}
+
 /// 关掉开关后，过程证据里**不该**出现识别到的文字，只留指纹。
 #[test]
 fn recording_what_was_read_can_be_switched_off() {
@@ -903,9 +989,9 @@ fn the_log_records_where_the_cursor_will_go() {
 
 /// OCR 把姓名读脏时，放宽匹配必须把链路跑通 —— 而且只放宽「怎么算命中」。
 ///
-/// **为什么钉住它**：实测日志里 OCR 读到的姓名行是 `0 丁俊`（那个 `0` 是头像列的
+/// **为什么钉住它**：实测日志里 OCR 读到的姓名行是 `0 李四`（那个 `0` 是头像列的
 /// 未读红点被 `Windows.Media.Ocr` **按行并进**了姓名块），而严格匹配要求逐字相等，
-/// 于是「丁俊明明就在列表里」却永远匹配不上。这条用例复现同一形状：
+/// 于是「李四明明就在列表里」却永远匹配不上。这条用例复现同一形状：
 /// 姓名行被污染成 `0 {CONTACT}`，同时群预览行 `{CONTACT}：…` 也包含目标名
 /// （用户点名的待优化项），放宽层取**最短**的那个 ⇒ 落到姓名行上。
 ///
@@ -951,9 +1037,9 @@ fn a_dirty_name_still_finds_the_contact_under_relaxed_matching() {
 
     // 点击必须落在**姓名行**（被污染的那条）上，而不是更长的群预览行。
     let clicks = relaxed.desktop.clicks.lock().unwrap().clone();
-    assert_eq!(clicks.len(), 2, "先点联系人，再聚焦输入框");
+    assert_eq!(clicks.len(), 3, "导航 + 联系人 + 输入框");
     assert_eq!(
-        (clicks[0].x, clicks[0].y),
+        (clicks[1].x, clicks[1].y),
         (panel.x + expected.x, panel.y + expected.y),
         "应点中姓名行，而不是更长的群预览行（`{group_preview}`）"
     );
@@ -1559,24 +1645,9 @@ fn stop_before_send_works_together_with_scrolling() {
 // 图标上没有文字，OCR 读不到它，所以"先切到联系人视图"这一步只能靠模板匹配。
 // 这三条用例覆盖：命中并跳转、认不出图标、点击没生效。
 
-/// 造一张"图标模板"。内容不重要——编排层只把它转交给图标定位端口。
-fn nav_template() -> IconTemplate {
-    IconTemplate {
-        label: "通讯录图标".into(),
-        pixels: vec![200; 24 * 24 * 4],
-        width: 24,
-        height: 24,
-    }
-}
-
 fn navigation_config() -> RunnerConfig {
-    RunnerConfig {
-        platform_label: "test".into(),
-        retry_backoff: Duration::ZERO,
-        navigate_before_search: true,
-        nav_icon_templates: vec![nav_template()],
-        ..list_config()
-    }
+    // 列表扫描式本身就会导航；这里不再叠 `navigate_before_search`。
+    list_config()
 }
 
 fn navigation_fixture(desktop: MockDesktop, icons: Arc<dyn IconLocator>) -> Fixture {
@@ -1733,17 +1804,13 @@ fn a_view_that_never_switched_is_caught_when_the_contact_is_not_found() {
 }
 
 #[test]
-fn navigation_is_off_unless_it_is_configured() {
+fn the_list_workflow_always_navigates_to_chat_history() {
     let icons = Arc::new(MockIconLocator::new());
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
     let fixture = Fixture::build_full(
         MockDesktop::new(),
         MockHumanConfirmation::default(),
-        RunnerConfig {
-            platform_label: "test".into(),
-            retry_backoff: Duration::ZERO,
-            ..list_config()
-        },
+        list_config(),
         scenario.script(),
         Arc::new(platform_mock::MockContactMatcher::new()),
         icons.clone(),
@@ -1752,9 +1819,33 @@ fn navigation_is_off_unless_it_is_configured() {
     let outcome = fixture.run(&fixture.task());
 
     assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
-    // 默认关：既不找图标，也不走那个状态。
-    assert_eq!(icons.call_count(), 0);
-    assert!(!fixture.progress.states().contains(&TaskState::NavigatingToView));
+    // 列表扫描式总是先切到聊天历史——不受 navigate_before_search 控制。
+    assert_eq!(icons.call_count(), 1);
+    assert!(fixture.progress.states().contains(&TaskState::NavigatingToView));
+}
+
+#[test]
+fn search_workflow_always_navigates_to_contacts_first() {
+    let icons = Arc::new(MockIconLocator::new());
+    let mut cfg = search_config();
+    cfg.nav_icon_templates = vec![nav_template()];
+    cfg.navigate_before_search = false; // 开关关着也不影响：搜索式一律先切联系人
+    let desktop = MockDesktop::new();
+    desktop.script_scroll_bottom(6);
+    let fixture = Fixture::build_full(
+        desktop,
+        MockHumanConfirmation::default(),
+        cfg,
+        search_script(CONTACT),
+        Arc::new(platform_mock::MockContactMatcher::new()),
+        icons.clone(),
+    );
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert_eq!(icons.call_count(), 1);
+    assert!(fixture.progress.states().contains(&TaskState::NavigatingToView));
 }
 
 #[test]
@@ -1809,7 +1900,7 @@ fn search_script(contact: &str) -> Vec<ScriptedCall> {
     ]
 }
 
-/// 搜索式的基线配置：三块区域都标好了，模板不涉及（这一步不点导航图标）。
+/// 搜索式的基线配置：三块区域都标好了；导航模板从 `list_config` 带上（搜索式一律先切联系人）。
 fn search_config() -> RunnerConfig {
     let region = |x: f32, y: f32, w: f32, h: f32| {
         automation_core::RelativeRegion::new(x, y, w, h)
@@ -1902,7 +1993,7 @@ fn the_search_workflow_reaches_prepared_and_stops_before_sending() {
     }
 }
 
-/// 点搜索框 → 点下拉里那一行 → 点资料页入口 → 点输入框：**四次**点击。
+/// 点导航 → 点搜索框 → 点下拉里那一行 → 点资料页入口 → 点输入框：**五次**点击。
 ///
 /// 为什么要数点击：少一次就少一个动作，而少的那一次**不一定报错**——
 /// 比如漏了点输入框，正文会敲进当时有焦点的控件里（最坏是搜索框，
@@ -1914,10 +2005,12 @@ fn the_search_workflow_clicks_every_control_it_needs() {
     assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
 
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
-    assert_eq!(clicks.len(), 4, "点击序列：搜索框 / 下拉行 / 资料页入口 / 输入框");
+    assert_eq!(
+        clicks.len(),
+        5,
+        "点击序列：联系人导航 / 搜索框 / 下拉行 / 资料页入口 / 输入框"
+    );
 
-    // 每一次点击都要落在**它该落的区域**里——坐标本身取自标定，
-    // 但"取的是哪个区域"是编排层的选择，写错了区域就会点到别处。
     let window = fixture.desktop.window();
     let inside = |point: automation_core::Point, region: automation_core::RelativeRegion| {
         let rect = region.resolve_within(window).expect("区域应当能换算");
@@ -1927,18 +2020,19 @@ fn the_search_workflow_clicks_every_control_it_needs() {
             && point.y <= rect.y + rect.height
     };
     let config = search_config();
-    assert!(inside(clicks[0], config.main_search.unwrap()), "第一次点击应当在搜索框里");
+    // 第一次是导航图标（落在 nav_strip / 窗口左侧一带），不强制区域断言。
+    assert!(inside(clicks[1], config.main_search.unwrap()), "第二次点击应当在搜索框里");
     assert!(
-        inside(clicks[1], config.search_dropdown.unwrap()),
-        "第二次点击应当在联想下拉里（点的是那一行文字）"
+        inside(clicks[2], config.search_dropdown.unwrap()),
+        "第三次点击应当在联想下拉里（点的是那一行文字）"
     );
     assert!(
-        inside(clicks[2], config.contact_profile.unwrap()),
-        "第三次点击应当在资料页里（点的是「发消息」入口）"
+        inside(clicks[3], config.contact_profile.unwrap()),
+        "第四次点击应当在资料页里（点的是「发消息」入口）"
     );
     assert!(
-        inside(clicks[3], config.composer),
-        "第四次点击应当落在消息输入框里"
+        inside(clicks[4], config.composer),
+        "第五次点击应当落在消息输入框里"
     );
 }
 
@@ -1965,32 +2059,57 @@ fn a_row_above_the_contact_group_is_not_a_candidate() {
     // 第二次点击的 y 必须在标题**下方**（标题底边 = 200 + 28）。
     let dropdown = search_config().search_dropdown.unwrap();
     let rect = dropdown.resolve_within(fixture.desktop.window()).unwrap();
-    let clicked_y = clicks[1].y - rect.y;
+    // clicks[0]=导航, [1]=搜索框, [2]=下拉行
+    let clicked_y = clicks[2].y - rect.y;
     assert!(
         clicked_y >= 228,
         "点到「联系人」标题上方去了（相对下拉区 y={clicked_y}）：那是聊天记录行"
     );
 }
 
-/// 「联系人」标题**下方**匹配到多行 ⇒ 转人工，绝不猜。
-///
-/// 同名、或者备注里也带着这个名字时，点错人会把消息发错对象——
-/// 这是整条链路上后果最严重的一类错误，所以宁可不做。
+/// 名字一样长的两行并列时，**照样取最上面那一行**——"同名就转人工"那道闸门
+/// 已按操作者 2026-09-21 的要求撤掉：客户端把最匹配的排在最前面，认它。
 #[test]
-fn two_matching_rows_under_the_group_are_refused() {
+fn a_tie_between_equally_long_rows_follows_the_topmost_one_instead_of_stopping() {
     let mut script = search_script(CONTACT);
     script[0] = ScriptedCall::Ok(vec![
         tb("联系人", 10, 0.99),
-        tb(CONTACT, 40, 0.99),
-        tb(&format!("{CONTACT}（备注）"), 80, 0.99),
+        tb(&format!("小{CONTACT}"), 40, 0.99),
+        tb(&format!("大{CONTACT}"), 80, 0.99),
     ]);
-    let fixture = search_fixture(script);
+    let fixture = search_fixture_relaxed(script);
 
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
-    assert_eq!(fixture.desktop.clicks.lock().unwrap().len(), 1, "点完搜索框就该停下");
+    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    let clicks = fixture.desktop.clicks.lock().unwrap().clone();
+    let dropdown = search_config().search_dropdown.unwrap();
+    let rect = dropdown.resolve_within(fixture.desktop.window()).unwrap();
+    let clicked_y = clicks[2].y - rect.y;
+    assert!(
+        (40..70).contains(&clicked_y),
+        "应当点最上面的那一行（相对 y={clicked_y}），不是下面那行"
+    );
     assert_eq!(fixture.desktop.send_count(), 0);
+}
+
+/// 同 `search_fixture`，但装配**放宽层**（`ContainsNameMatcher`）。
+///
+/// 生产跑的就是这一层（`runtime.rs` 里 `relaxed_name_match` 默认 true），
+/// 而替身默认装配的是严格匹配器。严格层下 `Jerry-张三同学` 这种行会被
+/// `verify_candidate` 判成"不被当前的姓名匹配策略接受"，流程在**挑完人之后**
+/// 就停了——那样就测不出"下拉里究竟挑了哪一行"这件事，
+/// 而这正是下面两条用例要钉的。
+fn search_fixture_relaxed(script: Vec<ScriptedCall>) -> Fixture {
+    let desktop = MockDesktop::new();
+    desktop.script_scroll_bottom(6);
+    Fixture::build_with_matcher(
+        desktop,
+        MockHumanConfirmation::default(),
+        search_config(),
+        script,
+        Arc::new(automation_core::ContainsNameMatcher::default()),
+    )
 }
 
 /// 下拉里根本没有「联系人」这一组 ⇒ 转人工，并说清读到的是什么。
@@ -2008,6 +2127,94 @@ fn a_dropdown_without_the_contact_group_is_a_human_review() {
     assert_eq!(outcome.state, TaskState::NeedsHumanReview);
     let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
     assert!(reason.contains("联系人"), "要说清缺的是哪一组：{reason}");
+}
+
+/// 人只出现在「最常使用」底下时也能找到——Mac 微信上常见。
+#[test]
+fn a_contact_only_under_frequently_used_is_picked() {
+    let mut script = search_script(CONTACT);
+    script[0] = ScriptedCall::Ok(vec![
+        tb("联系人", 10, 0.99),
+        tb("最常使用", 80, 0.99),
+        tb(CONTACT, 110, 0.99),
+        tb("聊天记录", 200, 0.99),
+        tb(&format!("和{CONTACT}的聊天"), 230, 0.99),
+    ]);
+    let fixture = search_fixture(script);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    let clicks = fixture.desktop.clicks.lock().unwrap().clone();
+    let dropdown = search_config().search_dropdown.unwrap();
+    let rect = dropdown.resolve_within(fixture.desktop.window()).unwrap();
+    let clicked_y = clicks[2].y - rect.y;
+    assert!(
+        (110..200).contains(&clicked_y),
+        "应当点「最常使用」下的那一行（相对 y={clicked_y}），不是聊天记录行"
+    );
+}
+
+/// 下拉里有多行含关键词时，取**最上面**的那一行——哪怕本人那一行在它下面。
+///
+/// 复现自 2026-09-21 Mac 微信实测（`/Users/admin/data/task-a537432a.log`）：
+/// 搜「李小明」时「联系人」分组下方同时有 `李小明` 与 `Jerry-李小明同学`，
+/// 原来的"多个就转人工"让整条流程停在搜索这一步（鼠标一下都没动）。
+///
+/// 判据是操作者定的「**排最上面的优先**」（不是"取最短"）：客户端自己会把
+/// 最匹配的那一行放在最前面。所以这条用例刻意把更长的 `Jerry-…同学` 放在
+/// 本人上方——取最短会点下面那行，取最上面才会点上面那行，
+/// 两种实现只有在这里能被区分开。
+#[test]
+fn the_topmost_matching_row_wins_when_several_rows_contain_the_name() {
+    let mut script = search_script(CONTACT);
+    script[0] = ScriptedCall::Ok(vec![
+        tb("联系人", 10, 0.99),
+        tb(&format!("Jerry-{CONTACT}同学"), 40, 0.99),
+        tb(CONTACT, 70, 0.99),
+        tb("群聊", 130, 0.99),
+        tb(&format!("和{CONTACT}的聊天"), 160, 0.99),
+    ]);
+    let fixture = search_fixture_relaxed(script);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    let clicks = fixture.desktop.clicks.lock().unwrap().clone();
+    let dropdown = search_config().search_dropdown.unwrap();
+    let rect = dropdown.resolve_within(fixture.desktop.window()).unwrap();
+    let clicked_y = clicks[2].y - rect.y;
+    assert!(
+        (40..70).contains(&clicked_y),
+        "应当点最上面的那一行（相对 y={clicked_y}），而不是下面那行"
+    );
+}
+
+/// 「聊天记录」下的同名行不能冒充联系人——即使上面的联系人分组是空的。
+#[test]
+fn a_chat_history_row_is_not_picked_when_contact_sections_exist() {
+    let mut script = search_script(CONTACT);
+    script[0] = ScriptedCall::Ok(vec![
+        tb("联系人", 10, 0.99),
+        tb("最常使用", 50, 0.99),
+        tb("聊天记录", 100, 0.99),
+        tb(&format!("和{CONTACT}的聊天"), 130, 0.99),
+    ]);
+    let fixture = search_fixture(script);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
+    let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
+    assert!(
+        reason.contains("联系人") || reason.contains("最常使用"),
+        "失败信息要点名试过的分组：{reason}"
+    );
+    assert_eq!(
+        fixture.desktop.clicks.lock().unwrap().len(),
+        2,
+        "导航 + 搜索框之后就该停下（还没点下拉行）"
+    );
 }
 
 /// 点完搜索框之后**先清空、再输入**。
@@ -2033,11 +2240,12 @@ fn the_search_workflow_clears_the_box_before_typing() {
         .map(String::as_str)
         .filter(|op| matches!(*op, "click" | "clear" | "type" | "paste"))
         .collect();
-    let head: Vec<&str> = inputs.iter().take(3).copied().collect();
+    // 开头多一次导航点击；之后必须是 点搜索框 → 清空 → 输入。
+    let head: Vec<&str> = inputs.iter().take(4).copied().collect();
     assert_eq!(
         head,
-        ["click", "clear", "type"],
-        "点搜索框之后必须先清空再输入。完整操作序列：{operations:?}"
+        ["click", "click", "clear", "type"],
+        "导航之后：点搜索框 → 清空 → 输入。完整操作序列：{operations:?}"
     );
     // 第一次逐字输入必须是关键词（后面还有一次是消息正文——搜索式也走逐字输入）。
     assert_eq!(
@@ -2142,8 +2350,8 @@ fn a_search_workflow_without_its_regions_stops_before_clicking() {
     assert_eq!(outcome.state, TaskState::NeedsHumanReview);
     assert_eq!(
         fixture.desktop.clicks.lock().unwrap().len(),
-        1,
-        "搜索框还是点得到的，缺的是下拉区——点完搜索框就该停"
+        2,
+        "导航与搜索框还是点得到的，缺的是下拉区——点完搜索框就该停"
     );
     let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
     assert!(reason.contains("搜索下拉列表"), "要说清缺的是哪一块：{reason}");

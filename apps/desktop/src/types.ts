@@ -127,6 +127,10 @@ export interface TaskView {
   history: HistoryEntry[];
   awaiting_confirmation: boolean;
   evidence_artifacts: EvidenceView[];
+  /** 过程日志路径；重启后从日志恢复的条目也会带上。 */
+  log_path?: string | null;
+  /** 是否从磁盘日志恢复（非本进程内存任务）。 */
+  from_log?: boolean;
 }
 
 export type RuntimeMode = "dry_run" | "live";
@@ -275,8 +279,8 @@ export interface RuntimeConfig {
    * 默认 `(0.62, 0.5)` = 上下居中、左右偏右一点（由后端常量下发，前端不另写一份）。
    * 不用区域中心的原因：联系人候选区的左边界是 0.14，**正好落在姓名那一列上**，
    * 区域中心会压住姓名与消息预览的交界处；而左边界取 0 会把导航图标栏与
-   * 头像列（含未读红点）一起圈进来，红点会被 OCR 并进姓名里（实测把「丁俊」
-   * 读成「0 丁俊」），逐字匹配就永远找不到人。
+   * 头像列（含未读红点）一起圈进来，红点会被 OCR 并进姓名里（实测把「李四」
+   * 读成「0 李四」），逐字匹配就永远找不到人。
    */
   scroll_anchor: { x: number; y: number };
   /**
@@ -287,6 +291,11 @@ export interface RuntimeConfig {
    * 尺寸去点。真实模式下这一项必须有值，否则任务会被拒绝装配。
    */
   calibrated_window: WindowGeometry | null;
+  /**
+   * 按显示器缩放保存的多份界面标定。任务装配时按当前缩放挑选。
+   * 旧配置没有这个字段时后端会迁成一份。
+   */
+  calibrations?: CalibrationSnapshot[];
   /**
    * 联系人列表最多完整扫描几轮（每轮 = 从列表顶部向下扫到底）。
    *
@@ -330,13 +339,15 @@ export interface RuntimeConfig {
    */
   navigate_before_search: boolean;
   /**
-   * 参与匹配的图标：**图标名**（不是路径）。
-   *
-   * 界面上不直接编辑这一项——「图标库」页里每个图标旁边有「用于导航」开关，
-   * 打开就等于把它的名字加进来。一个名字底下可以有多张图（选中 / 未选中 /
-   * 带气泡 / 气泡数字不同），它们**全都**会参与匹配。
+   * 「用于联系人导航」勾选的图标名（通讯录 / 联系人）。搜索式会先点它。
+   * 一个名字底下可以有多张图（选中 / 未选中 / 带气泡），它们**全都**会参与匹配。
    */
   nav_icon_templates: string[];
+  /**
+   * 「用于对话历史导航」勾选的图标名（聊天 / 微信）。列表扫描式会先点它回到会话列表。
+   * 老配置没有此键时按空数组处理。
+   */
+  chat_history_nav_templates?: string[];
   /**
    * 界面标定拖出来的框，key 见后端 `calibration::ITEMS`。
    *
@@ -411,10 +422,10 @@ export interface RuntimeConfig {
    */
   profile_chat_entry_text: string;
   /**
-   * 搜索下拉里「联系人」那一组的标题文字（默认「联系人」）。
+   * 搜索下拉里可作为「联系人」的分组标题（默认「联系人 / 最常使用」）。
    *
-   * 下拉是**分组**的（联系人 / 聊天记录 / 群聊…），只有"联系人"那一组下面
-   * 才是人。同样不能留空。
+   * 可写多项，用 `/`、`、` 或空白分隔。编排时在这些分组标题与下一组
+   * （群聊 / 聊天记录 / 公众号 / 小程序）之间找人。同样不能留空。
    */
   search_contact_group_label: string;
 }
@@ -577,6 +588,13 @@ export interface NavIconHit {
   accepted: boolean;
 }
 
+/** 一张模板在当前画面上的最高分。 */
+export interface NavIconScore {
+  template: string;
+  score: number;
+  accepted: boolean;
+}
+
 /** 「测试图标匹配」的结果。 */
 export interface NavIconProbe {
   window: Rect;
@@ -589,6 +607,8 @@ export interface NavIconProbe {
   strip: Rect;
   /** 最佳命中；`null` 表示所有模板都放不进搜索区。 */
   hit: NavIconHit | null;
+  /** 每张模板各自的最高分（降序）。 */
+  scores: NavIconScore[];
   /** 面向操作者的一句话结论（含分数与是否过阈值）。 */
   notice: string;
 }
@@ -639,6 +659,18 @@ export interface CircleTraceView {
    * 都是拍脑袋，且没有任何自动判据依赖它。
    */
   end_distance_px: number;
+}
+
+/** 按显示器缩放保存的一份完整界面标定。 */
+export interface CalibrationSnapshot {
+  scale_factor: number;
+  /** 可选短标签；空串 = 界面上不显示。 */
+  label: string;
+  window: WindowGeometry;
+  regions: RegionConfig;
+  area_marks?: Record<string, AreaMark>;
+  nav_strip: [number, number, number, number];
+  scroll_anchor: { x: number; y: number };
 }
 
 /** 标定时记录的窗口几何（屏幕坐标 + 显示器缩放）。 */
@@ -705,6 +737,122 @@ export interface Rect {
   y: number;
   width: number;
   height: number;
+}
+
+/**
+ * 过程诊断事件流里的坐标。
+ *
+ * **本帧图像坐标**（原点即那一块区域的左上角），与图上画的框一致——
+ * 不是屏幕坐标（那张图本身已经是区域内的画面了）。
+ */
+export interface ReplayRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** 事件流里的一块识别文字。 */
+export interface ReplayBox extends ReplayRect {
+  /** 识别到的文字，**原样**（前后空格、换行都留着——那本身是线索）。 */
+  text: string;
+  confidence: number;
+}
+
+/** 一个候选在这一次判定里的遭遇（事件流 `decision` 那一条的 `candidates`）。 */
+export interface ReplayCandidate extends ReplayBox {
+  /** 过没过它该过的那一道判据。 */
+  passed: boolean;
+  /** 通过 / 淘汰的具体原因，带数字（阈值、置信度、它上面那一行是什么）。 */
+  reason: string;
+}
+
+/**
+ * 「这一步看到了什么」。
+ *
+ * 与后端 `task_diagnostics/events.rs` 里 `kind == "read"` 那条一一对应。
+ */
+export interface ReplayReadEvent {
+  kind: "read";
+  /** 记下它的时刻（本地时间，人读的）。 */
+  t: string;
+  /** 步骤名，与 `decision` 那一条对得上。 */
+  step: string;
+  /** 第几步（从 1 起，与 `steps/` 里文件名前缀一致）。 */
+  index: number;
+  /** 标注图的**相对**路径（盘上存的就是这个，整个目录可以搬走）。 */
+  image: string;
+  /**
+   * 同上的**绝对**路径，由后端拼好。
+   *
+   * 界面读图走 asset 协议，协议按绝对路径放行；相对路径交给它取不到图。
+   * 分隔符也归后端管——前端不拼路径。
+   */
+  image_path: string;
+  /** 这一步要看的那块区域（屏幕坐标）。 */
+  region: { x: number; y: number; w: number; h: number };
+  frame: { w: number; h: number; fingerprint: string };
+  boxes: ReplayBox[];
+}
+
+/** 重跑这条判据要什么输入。`null`（缺这个键）= 这条判据不支持离线重跑。 */
+export type ReplayInput =
+  | { kind: "dropdown"; keyword: string; group_labels: string }
+  | { kind: "name_match"; expected_name: string; relaxed: boolean };
+
+/** 「这一步怎么判的」。与后端 `kind == "decision"` 那条一一对应。 */
+export interface ReplayDecisionEvent {
+  kind: "decision";
+  t: string;
+  step: string;
+  /** 这一步在问什么，一句人话。 */
+  question: string;
+  /** 按什么判的（阈值、分组、截断规则…）。 */
+  rule: string;
+  /** 结论：选中了什么，或者为什么停下来。 */
+  outcome: string;
+  /**
+   * 这条判据通过了没有。
+   *
+   * ★ 界面「默认落在失败那一步」靠的就是它。不从 `outcome` 那句话里猜——
+   * 措辞会改，而这是个结构化的事实。
+   */
+  passed: boolean;
+  min_confidence: number;
+  replay: ReplayInput | null;
+  candidates: ReplayCandidate[];
+}
+
+/**
+ * 事件流里的一条。
+ *
+ * 只列已知的两种 `kind`。读到别的（将来加了新事件）时，配对逻辑会**跳过**它，
+ * 而不是当成坏数据显示——判据在 `replayView.ts` 一处。
+ */
+export type ReplayEvent = ReplayReadEvent | ReplayDecisionEvent;
+
+/** `read_task_events` 的返回值。 */
+export interface TaskReplayData {
+  /**
+   * 任务目录的绝对路径。
+   *
+   * `null` = 这次任务没有过程诊断材料（旧布局的任务只有一个日志文件）。
+   * 界面据此说一句实话，而不是显示一个空面板。
+   */
+  dir: string | null;
+  events: ReplayEvent[];
+}
+
+/** 「过程重放」里的一步：先看图，再看它怎么判的。 */
+export interface ReplayStep {
+  /** 第几步（取自 `read.index`；没有图的那一步取序号）。 */
+  index: number;
+  /** 步骤名（`read.step` 与 `decision.step` 是同一套措辞）。 */
+  label: string;
+  /** 记下它的时刻，用图那一笔的（两者本来就是同一刻）。 */
+  at: string;
+  read: ReplayReadEvent | null;
+  decision: ReplayDecisionEvent | null;
 }
 
 /** 目标窗口的一次只读预览，用于区域标定。 */

@@ -164,7 +164,7 @@ fn the_region_defaults_match_the_core_constants() {
 /// 会话列表左侧还有导航图标栏和头像列（头像右上角带未读红点），
 /// 它们与姓名在同一行高度上，会被 OCR **并进同一个文字块**。
 /// 实测（960x734）：左边界取 0 时读到 `《明月（美、加、欧洲）清库存`、
-/// `0 丁俊`，取 0.14 时读到干净的 `明月（美、加、欧洲）清库存`、`丁俊`。
+/// `0 李四`，取 0.14 时读到干净的 `明月（美、加、欧洲）清库存`、`李四`。
 /// 而姓名匹配是逐字精确的（`docs/architecture.md` §6.4/§6.6），
 /// 多一个前导字符就永远找不到人。
 ///
@@ -256,26 +256,26 @@ fn reading_back_the_ocr_text_is_on_by_default() {
 ///
 /// 为什么值得单独钉：选错匹配器**不报任何错**，只在现场表现为
 /// 「它怎么点到别人身上去了」或者「明明在列表里却说找不到」。
-/// 这里用实测过的那条数据（OCR 把头像红点并进了姓名行，读出 `0 丁俊`）。
+/// 这里用实测过的那条数据（OCR 把头像红点并进了姓名行，读出 `0 李四`）。
 #[test]
 fn the_relaxed_switch_actually_selects_the_lenient_matcher() {
     use automation_core::{Rect, TextBox};
 
     let noisy = vec![TextBox {
-        text: "0 丁俊".into(),
+        text: "0 李四".into(),
         bounds: Rect { x: 4, y: 29, width: 38, height: 19 },
         confidence: 1.0,
     }];
 
     let lenient = build_matcher(true);
     let found = lenient
-        .find_unique_exact_match("丁俊", &noisy, DEFAULT_MIN_CONFIDENCE)
-        .expect("放宽模式下应当认出「0 丁俊」里的「丁俊」");
-    assert_eq!(found.text, "0 丁俊");
+        .find_unique_exact_match("李四", &noisy, DEFAULT_MIN_CONFIDENCE)
+        .expect("放宽模式下应当认出「0 李四」里的「李四」");
+    assert_eq!(found.text, "0 李四");
 
     let strict = build_matcher(false);
     assert!(
-        strict.find_unique_exact_match("丁俊", &noisy, DEFAULT_MIN_CONFIDENCE).is_err(),
+        strict.find_unique_exact_match("李四", &noisy, DEFAULT_MIN_CONFIDENCE).is_err(),
         "关掉开关就必须回到架构要求的逐字精确匹配"
     );
 }
@@ -310,14 +310,34 @@ fn navigation_defaults_come_from_the_core_constants_and_are_off() {
     assert!(!runner.navigate_before_search);
 }
 
-/// 装配用例的基线配置：**列表扫描式**。
+/// 装配用例的基线配置：**列表扫描式**，并勾好聊天历史图标。
 ///
 /// 为什么要显式选：`RuntimeConfig::default()` 现在是**搜索式**，而搜索式
-/// 要求先标好搜索框 / 下拉 / 资料页三块。下面这些用例验的是导航图标那一组，
-/// 与工作流无关；沿用默认值会让它们全部卡在「缺标定区域」上，
-/// 而那条报错看起来像是导航配置有问题——排查方向就歪了。
+/// 要求先标好搜索框 / 下拉 / 资料页三块。列表扫描式不需要那些，但**总是**
+/// 要聊天历史导航模板——没勾的话装配会卡在「没有配置聊天历史图标」上。
 fn base_config() -> RuntimeConfig {
-    RuntimeConfig { workflow: Workflow::ScrollListContact, ..RuntimeConfig::default() }
+    RuntimeConfig {
+        workflow: Workflow::ScrollListContact,
+        chat_history_nav_templates: vec!["聊天".into()],
+        ..RuntimeConfig::default()
+    }
+}
+
+/// 搜索式基线：三块区域都标好了，用来测 `navigate_before_search` + 联系人导航。
+fn search_base_config() -> RuntimeConfig {
+    let mark = |rect: [f32; 4]| calibration::AreaMark {
+        rect,
+        calibrated_at_ms: 1_700_000_000_000,
+        window: automation_core::Rect { x: 0, y: 0, width: 960, height: 734 },
+    };
+    let mut config = RuntimeConfig {
+        workflow: Workflow::SearchContact,
+        ..RuntimeConfig::default()
+    };
+    config.area_marks.insert("main_search".into(), mark([0.10, 0.02, 0.60, 0.05]));
+    config.area_marks.insert("search_dropdown".into(), mark([0.10, 0.07, 0.60, 0.50]));
+    config.area_marks.insert("contact_profile".into(), mark([0.72, 0.05, 0.27, 0.90]));
+    config
 }
 
 /// 打开开关却没配图标 ⇒ **装配期**就拒绝，而不是留一条跑到一半才失败的记录。
@@ -326,21 +346,21 @@ fn turning_on_navigation_without_a_template_is_refused() {
     let icons = temp_icons_dir("no-template");
     let config = RuntimeConfig {
         navigate_before_search: true,
-        ..base_config()
+        ..search_base_config()
     };
     let err = assemble_with_icons(&config, &icons)
         .err()
         .expect("没有图标时必须拒绝装配");
     // 报错要点名**缺的是哪个图标**：图标库里通常有四五个目录，
     // 不说清就等于让人自己去猜该配哪一个。
-    assert!(err.contains("没有配置「联系人」图标的模板"), "{err}");
+    assert!(err.contains("通讯录") || err.contains("联系人") || err.contains("用于联系人导航"), "{err}");
     assert!(err.contains("图标库"), "要告诉人下一步去哪配：{err}");
 
     // 只填空白也算没配——不然会变成"名字叫空字符串"这种更难查的错。
     let config = RuntimeConfig {
         navigate_before_search: true,
         nav_icon_templates: vec!["   ".into(), String::new()],
-        ..base_config()
+        ..search_base_config()
     };
     assert!(assemble_with_icons(&config, &icons).is_err());
 
@@ -348,10 +368,25 @@ fn turning_on_navigation_without_a_template_is_refused() {
     let config = RuntimeConfig {
         navigate_before_search: true,
         nav_icon_templates: vec!["聊天".into()],
-        ..base_config()
+        ..search_base_config()
     };
     let err = assemble_with_icons(&config, &icons).err().expect("名字对不上要拒绝");
     assert!(err.contains("聊天"), "{err}");
+}
+
+/// 列表扫描式没勾聊天历史图标 ⇒ 装配期拒绝（不受 navigate_before_search 控制）。
+#[test]
+fn the_list_workflow_refuses_without_chat_history_templates() {
+    let icons = temp_icons_dir("no-chat-history");
+    let config = RuntimeConfig {
+        workflow: Workflow::ScrollListContact,
+        chat_history_nav_templates: Vec::new(),
+        ..RuntimeConfig::default()
+    };
+    let err = assemble_with_icons(&config, &icons)
+        .err()
+        .expect("没勾聊天历史图标时必须拒绝");
+    assert!(err.contains("对话历史") || err.contains("用于对话历史导航"), "{err}");
 }
 
 /// 一个名字底下的**全部**变体都要被带进运行器。
@@ -363,8 +398,7 @@ fn every_variant_of_an_icon_reaches_the_runner() {
     let icons = temp_icons_dir("variants");
     write_icon(&icons, "聊天", 3, 20, 18);
     let config = RuntimeConfig {
-        navigate_before_search: true,
-        nav_icon_templates: vec!["聊天".into(), "  ".into()],
+        chat_history_nav_templates: vec!["聊天".into(), "  ".into()],
         ..base_config()
     };
 
@@ -390,9 +424,9 @@ fn an_unusable_template_is_refused_at_assembly_time() {
     let icons = temp_icons_dir("unusable");
     write_icon(&icons, "太大", 1, 300, 40);
     let config = RuntimeConfig {
-        navigate_before_search: true,
-        nav_icon_templates: vec!["太大".into()],
-        ..base_config()
+        workflow: Workflow::ScrollListContact,
+        chat_history_nav_templates: vec!["太大".into()],
+        ..RuntimeConfig::default()
     };
     let err = assemble_with_icons(&config, &icons).err().expect("过大的模板必须被拒绝");
     assert!(err.contains("太大"), "报错要说清是尺寸问题：{err}");
@@ -402,9 +436,9 @@ fn an_unusable_template_is_refused_at_assembly_time() {
     write_icon(&icons, "聊天", 3, 20, 18);
     std::fs::write(icons.join("聊天").join("2.png"), b"not a png").unwrap();
     let config = RuntimeConfig {
-        navigate_before_search: true,
-        nav_icon_templates: vec!["聊天".into()],
-        ..base_config()
+        workflow: Workflow::ScrollListContact,
+        chat_history_nav_templates: vec!["聊天".into()],
+        ..RuntimeConfig::default()
     };
     let err = assemble_with_icons(&config, &icons).err().expect("坏的那张必须被拒绝");
     assert!(err.contains("聊天/2.png"), "要说清是哪个图标的哪一张：{err}");
@@ -417,8 +451,6 @@ fn an_illegal_nav_strip_or_threshold_is_refused() {
     write_icon(&icons, "聊天", 1, 20, 18);
 
     let config = RuntimeConfig {
-        navigate_before_search: true,
-        nav_icon_templates: vec!["聊天".into()],
         nav_strip: [0.0, 0.0, 1.5, 1.0],
         ..base_config()
     };
@@ -426,8 +458,6 @@ fn an_illegal_nav_strip_or_threshold_is_refused() {
     assert!(err.contains("导航图标搜索区"), "{err}");
 
     let config = RuntimeConfig {
-        navigate_before_search: true,
-        nav_icon_templates: vec!["聊天".into()],
         nav_icon_min_score: 1.4,
         ..base_config()
     };
@@ -435,18 +465,24 @@ fn an_illegal_nav_strip_or_threshold_is_refused() {
     assert!(err.contains("0–1"), "{err}");
 }
 
-/// 关着的时候不该去读图标：名字写错了也不该拦住任务。
+/// 搜索式关掉「查找前先导航」时，不该去读联系人导航图标——
+/// 名字写错了、搜索区非法，都不该拦住任务。
+///
+/// 搜索式**一律**先切联系人，所以会读 `nav_icon_templates`；
+/// 但坏掉的「对话历史」名单不应挡住搜索式装配（那一组只给列表扫描用）。
 #[test]
-fn icons_are_not_touched_while_navigation_is_off() {
-    let icons = temp_icons_dir("off");
+fn search_workflow_ignores_broken_chat_history_nav_list() {
+    let icons = temp_icons_dir("search-ignore-chat");
+    write_icon(&icons, "通讯录", 1, 20, 18);
     let config = RuntimeConfig {
         navigate_before_search: false,
-        nav_icon_templates: vec!["根本不存在的图标".into()],
-        nav_strip: [0.0, 0.0, 9.0, 9.0],
-        ..base_config()
+        nav_icon_templates: vec!["通讯录".into()],
+        chat_history_nav_templates: vec!["根本不存在的图标".into()],
+        ..search_base_config()
     };
-    let runner = assemble_with_icons(&config, &icons).expect("关着的时候这些配置项都不该被读");
-    assert!(runner.config().nav_icon_templates.is_empty());
+    let runner = assemble_with_icons(&config, &icons).expect("搜索式不读对话历史那一组");
+    assert!(!runner.config().nav_icon_templates.is_empty());
+    assert_eq!(runner.config().nav_target_label, "通讯录");
 }
 
 // ── 工作流：该要求哪些标定区域 ──────────────────────────────────
@@ -485,6 +521,7 @@ fn the_search_workflow_refuses_to_start_without_its_regions() {
 #[test]
 fn the_search_regions_reach_the_runner_after_they_are_marked() {
     let icons = temp_icons_dir("search-regions-ok");
+    write_icon(&icons, "通讯录", 1, 20, 18);
     let mark = |rect: [f32; 4]| calibration::AreaMark {
         rect,
         calibrated_at_ms: 1_700_000_000_000,
@@ -492,6 +529,7 @@ fn the_search_regions_reach_the_runner_after_they_are_marked() {
     };
     let mut config = RuntimeConfig {
         workflow: Workflow::SearchContact,
+        nav_icon_templates: vec!["通讯录".into()],
         ..RuntimeConfig::default()
     };
     config.area_marks.insert("main_search".into(), mark([0.10, 0.02, 0.60, 0.05]));
@@ -515,12 +553,16 @@ fn the_search_regions_reach_the_runner_after_they_are_marked() {
 #[test]
 fn the_list_workflow_does_not_need_the_search_regions() {
     let icons = temp_icons_dir("list-no-search-regions");
+    write_icon(&icons, "聊天", 1, 20, 18);
     let config = RuntimeConfig {
         workflow: Workflow::ScrollListContact,
+        chat_history_nav_templates: vec!["聊天".into()],
         ..RuntimeConfig::default()
     };
     let runner = assemble_with_icons(&config, &icons).expect("列表式不该要求搜索式的区域");
     assert!(runner.config().main_search.is_none());
+    assert_eq!(runner.config().nav_target_label, "聊天");
+    assert!(!runner.config().nav_icon_templates.is_empty());
 }
 
 /// ★ 回归用例：**判据是运行参数，不是配置里的那个默认值**。
@@ -547,10 +589,13 @@ fn the_run_choice_decides_the_workflow_not_the_config() {
         "前提：默认配置按搜索式装配应当被拒（缺三块区域）"
     );
 
+    write_icon(&icons, "聊天", 1, 20, 18);
+    let mut config = config;
+    config.chat_history_nav_templates = vec!["聊天".into()];
     let choice = RunChoice {
         mode: config.mode,
         workflow: Workflow::ScrollListContact,
-        // 这条工作流不导航，所以这一项没有意义——填空串，别让它看起来像"选好了"。
+        // 列表式不读这一项（它用 chat_history_nav_templates）——填空串。
         nav_target: String::new(),
     };
     let runner = build_runner(
@@ -571,9 +616,9 @@ fn the_run_choice_decides_the_workflow_not_the_config() {
         Workflow::ScrollListContact,
         "运行器里那条路必须来自运行参数"
     );
-    // 这条路不导航，所以不该带上任何图标模板：带上了就说明有人把配置里那组
-    // "联系人视图"图标无条件塞了进来——那会在别的场合让任务先点一个不该点的图标。
-    assert!(runner.config().nav_icon_templates.is_empty());
+    // 列表式总是带上聊天历史模板（不是联系人导航那一组）。
+    assert!(!runner.config().nav_icon_templates.is_empty());
+    assert_eq!(runner.config().nav_target_label, "聊天");
 }
 
 /// ★ 回归用例：**模式也是运行参数**，不是配置里的那个默认值。
@@ -591,6 +636,7 @@ fn the_run_choice_decides_the_workflow_not_the_config() {
 #[test]
 fn the_run_choice_decides_the_mode_not_the_config() {
     let icons = temp_icons_dir("run-choice-mode");
+    write_icon(&icons, "聊天", 1, 20, 18);
     let runner_of = |config: &RuntimeConfig, choice: RunChoice| {
         build_runner(
             config,
@@ -608,6 +654,7 @@ fn the_run_choice_decides_the_mode_not_the_config() {
         mode: RuntimeMode::DryRun,
         calibrated_window: None,
         workflow: Workflow::ScrollListContact,
+        chat_history_nav_templates: vec!["聊天".into()],
         ..RuntimeConfig::default()
     };
     // 不用 `expect_err`：`WorkflowRunner` 没有实现 `Debug`，报不出成功那个值。
@@ -638,6 +685,7 @@ fn the_run_choice_decides_the_mode_not_the_config() {
             scale_factor: 1.0,
         }),
         workflow: Workflow::ScrollListContact,
+        chat_history_nav_templates: vec!["聊天".into()],
         ..RuntimeConfig::default()
     };
     let runner = runner_of(
@@ -725,8 +773,10 @@ fn navigate_only_loads_every_variant_of_the_chosen_icon() {
 #[test]
 fn blank_target_texts_are_refused() {
     let icons = temp_icons_dir("blank-text");
+    write_icon(&icons, "聊天", 1, 20, 18);
     let mut config = RuntimeConfig {
         workflow: Workflow::ScrollListContact,
+        chat_history_nav_templates: vec!["聊天".into()],
         ..RuntimeConfig::default()
     };
     config.profile_chat_entry_text = "  ".into();
@@ -736,6 +786,7 @@ fn blank_target_texts_are_refused() {
 
     let mut config = RuntimeConfig {
         workflow: Workflow::ScrollListContact,
+        chat_history_nav_templates: vec!["聊天".into()],
         ..RuntimeConfig::default()
     };
     config.search_contact_group_label = String::new();
@@ -793,8 +844,6 @@ fn a_negative_prior_tolerance_is_refused() {
     let icons = temp_icons_dir("negative-tolerance");
     write_icon(&icons, "聊天", 1, 20, 18);
     let config = RuntimeConfig {
-        navigate_before_search: true,
-        nav_icon_templates: vec!["聊天".into()],
         icon_prior_score_tolerance: -0.1,
         ..base_config()
     };
@@ -803,8 +852,6 @@ fn a_negative_prior_tolerance_is_refused() {
 
     // 0 是**合法**的：它表示"关掉先验"，是一个明确的配置意图。
     let config = RuntimeConfig {
-        navigate_before_search: true,
-        nav_icon_templates: vec!["聊天".into()],
         icon_prior_score_tolerance: 0.0,
         ..base_config()
     };

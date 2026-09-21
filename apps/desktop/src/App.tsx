@@ -10,6 +10,7 @@ import { RuntimePanel } from "./components/RuntimePanel";
 import { StateTimeline } from "./components/StateTimeline";
 import { TaskForm } from "./components/TaskForm";
 import { TaskHistory } from "./components/TaskHistory";
+import { TaskReplay } from "./components/TaskReplay";
 import { contactLabel } from "./taskDisplay";
 import {
   TERMINAL_STATES,
@@ -23,7 +24,7 @@ import {
   type WorkflowRequirement,
 } from "./types";
 
-type Tab = "tasks" | "calibration" | "icons" | "trace";
+type Tab = "tasks" | "calibration" | "icons" | "trace" | "replay";
 
 export function App() {
   const [tasks, setTasks] = useState<TaskView[]>([]);
@@ -31,6 +32,8 @@ export function App() {
   const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
   const [info, setInfo] = useState<RuntimeInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [taskLog, setTaskLog] = useState<string | null>(null);
+  const [taskLogError, setTaskLogError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("tasks");
 
   /**
@@ -101,7 +104,11 @@ export function App() {
   const upsert = useCallback((task: TaskView) => {
     setTasks((current) => {
       const index = current.findIndex((item) => item.id === task.id);
-      if (index === -1) return [task, ...current];
+      if (index === -1) {
+        // 新任务：列表插到最前，并切到它的进度 / 过程日志。
+        setActiveId(task.id);
+        return [task, ...current];
+      }
       const next = current.slice();
       next[index] = task;
       return next;
@@ -127,7 +134,6 @@ export function App() {
     void api
       .onTaskUpdated((task) => {
         upsert(task);
-        setActiveId((current) => current ?? task.id);
       })
       .then((fn) => {
         if (disposed) fn();
@@ -244,6 +250,30 @@ export function App() {
     () => tasks.find((task) => task.id === activeId) ?? null,
     [tasks, activeId],
   );
+  useEffect(() => {
+    if (!activeId) {
+      setTaskLog(null);
+      setTaskLogError(null);
+      return;
+    }
+    let cancelled = false;
+    setTaskLogError(null);
+    void api
+      .readTaskLog(activeId)
+      .then((text) => {
+        if (!cancelled) setTaskLog(text);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setTaskLog(null);
+          setTaskLogError(String(err));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId, activeTask?.state, activeTask?.failure?.reason, activeTask?.detail]);
+
 
   const running = useMemo(
     () => tasks.some((task) => !TERMINAL_STATES.includes(task.state)),
@@ -282,6 +312,18 @@ export function App() {
       setError(String(err));
     }
   };
+
+  /**
+   * 从任务历史直接跳到**那一次**的「过程重放」。
+   *
+   * ★ 两件事必须成对做：先选中那条任务（重放页看的是 `activeTask`），再切页签。
+   * 少了前一件，「过程重放」显示的会是上一次选中的那条——排查的时候，
+   * 那正好是**别人**的现场，而两张图都很像，不容易发现看错了。
+   */
+  const openReplay = useCallback((taskId: string) => {
+    setActiveId(taskId);
+    setTab("replay");
+  }, []);
 
   const handleDecision = async (approved: boolean, reason?: string) => {
     if (!confirmation) return;
@@ -372,6 +414,13 @@ export function App() {
         >
           轨迹自检
         </button>
+        <button
+          type="button"
+          className={tab === "replay" ? "tab is-active" : "tab"}
+          onClick={() => setTab("replay")}
+        >
+          过程重放
+        </button>
         {dirty && <span className="tab-dirty">有未保存的改动</span>}
       </nav>
 
@@ -451,6 +500,36 @@ export function App() {
                     </p>
                   </section>
                 )}
+
+                <section className="panel">
+                  <h2>任务信息</h2>
+                  <p className="field-hint">
+                    操作者：<strong>{activeTask.created_by || "（未填）"}</strong>
+                    {activeTask.external_contact_name
+                      ? ` · 联系人 ${activeTask.external_contact_name}`
+                      : ""}
+                  </p>
+                </section>
+
+                <section className="panel">
+                  <h2>过程日志</h2>
+                  {activeTask.log_path && (
+                    <p className="field-hint mono">{activeTask.log_path}</p>
+                  )}
+                  {activeTask.from_log && (
+                    <p className="notice notice-warn">
+                      这条来自磁盘日志（应用重启后内存历史会清空，日志文件仍保留）。
+                    </p>
+                  )}
+                  {taskLogError && (
+                    <p className="notice notice-error">{taskLogError}</p>
+                  )}
+                  {taskLog ? (
+                    <pre className="task-log mono">{taskLog}</pre>
+                  ) : (
+                    !taskLogError && <p className="muted-line">正在读取日志…</p>
+                  )}
+                </section>
               </>
             ) : (
               <section className="panel">
@@ -463,7 +542,12 @@ export function App() {
           </div>
 
           <div className="column">
-            <TaskHistory tasks={tasks} activeId={activeId} onSelect={setActiveId} />
+            <TaskHistory
+              tasks={tasks}
+              activeId={activeId}
+              onSelect={setActiveId}
+              onReplay={openReplay}
+            />
           </div>
         </main>
       )}
@@ -524,6 +608,14 @@ export function App() {
         <main className="app-grid is-single">
           <div className="column">
             <CursorMotionPanel busy={running} />
+          </div>
+        </main>
+      )}
+
+      {tab === "replay" && (
+        <main className="app-grid is-single">
+          <div className="column">
+            <TaskReplay task={activeTask} />
           </div>
         </main>
       )}

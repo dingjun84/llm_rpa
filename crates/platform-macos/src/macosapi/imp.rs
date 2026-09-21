@@ -18,8 +18,8 @@ use core_foundation::number::{CFNumberGetValue, CFNumberRef, kCFNumberFloat64Typ
 use core_foundation::string::{CFStringCreateWithCString, CFStringGetCString, CFStringRef, kCFStringEncodingUTF8};
 use core_graphics::display::{
     kCGNullWindowID, kCGWindowImageBoundsIgnoreFraming, kCGWindowListExcludeDesktopElements,
-    kCGWindowListOptionOnScreenOnly, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGMainDisplayID,
-    CGWindowListCopyWindowInfo, CGWindowListCreateImage,
+    kCGWindowListOptionOnScreenOnly, CGDisplayBounds, CGDisplayPixelsHigh, CGDisplayPixelsWide,
+    CGMainDisplayID, CGWindowListCopyWindowInfo, CGWindowListCreateImage,
 };
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
@@ -400,13 +400,40 @@ pub fn is_responsive(w: WindowRef) -> bool {
     path_for_pid(w.owner_pid).is_ok() && window_rect(w).is_ok()
 }
 
+/// 主屏尺寸（**逻辑点** / Cocoa points）。
+///
+/// 与 `CGWindowBounds`、`CGEvent` 全局坐标同一单位。Retina 上不能用
+/// `CGDisplayPixelsWide/High`（物理像素）做 Y 翻转，否则会偏约 scale 倍。
 pub fn primary_screen_size() -> (u32, u32) {
+    unsafe {
+        let bounds = CGDisplayBounds(CGMainDisplayID());
+        let w = bounds.size.width.round().max(0.0) as u32;
+        let h = bounds.size.height.round().max(0.0) as u32;
+        (w, h)
+    }
+}
+
+/// 主屏物理像素尺寸。截图像素缓冲等仍可能需要；鼠标坐标请用 [`primary_screen_size`]。
+pub fn primary_screen_pixel_size() -> (u32, u32) {
     unsafe {
         let id = CGMainDisplayID();
         (
             CGDisplayPixelsWide(id) as u32,
             CGDisplayPixelsHigh(id) as u32,
         )
+    }
+}
+
+fn accessibility_required_error() -> String {
+    "未授予「辅助功能」权限，系统会静默忽略鼠标移动与点击。请到「系统设置 → 隐私与安全性 → 辅助功能」中启用本应用；若还需要截屏/找窗口，请同时开启「屏幕录制」。"
+        .into()
+}
+
+fn ensure_accessibility() -> MacResult<()> {
+    if accessibility_trusted() {
+        Ok(())
+    } else {
+        Err(accessibility_required_error())
     }
 }
 
@@ -431,10 +458,124 @@ pub fn primary_scale_factor() -> f32 {
     }
 }
 
+/// AppKit 矩形（与 `NSScreen.frame` 同布局）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NsRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// 某点所在显示器的缩放（点坐标与 `kCGWindowBounds` 相同：主屏左上原点）。
+///
+/// ★ 标定与任务挑选必须用这个，不能用 [`primary_scale_factor`]：外接屏 1.0、内建 2.0 时
+/// 读主屏会把窗口记错档。找不到命中屏时退回主屏缩放。
+pub fn scale_factor_at_point(x: f64, y_top_left: f64) -> f32 {
+    unsafe {
+        let cls = match Class::get("NSScreen") {
+            Some(c) => c,
+            None => return primary_scale_factor(),
+        };
+        let main: *mut Object = msg_send![cls, mainScreen];
+        if main.is_null() {
+            return primary_scale_factor();
+        }
+        let main_frame: NsRect = msg_send![main, frame];
+        // CGWindowBounds 风格（左上）→ Cocoa（左下，原点在主屏左下）
+        let cocoa_y = main_frame.height - y_top_left;
+        let screens: *mut Object = msg_send![cls, screens];
+        if screens.is_null() {
+            return primary_scale_factor();
+        }
+        let count: usize = msg_send![screens, count];
+        for i in 0..count {
+            let screen: *mut Object = msg_send![screens, objectAtIndex: i];
+            if screen.is_null() {
+                continue;
+            }
+            let frame: NsRect = msg_send![screen, frame];
+            if x >= frame.x
+                && x < frame.x + frame.width
+                && cocoa_y >= frame.y
+                && cocoa_y < frame.y + frame.height
+            {
+                let scale: f64 = msg_send![screen, backingScaleFactor];
+                if scale.is_finite() && scale > 0.0 {
+                    return scale as f32;
+                }
+            }
+        }
+        primary_scale_factor()
+    }
+}
+
+/// 窗口矩形中心所在显示器的缩放。
+pub fn scale_factor_for_rect(rect: Rect) -> f32 {
+    let cx = rect.x as f64 + (rect.width as f64) * 0.5;
+    let cy = rect.y as f64 + (rect.height as f64) * 0.5;
+    scale_factor_at_point(cx, cy)
+}
+
+/// 窗口所在显示器的逻辑点尺寸 + 缩放（与 [`scale_factor_for_rect`] 同一套屏）。
+pub fn metrics_for_rect(rect: Rect) -> (u32, u32, f32) {
+    let cx = rect.x as f64 + (rect.width as f64) * 0.5;
+    let cy = rect.y as f64 + (rect.height as f64) * 0.5;
+    unsafe {
+        let cls = match Class::get("NSScreen") {
+            Some(c) => c,
+            None => {
+                let (w, h) = primary_screen_size();
+                return (w, h, primary_scale_factor());
+            }
+        };
+        let main: *mut Object = msg_send![cls, mainScreen];
+        if main.is_null() {
+            let (w, h) = primary_screen_size();
+            return (w, h, primary_scale_factor());
+        }
+        let main_frame: NsRect = msg_send![main, frame];
+        let cocoa_y = main_frame.height - cy;
+        let screens: *mut Object = msg_send![cls, screens];
+        if screens.is_null() {
+            let (w, h) = primary_screen_size();
+            return (w, h, primary_scale_factor());
+        }
+        let count: usize = msg_send![screens, count];
+        for i in 0..count {
+            let screen: *mut Object = msg_send![screens, objectAtIndex: i];
+            if screen.is_null() {
+                continue;
+            }
+            let frame: NsRect = msg_send![screen, frame];
+            if cx >= frame.x
+                && cx < frame.x + frame.width
+                && cocoa_y >= frame.y
+                && cocoa_y < frame.y + frame.height
+            {
+                let scale: f64 = msg_send![screen, backingScaleFactor];
+                let w = frame.width.round().max(0.0) as u32;
+                let h = frame.height.round().max(0.0) as u32;
+                let scale = if scale.is_finite() && scale > 0.0 {
+                    scale as f32
+                } else {
+                    primary_scale_factor()
+                };
+                return (w, h, scale);
+            }
+        }
+    }
+    let (w, h) = primary_screen_size();
+    (w, h, primary_scale_factor())
+}
+
 pub fn capture_region(region: Rect) -> MacResult<CapturedFrame> {
     if region.width <= 0 || region.height <= 0 {
         return Err("捕获区域尺寸无效".into());
     }
+    // 实测：本机用与 kCGWindowBounds 相同的左上原点矩形即可截到正确窗口内容。
+    // （文档写 Quartz 左下；若再翻转 Y，预览会与真窗口错位。）
     let rect = CGRect::new(
         &CGPoint::new(region.x as f64, region.y as f64),
         &CGSize::new(region.width as f64, region.height as f64),
@@ -517,30 +658,43 @@ pub fn cursor_position() -> MacResult<(i32, i32)> {
     let source = event_source()?;
     let event = CGEvent::new(source).map_err(|_| "无法读取光标位置".to_string())?;
     let loc = event.location();
-    let (_, screen_h) = primary_screen_size();
-    Ok((
-        loc.x.round() as i32,
-        (screen_h as f64 - loc.y).round() as i32,
-    ))
+    // 与 kCGWindowBounds 同一套：主屏左上为原点的全局坐标。
+    // 若再按「Quartz 左下」做一次 Y 翻转，相对轨迹自检仍能画圆（读写一致），
+    // 但按窗口矩形算出来的绝对目标会整体偏掉——正是「绿框对、鼠标偏」的症状。
+    Ok((loc.x.round() as i32, loc.y.round() as i32))
 }
 
 pub fn window_from_point(x: i32, y: i32) -> Option<WindowRef> {
-    // list_visible_windows 按 Z 序不保证；按面积从小到大优先命中最上层小窗不现实，
-    // 这里取第一个包含该点的窗口（列表大致从前到后）。
-    list_visible_windows()
-        .into_iter()
-        .find(|w| {
-            x >= w.rect.x
-                && y >= w.rect.y
-                && x < w.rect.x + w.rect.width
-                && y < w.rect.y + w.rect.height
-        })
-        .map(|w| as_ref(&w))
+    // 与 Windows `WindowFromPoint` 对齐：取光标下**最具体**的那扇窗，不要求先获焦。
+    // CGWindowList 的前后序在多屏/全屏场景下不可靠；包含该点的窗口里取**面积最小**的，
+    // 避免命中背后那块几乎铺满屏的大窗（用户感觉像「取到了最大的窗口」）。
+    let mut best: Option<WindowInfo> = None;
+    let mut best_area: i64 = i64::MAX;
+    for w in list_visible_windows() {
+        if !w.is_on_screen {
+            continue;
+        }
+        if x < w.rect.x
+            || y < w.rect.y
+            || x >= w.rect.x + w.rect.width
+            || y >= w.rect.y + w.rect.height
+        {
+            continue;
+        }
+        let area = (w.rect.width as i64).saturating_mul(w.rect.height as i64);
+        if area <= 0 {
+            continue;
+        }
+        if area < best_area {
+            best_area = area;
+            best = Some(w);
+        }
+    }
+    best.map(|w| as_ref(&w))
 }
 
 fn to_quartz_point(x: i32, y: i32) -> CGPoint {
-    let (_, screen_h) = primary_screen_size();
-    CGPoint::new(x as f64, screen_h as f64 - y as f64)
+    CGPoint::new(x as f64, y as f64)
 }
 
 fn event_source() -> MacResult<CGEventSource> {
@@ -550,18 +704,45 @@ fn event_source() -> MacResult<CGEventSource> {
 }
 
 pub fn move_cursor(x: i32, y: i32, speed_px_per_sec: f64) -> MacResult<()> {
-    let (sx, sy) = cursor_position()?;
-    let dx = (x - sx) as f64;
-    let dy = (y - sy) as f64;
-    let distance = (dx * dx + dy * dy).sqrt();
+    ensure_accessibility()?;
+    let (mut sx, mut sy) = cursor_position()?;
+    let mut dx = (x - sx) as f64;
+    let mut dy = (y - sy) as f64;
+    let mut distance = (dx * dx + dy * dy).sqrt();
+    // 人若在确认点击前挪开了鼠标，必须再滑回去；距离太近时也绕一下，
+    // 避免「瞬移」看起来像没动。
+    const MIN_VISIBLE: f64 = 56.0;
     if distance < 1.0 {
-        return warp_cursor(x, y);
+        // 已在目标上：先挪开再滑回，保证第二下「定位并点击」仍看得见轨迹。
+        let lift_x = sx + MIN_VISIBLE as i32;
+        let lift_y = sy;
+        warp_cursor(lift_x, lift_y)?;
+        std::thread::sleep(POINTER_STEP_INTERVAL);
+        sx = lift_x;
+        sy = lift_y;
+        dx = (x - sx) as f64;
+        dy = (y - sy) as f64;
+        distance = (dx * dx + dy * dy).sqrt();
+    } else if distance < MIN_VISIBLE {
+        let ux = dx / distance;
+        let uy = dy / distance;
+        let mid_x = (sx as f64 + ux * (distance * 0.5) - uy * (MIN_VISIBLE * 0.35)).round() as i32;
+        let mid_y = (sy as f64 + uy * (distance * 0.5) + ux * (MIN_VISIBLE * 0.35)).round() as i32;
+        warp_cursor(mid_x, mid_y)?;
+        std::thread::sleep(POINTER_STEP_INTERVAL);
+        sx = mid_x;
+        sy = mid_y;
+        dx = (x - sx) as f64;
+        dy = (y - sy) as f64;
+        distance = (dx * dx + dy * dy).sqrt().max(1.0);
     }
     let speed = speed_px_per_sec.max(1.0);
     let mut duration = Duration::from_secs_f64(distance / speed);
-    duration = duration.clamp(POINTER_MIN_DURATION, POINTER_MAX_DURATION);
-    let steps =
-        ((duration.as_secs_f64() / POINTER_STEP_INTERVAL.as_secs_f64()).ceil() as usize).max(1);
+    // 下限抬高：短距离也要看得出在滑。
+    let min_dur = POINTER_MIN_DURATION.max(Duration::from_millis(280));
+    duration = duration.clamp(min_dur, POINTER_MAX_DURATION);
+    let steps = ((duration.as_secs_f64() / POINTER_STEP_INTERVAL.as_secs_f64()).ceil() as usize)
+        .max(12);
     for i in 1..=steps {
         let t = i as f64 / steps as f64;
         warp_cursor(
@@ -582,10 +763,97 @@ fn warp_cursor(x: i32, y: i32) -> MacResult<()> {
         CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
             .map_err(|_| "创建鼠标移动事件失败".to_string())?;
     event.post(CGEventTapLocation::HID);
+    event.post(CGEventTapLocation::Session);
     Ok(())
 }
 
+
+const CIRCLE_MIN_DURATION: Duration = Duration::from_millis(400);
+const CIRCLE_MAX_DURATION: Duration = Duration::from_secs(8);
+const CIRCLE_MIN_STEPS: u32 = 24;
+const CIRCLE_EXTRA_TURNS: f64 = 0.25;
+
+/// 「画圆」自检结果：圆心 / 半径 / 步数 / 时长 / 实测终点。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CircleTrace {
+    pub center: (i32, i32),
+    pub radius: i32,
+    pub steps: u32,
+    pub duration: Duration,
+    pub end: (i32, i32),
+}
+
+impl CircleTrace {
+    pub fn end_distance_px(&self) -> i32 {
+        let dx = (self.end.0 - self.center.0) as f64;
+        let dy = (self.end.1 - self.center.1) as f64;
+        (dx * dx + dy * dy).sqrt().round() as i32
+    }
+}
+
+fn circle_points(center: (i32, i32), radius: i32, steps: u32, turns: f64) -> Vec<(i32, i32)> {
+    if steps == 0 {
+        return Vec::new();
+    }
+    let (cx, cy) = center;
+    let radius = radius as f64;
+    (1..=steps)
+        .map(|step| {
+            let angle = std::f64::consts::TAU * turns * step as f64 / steps as f64;
+            (
+                cx + (radius * angle.cos()).round() as i32,
+                cy + (radius * angle.sin()).round() as i32,
+            )
+        })
+        .collect()
+}
+
+/// 以当前坐标系（逻辑点、原点在主屏左上）走圆周，供「鼠标轨迹自检」使用。
+pub fn move_cursor_circle(
+    center: (i32, i32),
+    radius: i32,
+    speed_px_per_sec: f64,
+) -> MacResult<CircleTrace> {
+    ensure_accessibility()?;
+    if radius <= 0 {
+        return Err(format!("圆的半径必须是正数，收到 {radius}"));
+    }
+    if !speed_px_per_sec.is_finite() || speed_px_per_sec <= 0.0 {
+        return Err(format!("光标速度必须是正数，收到 {speed_px_per_sec}"));
+    }
+
+    let (cx, cy) = center;
+    move_cursor(cx + radius, cy, speed_px_per_sec)?;
+
+    let turns = 1.0 + CIRCLE_EXTRA_TURNS;
+    let path = std::f64::consts::TAU * radius as f64 * turns;
+    let duration = Duration::from_secs_f64(path / speed_px_per_sec)
+        .clamp(CIRCLE_MIN_DURATION, CIRCLE_MAX_DURATION);
+    let steps = ((duration.as_secs_f64() / POINTER_STEP_INTERVAL.as_secs_f64()).round() as u32)
+        .max(CIRCLE_MIN_STEPS);
+    let step_delay = duration / steps;
+
+    let points = circle_points(center, radius, steps, turns);
+    let last = points.len();
+    for (index, (x, y)) in points.into_iter().enumerate() {
+        warp_cursor(x, y)?;
+        if index + 1 < last {
+            std::thread::sleep(step_delay);
+        }
+    }
+
+    let end = cursor_position()?;
+    Ok(CircleTrace {
+        center,
+        radius,
+        steps,
+        duration,
+        end,
+    })
+}
+
 pub fn left_click() -> MacResult<()> {
+    ensure_accessibility()?;
     let source = event_source()?;
     let (x, y) = cursor_position()?;
     let point = to_quartz_point(x, y);
@@ -683,17 +951,34 @@ pub fn send_enter() -> MacResult<()> {
 }
 
 pub fn send_unicode_text(text: &str, interval: Duration) -> MacResult<()> {
-    // 逐字经剪贴板 + Cmd+V：比 CGEventKeyboardSetUnicodeString 更稳妥
-    // （后者在部分系统版本上对 CJK 不可靠），且仍能驱动联想式搜索框。
-    // 结束后清空剪贴板，不留下正文残留。
-    for ch in text.chars() {
-        set_clipboard_text(&ch.to_string())?;
-        send_cmd_v()?;
-        if !interval.is_zero() {
-            std::thread::sleep(interval);
+    // 逐字用 CGEventKeyboardSetUnicodeString 注入，直接追加进输入框。
+    //
+    // 以前走「每字写剪贴板 + Cmd+V」：联想式搜索框常会在粘贴后选中刚贴的字，
+    // 下一字再 Cmd+V 就变成**覆盖**而不是追加——看起来就像「只打进去一个字」。
+    // Unicode 键盘事件没有这个问题，也能驱动中文。
+    ensure_accessibility()?;
+    let source = event_source()?;
+    // 联想搜索框要一点间隔；配置里 0 时仍给一个下限，避免连发被客户端吞字。
+    let gap = if interval.is_zero() {
+        Duration::from_millis(40)
+    } else {
+        interval.max(Duration::from_millis(40))
+    };
+    let total = text.chars().count();
+    for (index, ch) in text.chars().enumerate() {
+        let unit = ch.to_string();
+        let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
+            .map_err(|_| format!("创建键盘按下事件失败（第 {} 字）", index + 1))?;
+        down.set_string(&unit);
+        down.post(CGEventTapLocation::HID);
+        let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
+            .map_err(|_| format!("创建键盘抬起事件失败（第 {} 字）", index + 1))?;
+        up.set_string(&unit);
+        up.post(CGEventTapLocation::HID);
+        if index + 1 < total {
+            std::thread::sleep(gap);
         }
     }
-    let _ = clear_clipboard();
     Ok(())
 }
 

@@ -139,7 +139,7 @@ export function WindowPicker({ disabled, onApply }: Props) {
         </span>
       ) : (
         <span className="field-hint">
-          点「指认窗口」，然后在 5 秒内把鼠标停在目标程序的主窗口上。
+          点「指认窗口」，然后在 5 秒内把鼠标停在目标程序的主窗口上（不必先点它获焦；取的是鼠标下最上层的窗）。
           只读取类名与所属程序路径，不点击、不聚焦、不产生任何输入。
         </span>
       )}

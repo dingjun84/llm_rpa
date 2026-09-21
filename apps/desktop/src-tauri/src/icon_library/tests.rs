@@ -129,9 +129,17 @@ fn the_default_directory_lives_under_the_data_dir() {
 fn a_configured_directory_wins_and_relative_paths_hang_off_the_working_dir() {
     let fallback = std::path::Path::new("Z:/fallback-data");
 
+    #[cfg(windows)]
+    let absolute = "  D:/somewhere/icons  ";
+    #[cfg(windows)]
+    let absolute_trimmed = PathBuf::from("D:/somewhere/icons");
+    #[cfg(not(windows))]
+    let absolute = "  /somewhere/icons  ";
+    #[cfg(not(windows))]
+    let absolute_trimmed = PathBuf::from("/somewhere/icons");
     assert_eq!(
-        resolve_dir(Some("  D:/somewhere/icons  "), fallback),
-        PathBuf::from("D:/somewhere/icons"),
+        resolve_dir(Some(absolute), fallback),
+        absolute_trimmed,
         "绝对路径原样用，两边的空白要去掉"
     );
     assert_eq!(

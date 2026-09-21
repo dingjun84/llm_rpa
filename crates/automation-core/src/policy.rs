@@ -7,9 +7,16 @@
 //! 本模块同时提供 [`ContainsNameMatcher`]——一个**临时的**放宽层
 //! （包含匹配即可），用于先把链路跑通。它**违反**上面那条架构约定，
 //! 存在理由、已知风险与后续优化方向都写在它自己的文档注释和 `docs/todo.md` 里。
+//!
+//! ⚠️ **判定体本身不在这里**，在子模块 [`trail`]：它必须**同时**产出结论与轨迹
+//! （每个候选过没过、为什么），而轨迹只能由判据自己给出（`CONVENTIONS.md` §1.3）。
+//! 这里剩下的两件事是：策略的文档与配置（别名表、最小间距），以及一个薄薄的转发。
+
+mod trail;
 
 use std::collections::BTreeMap;
 
+use crate::diagnostics::MatchTrail;
 use crate::ports::{AutomationError, ContactMatcher, Rect, TextBox};
 
 /// 默认拒绝阈值：两个候选框中心距离小于该像素数时视为无法区分。
@@ -62,53 +69,6 @@ impl StrictContactMatcher {
         }
         Ok(())
     }
-
-    /// 过滤出达到最低置信度的候选；全被滤掉时报错。
-    ///
-    /// 抽出来是因为放宽匹配要**复用同一套过滤**：否则两种模式对"低置信度候选"
-    /// 的处理会悄悄不一致，而 `winocr` 恒输出 `confidence = 1.0`，
-    /// 这种不一致在现场根本看不出来。
-    fn accepted<'a>(
-        &self,
-        candidates: &'a [TextBox],
-        min_confidence: f32,
-    ) -> Result<Vec<&'a TextBox>, AutomationError> {
-        let accepted: Vec<&TextBox> =
-            candidates.iter().filter(|c| c.confidence >= min_confidence).collect();
-        if accepted.is_empty() {
-            return Err(AutomationError::NeedsHumanReview(format!(
-                "该区域没有达到最低置信度 {min_confidence} 的文字候选"
-            )));
-        }
-        Ok(accepted)
-    }
-
-    /// 对**已经选定**的候选做最后两道检查：文字框尺寸是否可用、与其它候选是否近到无法区分。
-    ///
-    /// 两种匹配模式共用同一份实现——放宽的是"怎么算命中"，
-    /// **不是**"命中之后的安全检查"。
-    fn confirm(
-        &self,
-        matched: &TextBox,
-        accepted: &[&TextBox],
-    ) -> Result<TextBox, AutomationError> {
-        if matched.bounds.is_degenerate() {
-            return Err(AutomationError::AmbiguousVision(
-                "匹配到的联系人文字框尺寸无效".into(),
-            ));
-        }
-        let too_close = accepted.iter().any(|c| {
-            !std::ptr::eq(*c, matched)
-                && Self::centers_too_close(c.bounds, matched.bounds, self.min_separation_px)
-        });
-        if too_close {
-            return Err(AutomationError::AmbiguousVision(format!(
-                "「{}」附近存在过于接近的候选文字框，无法确定点击目标",
-                matched.text.trim()
-            )));
-        }
-        Ok(matched.clone())
-    }
 }
 
 impl ContactMatcher for StrictContactMatcher {
@@ -118,28 +78,16 @@ impl ContactMatcher for StrictContactMatcher {
         candidates: &[TextBox],
         min_confidence: f32,
     ) -> Result<TextBox, AutomationError> {
-        Self::ensure_name_present(expected_name)?;
+        trail::strict_judge(self, expected_name, candidates, min_confidence).0
+    }
 
-        let accepted = self.accepted(candidates, min_confidence)?;
-
-        let terms = self.accepted_terms(expected_name);
-        let matches: Vec<&TextBox> = accepted
-            .iter()
-            .copied()
-            .filter(|c| terms.iter().any(|t| Self::canonical(&c.text) == Self::canonical(t)))
-            .collect();
-
-        match matches.len() {
-            0 => Err(AutomationError::NeedsHumanReview(format!(
-                "未找到与「{}」逐字匹配的联系人",
-                expected_name.trim()
-            ))),
-            1 => self.confirm(matches[0], &accepted),
-            n => Err(AutomationError::AmbiguousVision(format!(
-                "存在 {n} 个与「{}」逐字匹配的联系人，拒绝猜测",
-                expected_name.trim()
-            ))),
-        }
+    fn find_unique_exact_match_with_trail(
+        &self,
+        expected_name: &str,
+        candidates: &[TextBox],
+        min_confidence: f32,
+    ) -> (Result<TextBox, AutomationError>, MatchTrail) {
+        trail::strict_judge(self, expected_name, candidates, min_confidence)
     }
 
     fn accepts(&self, expected_name: &str, candidate: &TextBox) -> bool {
@@ -173,8 +121,8 @@ impl ContactMatcher for StrictContactMatcher {
 ///    放宽只会让它更歧义，绝不会更确定。
 /// 3. 只有「一个都没匹配上」才退化到包含匹配。
 /// 4. 包含匹配命中多个时取**最短**的那个。依据（实测）：联系人姓名行只有姓名本身，
-///    而群消息预览行是「发送者：消息内容」，一定更长。实测「丁俊」同时出现在
-///    姓名行 `丁俊` 和群「美区搞钱」的预览行 `丁俊：可以了，登录进去了` 里，
+///    而群消息预览行是「发送者：消息内容」，一定更长。实测「李四」同时出现在
+///    姓名行 `李四` 和群「测试群一」的预览行 `李四：可以了，登录进去了` 里，
 ///    两条都在候选区中。
 /// 5. 最短的仍有并列（长度相同）⇒ 仍然按歧义拒绝，**不猜**。
 ///
@@ -203,44 +151,18 @@ impl ContactMatcher for ContainsNameMatcher {
         candidates: &[TextBox],
         min_confidence: f32,
     ) -> Result<TextBox, AutomationError> {
-        // **必须先查空名**：空名的 `contains("")` 恒为真，后面那一步会把
-        // 第一个候选当成命中。这一步不能省，也不能只靠内层去查——
-        // 内层的错误会被下面那句 `Err(_) => {}` 吞掉。
-        StrictContactMatcher::ensure_name_present(expected_name)?;
+        // 空名必须**先**查（`contains("")` 恒为真，会把第一个候选当成命中），
+        // 放宽与否的两条路都在 `trail` 里，判据与轨迹同源。
+        trail::contains_judge(self, expected_name, candidates, min_confidence).0
+    }
 
-        match self.strict.find_unique_exact_match(expected_name, candidates, min_confidence) {
-            Ok(found) => return Ok(found),
-            Err(err @ AutomationError::AmbiguousVision(_)) => return Err(err),
-            // 只有「一个都没匹配上 / 没有合格候选」才继续往下放宽。
-            Err(_) => {}
-        }
-
-        let name = expected_name.trim();
-        let accepted = self.strict.accepted(candidates, min_confidence)?;
-        let hits: Vec<&TextBox> =
-            accepted.iter().copied().filter(|c| c.text.contains(name)).collect();
-
-        match hits.len() {
-            0 => Err(AutomationError::NeedsHumanReview(format!(
-                "未找到名称包含「{name}」的联系人（已放宽为包含匹配）"
-            ))),
-            1 => self.strict.confirm(hits[0], &accepted),
-            _ => {
-                let shortest =
-                    hits.iter().map(|c| c.text.trim().chars().count()).min().unwrap_or(0);
-                let mut best =
-                    hits.iter().copied().filter(|c| c.text.trim().chars().count() == shortest);
-                let first = best.next().expect("hits 非空，最短的那个必然存在");
-                if best.next().is_some() {
-                    return Err(AutomationError::AmbiguousVision(format!(
-                        "有 {} 个候选都包含「{name}」，且其中最短的几个一样长（{shortest} 字），\
-                         无法确定点击目标",
-                        hits.len()
-                    )));
-                }
-                self.strict.confirm(first, &accepted)
-            }
-        }
+    fn find_unique_exact_match_with_trail(
+        &self,
+        expected_name: &str,
+        candidates: &[TextBox],
+        min_confidence: f32,
+    ) -> (Result<TextBox, AutomationError>, MatchTrail) {
+        trail::contains_judge(self, expected_name, candidates, min_confidence)
     }
 
     fn accepts(&self, expected_name: &str, candidate: &TextBox) -> bool {
@@ -352,18 +274,18 @@ mod tests {
         ContainsNameMatcher::default()
     }
 
-    /// 真实数据复现：OCR 把头像红点并进了姓名行，读出 `0 丁俊`。
+    /// 真实数据复现：OCR 把头像红点并进了姓名行，读出 `0 李四`。
     /// 严格匹配必然失败，放宽层要能认出来。
     #[test]
     fn contains_matching_finds_the_name_inside_a_noisy_block() {
         let strict = StrictContactMatcher::default();
-        let candidates = vec![tb("0 丁俊", 10, 10, 0.99)];
+        let candidates = vec![tb("0 李四", 10, 10, 0.99)];
         assert!(
-            strict.find_unique_exact_match("丁俊", &candidates, MIN).is_err(),
+            strict.find_unique_exact_match("李四", &candidates, MIN).is_err(),
             "严格模式本来就不该匹配上带噪声的文本"
         );
-        let found = lenient().find_unique_exact_match("丁俊", &candidates, MIN).unwrap();
-        assert_eq!(found.text, "0 丁俊");
+        let found = lenient().find_unique_exact_match("李四", &candidates, MIN).unwrap();
+        assert_eq!(found.text, "0 李四");
     }
 
     /// 命中多个时取**最短**的那个：姓名行只有姓名，群消息预览行是
@@ -371,11 +293,11 @@ mod tests {
     #[test]
     fn contains_matching_prefers_the_shorter_candidate() {
         let candidates = vec![
-            tb("丁俊", 10, 10, 0.99),
-            tb("丁俊：可以了，登录进去了", 10, 120, 0.99),
+            tb("李四", 10, 10, 0.99),
+            tb("李四：可以了，登录进去了", 10, 120, 0.99),
         ];
-        let found = lenient().find_unique_exact_match("丁俊", &candidates, MIN).unwrap();
-        assert_eq!(found.text, "丁俊", "应当选中较短的姓名行，而不是群消息预览行");
+        let found = lenient().find_unique_exact_match("李四", &candidates, MIN).unwrap();
+        assert_eq!(found.text, "李四", "应当选中较短的姓名行，而不是群消息预览行");
         assert_eq!(found.bounds.y, 10, "落点应当还在姓名那一行");
     }
 
@@ -383,16 +305,16 @@ mod tests {
     /// 不是"命中之后可以不看歧义"**。
     #[test]
     fn contains_matching_still_rejects_a_length_tie() {
-        let candidates = vec![tb("丁俊甲", 10, 10, 0.99), tb("丁俊乙", 10, 200, 0.99)];
-        let err = lenient().find_unique_exact_match("丁俊", &candidates, MIN).unwrap_err();
+        let candidates = vec![tb("李四甲", 10, 10, 0.99), tb("李四乙", 10, 200, 0.99)];
+        let err = lenient().find_unique_exact_match("李四", &candidates, MIN).unwrap_err();
         assert!(matches!(err, AutomationError::AmbiguousVision(_)), "实际：{err:?}");
     }
 
     /// 精确匹配报歧义时**不降级**：放宽只会让它更歧义，绝不会更确定。
     #[test]
     fn contains_matching_does_not_degrade_on_an_exact_ambiguity() {
-        let candidates = vec![tb("丁俊", 10, 10, 0.99), tb("丁俊", 10, 300, 0.99)];
-        let err = lenient().find_unique_exact_match("丁俊", &candidates, MIN).unwrap_err();
+        let candidates = vec![tb("李四", 10, 10, 0.99), tb("李四", 10, 300, 0.99)];
+        let err = lenient().find_unique_exact_match("李四", &candidates, MIN).unwrap_err();
         assert!(
             matches!(err, AutomationError::AmbiguousVision(_)),
             "两个逐字相同的联系人必须照旧拒绝，实际：{err:?}"
@@ -418,15 +340,15 @@ mod tests {
     #[test]
     fn contains_matching_still_fails_when_the_name_is_absent() {
         let candidates = vec![tb("张三", 10, 10, 0.99), tb("李四", 10, 200, 0.99)];
-        let err = lenient().find_unique_exact_match("丁俊", &candidates, MIN).unwrap_err();
+        let err = lenient().find_unique_exact_match("赵六", &candidates, MIN).unwrap_err();
         assert!(matches!(err, AutomationError::NeedsHumanReview(_)), "实际：{err:?}");
     }
 
     /// 低置信度候选在两种模式下都要被滤掉，且滤光之后报同一类错。
     #[test]
     fn contains_matching_filters_by_confidence_too() {
-        let candidates = vec![tb("丁俊", 10, 10, 0.40)];
-        let err = lenient().find_unique_exact_match("丁俊", &candidates, MIN).unwrap_err();
+        let candidates = vec![tb("李四", 10, 10, 0.40)];
+        let err = lenient().find_unique_exact_match("李四", &candidates, MIN).unwrap_err();
         assert!(matches!(err, AutomationError::NeedsHumanReview(_)), "实际：{err:?}");
     }
 

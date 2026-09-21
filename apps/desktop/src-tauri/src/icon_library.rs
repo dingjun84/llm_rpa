@@ -75,7 +75,7 @@ mod tests;
 mod write;
 
 pub use layout::{default_dir, ensure_dir, resolve_dir};
-pub use read::{list, resolve_selection};
+pub use read::{list, resolve_selection, variants_of};
 pub use write::{delete, delete_variant, save};
 
 use std::path::PathBuf;

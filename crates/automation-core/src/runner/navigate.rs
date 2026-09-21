@@ -95,7 +95,24 @@ impl Run<'_> {
             &IconQuery::new(templates, min_score).with_prior(prior),
         )?;
 
-        let hit_screen = found.bounds.to_screen(Point { x: strip.x, y: strip.y });
+        // `frame` 在 macOS Retina 上可能是物理像素，而 `strip` 是屏幕逻辑点。
+        // 命中框要先按帧尺寸相对搜索区比例，再加回搜索区原点。
+        let scale_x = if strip.width > 0 {
+            frame.width as f32 / strip.width as f32
+        } else {
+            1.0
+        };
+        let scale_y = if strip.height > 0 {
+            frame.height as f32 / strip.height as f32
+        } else {
+            1.0
+        };
+        let hit_screen = Rect {
+            x: strip.x + (found.bounds.x as f32 / scale_x).round() as i32,
+            y: strip.y + (found.bounds.y as f32 / scale_y).round() as i32,
+            width: (found.bounds.width as f32 / scale_x).round() as i32,
+            height: (found.bounds.height as f32 / scale_y).round() as i32,
+        };
         let target = hit_screen.center();
         // 记下"点的是哪儿、分数多少"。图标匹配不像文字识别那样有天然的可读结果，
         // 这一行是事后唯一能回答"它到底认成了什么"的地方。
@@ -122,6 +139,8 @@ impl Run<'_> {
         ));
 
         self.ensure_not_frozen("已取消切换视图")?;
+        // 先滑到命中点（不点）：任务若在标定校验处失败，操作者仍能看见认到的位置。
+        self.runner.ports.platform.move_pointer(target)?;
         let expected_window = self.ensure_calibrated()?;
         self.runner
             .ports

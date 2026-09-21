@@ -22,7 +22,7 @@ fn variant_order(stem: &str) -> (u8, u32, String) {
 }
 
 /// 一个名字下的全部变体。旧式单文件排在最前（它是最早那张）。
-pub(super) fn variants_of(icons_dir: &Path, name: &str) -> Vec<IconVariant> {
+pub fn variants_of(icons_dir: &Path, name: &str) -> Vec<IconVariant> {
     let mut found: Vec<PathBuf> = Vec::new();
 
     let legacy = legacy_file(icons_dir, name);

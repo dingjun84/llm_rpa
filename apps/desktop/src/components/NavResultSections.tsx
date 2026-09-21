@@ -1,4 +1,4 @@
-import type { IconClickResult, NavIconHit, NavIconProbe, Rect } from "../types";
+import type { IconClickResult, NavIconHit, NavIconProbe, NavIconScore, Rect } from "../types";
 
 interface Props {
   /** 「测试匹配」的结果。`null` = 还没测过。 */
@@ -9,7 +9,7 @@ interface Props {
   click: IconClickResult | null;
 }
 
-/** 只读的结果预览：整窗画面 + 搜索区（蓝虚线）+ 命中框（绿/红）+ 点击点。 */
+/** 只读的结果预览：整窗画面 + 搜索区（蓝虚线）+ 命中框（绿/红）+ 分数标签 + 点击点。 */
 function ShotOverlay({
   image,
   width,
@@ -25,6 +25,7 @@ function ShotOverlay({
   hit?: NavIconHit | null;
   clicked?: { x: number; y: number } | null;
 }) {
+  const labelY = hit ? Math.max(12, hit.y - 4) : 0;
   return (
     <div className="shot-wrap">
       <img className="shot-image" src={image} alt="目标窗口画面" draggable={false} />
@@ -46,14 +47,24 @@ function ShotOverlay({
           />
         )}
         {hit && (
-          <rect
-            className={hit.accepted ? "shot-hit" : "shot-hit is-low"}
-            x={hit.x}
-            y={hit.y}
-            width={hit.width}
-            height={hit.height}
-            vectorEffect="non-scaling-stroke"
-          />
+          <>
+            <rect
+              className={hit.accepted ? "shot-hit" : "shot-hit is-low"}
+              x={hit.x}
+              y={hit.y}
+              width={hit.width}
+              height={hit.height}
+              vectorEffect="non-scaling-stroke"
+            />
+            <text
+              className={hit.accepted ? "shot-score" : "shot-score is-low"}
+              x={hit.x}
+              y={labelY}
+              vectorEffect="non-scaling-stroke"
+            >
+              {hit.score.toFixed(3)}
+            </text>
+          </>
         )}
         {clicked && (
           <circle
@@ -65,6 +76,40 @@ function ShotOverlay({
           />
         )}
       </svg>
+    </div>
+  );
+}
+
+function ScoreTable({ scores }: { scores: NavIconScore[] }) {
+  if (!scores.length) return null;
+  return (
+    <div className="score-table-wrap">
+      <table className="score-table">
+        <thead>
+          <tr>
+            <th>模板</th>
+            <th>分数</th>
+            <th>相对阈值</th>
+          </tr>
+        </thead>
+        <tbody>
+          {scores.map((row) => (
+            <tr key={row.template} className={row.accepted ? "is-ok" : "is-low"}>
+              <td>{row.template}</td>
+              <td className="score-num">
+                {row.score < 0 ? "—" : row.score.toFixed(3)}
+              </td>
+              <td>
+                {row.score < 0
+                  ? "放不进搜索区"
+                  : row.accepted
+                    ? "已过阈值"
+                    : "未过阈值"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -94,9 +139,19 @@ export function NavResultSections({ probe, probingLabel, click }: Props) {
           <div className="calibration-head">
             <h3>匹配结果{probingLabel ? `（${probingLabel}）` : ""}</h3>
           </div>
+          {probe.hit ? (
+            <p className={probe.hit.accepted ? "notice score-banner" : "notice notice-warn score-banner"}>
+              最高分 <strong>{probe.hit.score.toFixed(3)}</strong>
+              {" · "}模板「{probe.hit.template}」
+              {probe.hit.accepted ? " · 已过阈值" : " · 未过阈值"}
+            </p>
+          ) : (
+            <p className="notice notice-warn score-banner">没有可用命中</p>
+          )}
           <p className={probe.hit?.accepted ? "notice" : "notice notice-warn"}>
             {probe.notice}
           </p>
+          <ScoreTable scores={probe.scores ?? []} />
           <ShotOverlay
             image={probe.image}
             width={probe.width}
@@ -105,7 +160,8 @@ export function NavResultSections({ probe, probingLabel, click }: Props) {
             hit={probe.hit}
           />
           <span className="field-hint">
-            蓝虚线 = 搜索区，{probe.hit?.accepted ? "绿" : "红"}实线 = 匹配到的位置。
+            蓝虚线 = 搜索区，{probe.hit?.accepted ? "绿" : "红"}实线 = 匹配到的位置，
+            框旁数字 = 该命中分数。
             <strong>红框也要看</strong>——它标的是「它认为最像的地方」，
             那个位置对不对才是判断模板对不对的依据。框住的不是那个图标，
             就说明模板截错了、或者搜索区没盖住它。
@@ -118,6 +174,12 @@ export function NavResultSections({ probe, probingLabel, click }: Props) {
           <div className="calibration-head">
             <h3>点击结果</h3>
           </div>
+          {click.hit && (
+            <p className={click.hit.accepted ? "notice score-banner" : "notice notice-warn score-banner"}>
+              点击时分数 <strong>{click.hit.score.toFixed(3)}</strong>
+              {" · "}模板「{click.hit.template}」
+            </p>
+          )}
           <p className={click.changed ? "notice" : "notice notice-warn"}>
             {click.notice}
           </p>

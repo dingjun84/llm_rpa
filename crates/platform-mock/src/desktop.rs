@@ -316,7 +316,12 @@ impl DesktopPlatform for MockDesktop {
         Ok(())
     }
 
-    fn scroll(
+        fn move_pointer(&self, target: Point) -> Result<(), AutomationError> {
+        let _ = target;
+        Ok(())
+    }
+
+fn scroll(
         &self,
         at: Point,
         notches: i32,

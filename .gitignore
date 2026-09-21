@@ -43,6 +43,9 @@ pnpm-debug.log*
 **/gen/schemas/
 
 # ---------- 运行期数据：审计库 / 证据截图 / 日志 ----------
+# ★★ `/data/` 下的 `tasks/<任务ID>/` 是**真实界面截图**：截的是真机上的微信界面，
+# 里面有联系人的**真实姓名**与聊天片段。它只用于本机排查（`docs/todo.md` T29/T30），
+# 任何情况下都不许入库；现场收编成的用例（`data/cases/`）也在这里，同样永不入库。
 *.db
 *.db-journal
 *.db-wal
@@ -53,6 +56,19 @@ pnpm-debug.log*
 /evidence/
 /logs/
 *.log
+
+# ---------- 防手滑：现场素材不许进仓库 ----------
+# 规矩写在文档里靠自觉，写在这儿是**机器执行**的。截图只应该出现在 /data/ 下，
+# 谁要是把它拷进 fixtures 当测试素材，`git status` 里直接看不见它。
+# ⚠️ 只拦图片：`tests/fixtures/` 下的 `events.jsonl` 是**人工造的假场景**，
+#    那是要入库的回归用例（里面不该有真实姓名）。
+**/fixtures/**/*.png
+**/cases/
+
+# `datasets/` 下是**真机微信 / 企业微信的截图**（`chat_ui_yolo_demo/images/` 与
+# `crop_samples/` 的裁图里带着真实群名、姓名与聊天预览），与 `/data/` 同一条红线：
+# 只在本机用，任何情况下都不许进版本库。
+/datasets/
 
 # mem-diag 每次跑都生成一份带时间戳的报告，不进版本库
 tools/mem-diag-*.txt
@@ -75,3 +91,4 @@ desktop.ini
 
 # ---------- 本地 AI 工具链数据（非项目源码）----------
 .workbuddy-ai/
+.workbuddy/

@@ -382,6 +382,31 @@ button.ghost {
   display: block;
 }
 
+/* 一条任务里「选中」那一下的正文区。
+   外面那层 `.history-item` 是容器（一条任务上有两个动作），所以这里把
+   按钮自带的底色/边框/内边距全部退掉，看上去仍是原来那张卡片。 */
+.history-main {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  color: inherit;
+}
+
+.history-foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.history-replay {
+  font-size: 11px;
+  padding: 4px 10px;
+}
+
 .history-item.is-active {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px #2f6feb22;
@@ -1020,4 +1045,262 @@ button.ghost {
 button.danger {
   background: var(--bad);
   color: #fff;
+}
+
+
+/* 图标匹配分数展示 */
+.score-banner {
+  font-size: 1.05rem;
+}
+.score-banner strong {
+  font-size: 1.35rem;
+  font-variant-numeric: tabular-nums;
+}
+.score-table-wrap {
+  margin: 8px 0 12px;
+  overflow-x: auto;
+}
+.score-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+.score-table th,
+.score-table td {
+  border: 1px solid #d0d7de;
+  padding: 6px 10px;
+  text-align: left;
+}
+.score-table th {
+  background: #f6f8fa;
+}
+.score-table .score-num {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.score-table tr.is-ok td {
+  background: #e8f8ef;
+}
+.score-table tr.is-low td {
+  background: #fff5f5;
+}
+.shot-score {
+  fill: #1a7f37;
+  font-size: 14px;
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: #fff;
+  stroke-width: 3px;
+}
+.shot-score.is-low {
+  fill: #cf222e;
+}
+
+
+.task-log {
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #0f172a0d;
+  border: 1px solid #00000014;
+  margin: 0;
+}
+
+/* ── 过程重放 ──────────────────────────────────────────────────────── */
+
+/* 「材料目录：…」那一行 + 「打开任务目录」按钮。路径是一串 UUID，
+   会和按钮挤在一起，所以在窄窗口里允许换行。 */
+.replay-material {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.replay-material button {
+  font-size: 12px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+
+/* 步骤选择条。每个步骤一格，格子里带「过了 / 没过 / 只看了图」。 */
+.replay-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 16px;
+}
+
+.replay-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.replay-step.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px #2f6feb22;
+  color: var(--text);
+}
+
+.replay-step-no {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.replay-step-label {
+  font-weight: 600;
+}
+
+/* 记号：过了 / 没过 / 只看了图。
+   「只看了图」用中性灰而不是绿色——那一步**根本没判过**，
+   显示成通过会让人以为它也判了一遍。 */
+.step-mark {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.step-mark.is-ok {
+  background: #e8f6ee;
+  color: var(--ok);
+}
+
+.step-mark.is-bad {
+  background: #fef3f2;
+  color: var(--bad);
+}
+
+.step-mark.is-none {
+  background: #f1f2f4;
+  color: var(--muted);
+}
+
+/* 左图右表，各占一半：图回答"看到了什么"，表回答"为什么这么判"。
+   两者必须同时看得见——只给图，看不出判定；只给表，对不上画面。 */
+.replay-body {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(360px, 1.1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 1180px) {
+  .replay-body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.replay-image img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+/* 图下面那几行事实（时间、区域、帧尺寸、块数、相对路径）。 */
+.replay-image .field-hint {
+  margin: 6px 0 0;
+}
+
+.replay-detail {
+  min-width: 0;
+}
+
+/* 结论。未通过用报错红——这一整页存在的理由就是看清那一步为什么没过。 */
+.replay-outcome {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.replay-outcome.is-ok {
+  color: var(--ok);
+}
+
+.replay-outcome.is-bad {
+  color: var(--bad);
+}
+
+.replay-candidates-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 4px 0 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.replay-candidates-head input {
+  width: auto;
+  flex: 0 1 220px;
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+/* 候选淘汰表。四列固定宽度：文字与理由长短悬殊，
+   交给浏览器自动分配的话，"为什么"那一列会被一行长文字挤扁。 */
+.candidate-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  table-layout: fixed;
+}
+
+.candidate-table th,
+.candidate-table td {
+  border: 1px solid var(--border);
+  padding: 5px 8px;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.candidate-table th {
+  background: #f6f8fa;
+  font-weight: 600;
+}
+
+.candidate-table th:nth-child(1) {
+  width: 26%;
+}
+
+.candidate-table th:nth-child(2) {
+  width: 12%;
+}
+
+.candidate-table th:nth-child(3) {
+  width: 10%;
+}
+
+.candidate-table th:nth-child(4) {
+  width: 52%;
+}
+
+/* 通过了的那一行加底色：整张表扫下来，一眼能看出它挑中的是哪一行。 */
+.candidate-table tr.is-passed td {
+  background: #f3faf6;
+}
+
+/* 「为什么」那一列是这张表存在的理由，用正文色，不用灰。 */
+.candidate-reason {
+  color: var(--text);
 }

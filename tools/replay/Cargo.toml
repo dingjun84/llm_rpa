@@ -1,0 +1,21 @@
+[package]
+name = "replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "离线重放过程诊断事件流：拿盘上记下的那一帧重跑判据，回答「它为什么这么判」"
+
+[lib]
+name = "replay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "replay"
+path = "src/main.rs"
+
+[dependencies]
+automation-core = { path = "../../crates/automation-core" }
+# 真 OCR 模式要起本机引擎：引擎的调用与 stdout 解析只有 `vision` 一处实现，
+# 自己再写一套会让"两次读数"的差异里混进"两个解析器的差异"。
+vision = { path = "../../crates/vision" }
+serde_json.workspace = true

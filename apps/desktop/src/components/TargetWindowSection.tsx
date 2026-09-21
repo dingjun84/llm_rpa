@@ -1,8 +1,7 @@
 import { useState } from "react";
 
-import { launchClient, recordWindowGeometry } from "../api";
-import type { PickedWindow, RuntimeConfig } from "../types";
-import { WindowPicker } from "./WindowPicker";
+import { launchClient } from "../api";
+import type { RuntimeConfig } from "../types";
 
 interface Props {
   draft: RuntimeConfig;
@@ -11,42 +10,24 @@ interface Props {
 }
 
 /**
- * 「目标窗口」这一组：指认窗口、可执行文件路径与哈希、启动客户端、窗口类名、
- * 标定窗口尺寸、本地 OCR 程序路径。
+ * 「目标窗口」这一组：可执行文件路径与哈希、启动客户端、窗口类名、
+ * 本地 OCR 程序路径（窗口尺寸改在「界面标定」页按缩放分别记录）。
  *
  * ## 为什么单独成文件
  *
  * 这一组是**只读的准备工作**（指认、量尺寸、看路径都不点击、不输入、不发送），
- * 与运行模式无关，演练模式下也能随时做。它自带的两个异步动作
- * （启动客户端 / 记录窗口尺寸）各自有一份"进行中 + 结果提示"的局部状态，
- * 这些状态与面板上其它表单没有任何关系，放在一起只会让两边都难读。
+ * 与运行模式无关，演练模式下也能随时做。「启动客户端」的进行中状态
+ * 与面板上其它表单无关，单独放在这里更清晰。
  *
- * ★ 它是**配置**：改完必须点「保存配置」才生效（`calibrated_window` 尤其如此）。
+ * ★ 它是**配置**：改完必须点「保存配置」才生效。
  */
 export function TargetWindowSection({ draft, onPatch, busy }: Props) {
   /** 「启动客户端」的结果提示（成功或失败）。 */
   const [launchNotice, setLaunchNotice] = useState<string | null>(null);
   const [launching, setLaunching] = useState(false);
-  /** 「记录窗口尺寸」的结果提示（成功或失败）。 */
-  const [measureNotice, setMeasureNotice] = useState<string | null>(null);
-  const [measuring, setMeasuring] = useState(false);
-
   // 改草稿的字段。本地适配器——只为让下面的调用点短一点，判据不在这里。
   const update = <K extends keyof RuntimeConfig>(key: K, value: RuntimeConfig[K]) => {
     onPatch({ [key]: value } as Partial<RuntimeConfig>);
-  };
-
-  /**
-   * 指认窗口后的回填。
-   *
-   * 类名一定回填（那是匹配的主要依据）；可执行文件路径**只在读到时才覆盖**——
-   * 有些窗口（权限受限的系统进程）读不出路径，直接写 null 会把已有配置抹掉。
-   */
-  const applyPickedWindow = (picked: PickedWindow) => {
-    onPatch({
-      window_class: picked.class_name,
-      wecom_exe: picked.exe_path ?? draft.wecom_exe,
-    });
   };
 
   const startClient = async () => {
@@ -65,23 +46,6 @@ export function TargetWindowSection({ draft, onPatch, busy }: Props) {
     }
   };
 
-  const measureWindow = async () => {
-    setMeasuring(true);
-    setMeasureNotice(null);
-    try {
-      const geometry = await recordWindowGeometry(draft.window_class, draft.wecom_exe);
-      onPatch({ calibrated_window: geometry });
-      setMeasureNotice(
-        `已记录 ${geometry.width}×${geometry.height} @(${geometry.x}, ${geometry.y})，` +
-          `缩放 ${geometry.scale_factor}。还要点最下面的「保存配置」才会生效。`,
-      );
-    } catch (err) {
-      setMeasureNotice(`记录失败：${String(err)}`);
-    } finally {
-      setMeasuring(false);
-    }
-  };
-
   return (
     /* 下面这一组是**配置**，刻意不放在「模式」分支里。
         指认窗口与区域标定都是只读操作（不点击、不输入、不发送），
@@ -92,18 +56,16 @@ export function TargetWindowSection({ draft, onPatch, busy }: Props) {
         <h3>目标窗口</h3>
       </div>
       <p className="field-hint">
-        标定跟运行模式无关：这里只读地看一眼目标窗口，不会点击、不会输入、不会发送，
-        所以演练模式下也可以随时做。
+        指认窗口已挪到「界面标定」页（按鼠标下最上层窗取，不必先获焦）。
+        这里只保留路径、类名、启动与 OCR——改完仍要点「保存配置」。
       </p>
-
-      <WindowPicker disabled={busy} onApply={applyPickedWindow} />
 
       <label className="field">
         <span className="field-label">目标程序可执行文件路径</span>
         <input
           type="text"
           value={draft.wecom_exe ?? ""}
-          placeholder="点「指认窗口」可自动填入"
+          placeholder="在「界面标定」页点「指认窗口」可自动填入"
           onChange={(event) => update("wecom_exe", event.target.value || null)}
         />
         <span className="field-hint">
@@ -151,37 +113,15 @@ export function TargetWindowSection({ draft, onPatch, busy }: Props) {
         />
         <span className="field-hint">
           定位目标窗口按类名匹配；填了上面的可执行文件路径时，会同时校验窗口属于该程序。
-          点「指认窗口」会自动填入。「界面标定」页截图用的也是这个值，
+          在「界面标定」页点「指认窗口」会自动填入。截图用的也是这个值，
           改完不用保存就能直接切过去截图看效果。
         </span>
       </label>
 
-      <div className="field">
-        <span className="field-label">标定窗口尺寸</span>
-        <div className="calibration-actions">
-          <button
-            type="button"
-            disabled={busy || measuring || !draft.window_class.trim()}
-            onClick={measureWindow}
-          >
-            {measuring ? "读取中…" : "记录窗口尺寸"}
-          </button>
-        </div>
-        {draft.calibrated_window ? (
-          <span className="field-hint">
-            已记录 <strong>{draft.calibrated_window.width}×{draft.calibrated_window.height}</strong>
-            {" "}@({draft.calibrated_window.x}, {draft.calibrated_window.y})，缩放{" "}
-            {draft.calibrated_window.scale_factor}。任务只在<strong>这个尺寸</strong>下运行：
-            尺寸对不上会先把窗口调回这个尺寸，调不动才转人工；位置不校验，窗口挪到哪儿都行。
-          </span>
-        ) : (
-          <span className="field-hint">
-            还没有记录。真实模式必须先点这个按钮——任务只在标定时的窗口尺寸下运行：
-            尺寸对不上会先把窗口调回来，客户端的最小尺寸不允许时才会转人工。
-          </span>
-        )}
-        {measureNotice && <p className="notice">{measureNotice}</p>}
-      </div>
+      <p className="field-hint">
+        窗口尺寸与区域框已挪到「界面标定」页，并按<strong>显示器缩放</strong>各存一份。
+        任务开跑时按当前缩放自动挑选对应那份——缩放对不上会直接拒绝，不会拿错份去点。
+      </p>
 
       <label className="field">
         <span className="field-label">本地 OCR 程序路径</span>

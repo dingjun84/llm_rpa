@@ -34,7 +34,10 @@
 //! （窗口的左侧 7.5% 宽、整高）与 26×26 的模板为例：约 3.4 万个位置 ×
 //! 676 像素 × 3 通道 ≈ 7000 万次乘加，debug 构建下是**几百毫秒**量级。
 //!
-//! 这里刻意**不做**近似加速（抽稀采样、先粗后精、子集预筛）：它们的共同代价是
+//! 默认单尺度 NCC。多尺度金字塔（[`TEMPLATE_SCALE_PYRAMID`]）仍保留在库里供实验，
+//! 但不挂进主路径——Retina 全分辨率下七档会把「测试匹配」拖到秒级以上。
+//!
+//! 这里刻意**不做**抽稀采样 / 先粗后精 / 子集预筛：它们的共同代价是
 //! "某些位置永远不会被认真比一遍"，而这类漏检**不会报错**，只会表现为
 //! "分数不高，转人工"——那时人只会去调阈值，找不到真原因。
 //!
@@ -476,6 +479,111 @@ fn position_score(
     } else {
         Some(total / usable as f64)
     }
+}
+
+/// 模板相对搜索区的缩放档（窄金字塔）。
+///
+/// 覆盖 Retina / 轻微 UI 缩放差。档位固定且窄：每档都会完整扫搜索区，
+/// 不是先粗后精的近似。
+pub const TEMPLATE_SCALE_PYRAMID: &[f32] = &[
+    0.85, 0.90, 0.95, 1.0, 1.05, 1.10, 1.15,
+];
+
+/// 把模板双线性缩放到 `scale` 倍。越界尺寸直接丢弃。
+fn scale_icon_template(template: &IconTemplate, scale: f32) -> Option<IconTemplate> {
+    if (scale - 1.0).abs() < 1e-4 {
+        return Some(template.clone());
+    }
+    let width = ((template.width as f32) * scale).round() as u32;
+    let height = ((template.height as f32) * scale).round() as u32;
+    if width < MIN_TEMPLATE_SIDE
+        || height < MIN_TEMPLATE_SIDE
+        || width > MAX_TEMPLATE_SIDE
+        || height > MAX_TEMPLATE_SIDE
+    {
+        return None;
+    }
+    // BGRA → RGBA，走 `image` 的缩放，再转回 BGRA。
+    let mut rgba = Vec::with_capacity(template.pixels.len());
+    for px in template.pixels.chunks_exact(4) {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    let src = image::RgbaImage::from_raw(template.width, template.height, rgba)?;
+    let resized = image::imageops::resize(
+        &src,
+        width,
+        height,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut pixels = resized.into_raw();
+    for px in pixels.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    Some(IconTemplate {
+        label: template.label.clone(),
+        pixels,
+        width,
+        height,
+    })
+}
+
+/// 在金字塔各档上跑 [`best_match`]，取最高分。
+fn best_match_pyramid(hay: &[Plane], template: &IconTemplate) -> Option<(Rect, f32)> {
+    let mut best: Option<(Rect, f32)> = None;
+    for &scale in TEMPLATE_SCALE_PYRAMID {
+        let Some(scaled) = scale_icon_template(template, scale) else {
+            continue;
+        };
+        let Ok(needle) = planes_from_bgra(&scaled.pixels, scaled.width, scaled.height) else {
+            continue;
+        };
+        let Some((bounds, score)) = best_match(hay, &needle) else {
+            continue;
+        };
+        if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+            best = Some((bounds, score));
+        }
+    }
+    best
+}
+
+/// 同 [`best_match_pyramid`]，额外带回胜出那档的 [`Prepared`]（给位置先验用）。
+fn best_match_pyramid_prepared(
+    hay: &[Plane],
+    template: &IconTemplate,
+) -> Option<(Rect, f32, Prepared)> {
+    let mut best: Option<(Rect, f32, Prepared)> = None;
+    for &scale in TEMPLATE_SCALE_PYRAMID {
+        let Some(scaled) = scale_icon_template(template, scale) else {
+            continue;
+        };
+        let Ok(needle) = planes_from_bgra(&scaled.pixels, scaled.width, scaled.height) else {
+            continue;
+        };
+        let Some(prepared) = prepare(hay, &needle) else {
+            continue;
+        };
+        let rows = hay[0].height - prepared.height + 1;
+        let Some(found) = scan_rows_parallel(
+            rows,
+            |range| scan_rows(hay, &prepared, range),
+            |current, candidate| {
+                if is_better(current, candidate.2, candidate.0, candidate.1) {
+                    Some(candidate)
+                } else {
+                    current
+                }
+            },
+        ) else {
+            continue;
+        };
+        let score = found.2 as f32;
+        let bounds = hit_rect(found.0, found.1, &prepared);
+        if best.as_ref().map(|(_, s, _)| score > *s).unwrap_or(true) {
+            best = Some((bounds, score, prepared));
+        }
+    }
+    best
 }
 
 /// 在一帧截图里找一张模板；返回图像坐标系下的最佳位置与分数。

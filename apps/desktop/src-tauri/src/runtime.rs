@@ -27,12 +27,14 @@ use crate::calibration;
 
 mod mode;
 mod requirements;
+mod calibrations;
 
 // ★ 再导出：这几块搬进了 `mode.rs` / `requirements.rs`，但
 // `crate::runtime::X` 这条路径必须照旧成立——`lib.rs` 与 `runtime/tests.rs`
 // 都按它引用（`use crate::runtime::{RunChoice, RuntimeMode, …}`）。
 // 少这几行，症状是一堆 `E0432: unresolved import`，看着像"文件没编进去"。
 pub use mode::{DemoScenario, ModeNotices, RuntimeMode};
+pub use calibrations::CalibrationSnapshot;
 pub use requirements::{
     workflow_inputs, workflow_requirements, MarkRequirement, WorkflowInputs, WorkflowRequirement,
 };
@@ -171,6 +173,14 @@ pub struct RuntimeConfig {
     /// 客户端的最小尺寸不允许时才会转人工——绝不按错的尺寸去点。
     /// 真实模式下这一项必须有值（[`build_runner`] 会拦），演练模式下用不上。
     pub calibrated_window: Option<WindowGeometry>,
+    /// 按显示器缩放保存的多份界面标定（窗口尺寸 + 区域 + 导航搜索区 + 滚动落点）。
+    ///
+    /// 真实模式装配时按**当前**缩放挑一份；没有匹配的就拒绝开跑。
+    /// 顶层的 `calibrated_window` / `regions` / `area_marks` / `nav_strip` / `scroll_anchor`
+    /// 是「界面标定」页正在编辑的工作副本；保存时会 upsert 进这里。
+    /// 旧配置只有顶层字段时，加载/保存时会自动迁成一份。
+    #[serde(default)]
+    pub calibrations: Vec<CalibrationSnapshot>,
     /// 联系人列表最多**完整**扫描几轮（每轮 = 从列表顶部向下扫到底）。
     ///
     /// 列表按"最近有消息"排序，扫描期间到达的新消息会把目标顶到最上面，
@@ -239,6 +249,12 @@ pub struct RuntimeConfig {
     /// 不要指望程序自动裁一个：程序猜出来的模板会把"点错了地方"变成一次
     /// 看起来完全正常的运行——匹配分数照样很高，因为它匹配的是它自己刚裁的那块。
     pub nav_icon_templates: Vec<String>,
+    /// 「用于对话历史导航」勾上的图标名（常见「聊天」）。
+    ///
+    /// 列表扫描式在扫会话列表之前，要先点它把视图切到聊天历史页。
+    /// 与 [`Self::nav_icon_templates`]（通讯录 / 联系人）是两套，不要混。
+    #[serde(default)]
+    pub chat_history_nav_templates: Vec<String>,
     /// 图标库目录。**留空 = 用默认**（项目根下的 `data/icons/`）。
     ///
     /// 默认放在项目里而不是 AppData：AppData 底下那层目录名是包标识符，
@@ -306,10 +322,10 @@ pub struct RuntimeConfig {
     /// （本机靶标是微信 4.x，`window_class` 默认值也是为它改过的）。
     /// 写死的话，症状是"资料页滚到底了却找不到入口"——看不出是文字对不上。
     pub profile_chat_entry_text: String,
-    /// 搜索下拉里"联系人"那一组的标题文字（默认「联系人」）。
+    /// 搜索下拉里可作为「联系人」的分组标题（默认「联系人 / 最常使用」）。
     ///
-    /// 下拉是**分组**的（联系人 / 聊天记录 / 群聊…），只有"联系人"那一组下面
-    /// 才是人。标题取错的话，会把"聊天记录里提到这个名字"当成联系人。
+    /// 可写多项（`/`、`、`、空白分隔）。Mac 微信上人有时只出现在「最常使用」底下。
+    /// 标题取错的话，会把「聊天记录里提到这个名字」当成联系人。
     pub search_contact_group_label: String,
     /// 界面标定出来的**新增区域**（键 = `calibration::ITEMS` 里的 `key`）。
     ///
@@ -359,6 +375,7 @@ impl Default for RuntimeConfig {
             scroll_anchor: ScrollAnchorConfig::default(),
             // 默认没有标定尺寸：真实模式必须先在界面上点「记录窗口尺寸」。
             calibrated_window: None,
+            calibrations: Vec::new(),
             // 两轮：一轮从当前位置扫到底，一轮回顶重扫。
             max_search_sweeps: 2,
             liveness_check: true,
@@ -373,6 +390,7 @@ impl Default for RuntimeConfig {
             // 默认打开等于让每个还没准备模板的人都撞上一次装配错误。
             navigate_before_search: false,
             nav_icon_templates: Vec::new(),
+            chat_history_nav_templates: Vec::new(),
             // 留空 = 项目根下的 `data/icons/`，由 `icon_library::resolve_dir` 定夺。
             icons_dir: None,
             nav_icon_min_score: DEFAULT_NAV_ICON_MIN_SCORE,
@@ -623,6 +641,51 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
 /// 校验规则对两个模式**完全一致**。演练模式本来可以放宽（替身不读图片），
 /// 但那样就会出现"演练一路通过、切到真实模式立刻报错"，而报错的那一刻
 /// 任务已经登记了。宁可在演练模式也要求配一张真图片。
+
+/// 解析「用于某某导航」勾选的图标名；为空时按常见目录名回退。
+fn resolve_nav_icon_names(
+    icons_dir: &std::path::Path,
+    configured: &[String],
+    fallbacks: &[&str],
+    what: &str,
+    checkbox_label: &str,
+) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = configured
+        .iter()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if names.is_empty() {
+        for candidate in fallbacks {
+            if !crate::icon_library::variants_of(icons_dir, candidate).is_empty() {
+                names.push((*candidate).to_string());
+                break;
+            }
+        }
+    }
+    if names.is_empty() {
+        let available = crate::icon_library::list(icons_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.name)
+            .collect::<Vec<_>>();
+        let available = if available.is_empty() {
+            "（图标库是空的）".to_string()
+        } else {
+            available.join("、")
+        };
+        return Err(format!(
+            "要先点「{what}」导航图标，但还没指定用哪一个。\n\
+· 「只做导航」能点，是因为任务页另选了图标——那是另一套。\n\
+· 请到「图标库」把对应图标勾上「{checkbox_label}」，再保存配置。\n\
+· 当前库里有：{available}\n\
+· 图标库目录：{}",
+            icons_dir.display()
+        ));
+    }
+    Ok(names)
+}
+
 pub(crate) fn load_nav_icon_templates(
     icons_dir: &std::path::Path,
     names: &[String],
@@ -781,12 +844,14 @@ pub fn build_runner(
     // 分辨"这是不是我标定过的那个窗口、是不是那个尺寸"，只能靠这条记录。
     // 少了它，"按标定尺寸工作"就只是一句口号：尺寸变了区域会整体偏移，而点击
     // 落偏的后果是点到别的地方——宁可停在原地让人把窗口恢复回去。
-    if config.mode == RuntimeMode::Live && config.calibrated_window.is_none() {
-        return Err(
-            "真实模式必须先点「记录窗口尺寸」并保存配置（模式本身不用保存）：\
-             任务只在标定时的窗口尺寸下运行，否则四个区域会整体偏移。"
-                .to_string(),
-        );
+    if config.mode == RuntimeMode::Live {
+        config.ensure_calibrations_migrated();
+        if config.calibrations.is_empty() {
+            return Err(
+                "真实模式必须先在「界面标定」页记录至少一份窗口标定并保存：                 先点「记录窗口尺寸」，再框区域。任务按当前显示器缩放挑选对应那份标定；                 缩放对不上会直接拒绝，绝不用错缩放的区域去点。"
+                    .to_string(),
+            );
+        }
     }
 
     // 滚动落点也得是个合法比例。核心层同样会拦（而且是在**第一次滚动之前**就拦），
@@ -851,6 +916,18 @@ pub fn build_runner(
     // 确认端口始终来自界面，保证真实模式下也必须人工确认。
     ports.confirmation = confirmation;
 
+    // 真实模式：按**当前**显示器缩放挑一份标定，覆盖工作副本后再交给核心层。
+    // 演练模式没有真窗口，继续用配置里正在编辑的那一份（或默认值）。
+    if config.mode == RuntimeMode::Live {
+        // 装配期还没 focus，必须用「定位目标窗 → 所在屏缩放」，与「记录窗口尺寸」同源。
+        let (_rect, metrics) = ports
+            .platform
+            .measure_target_window()
+            .map_err(|err| format!("读取目标窗口所在显示器缩放失败：{err}"))?;
+        let snap = config.pick_calibration(metrics.scale_factor)?.clone();
+        config.apply_snapshot(&snap);
+    }
+
     let mut runner_config = config.to_runner_config();
 
     // 运行参数覆盖「配置里的默认值」。
@@ -866,27 +943,15 @@ pub fn build_runner(
 
     // ── 导航图标：这一次要点哪一个 ──────────────────────────────
     //
-    // 「只做导航」那条路**导航就是任务本身**，所以不受 `navigate_before_search`
-    // 这个开关约束——那个开关说的是"查找之前要不要先切一次视图"。
-    // 另外两条路只会在开关打开时切一次，而且固定切到联系人视图
-    // （列表扫描式扫的就是联系人列表；搜索式的搜索框也在主界面上）。
+    // 「只做导航」那条路**导航就是任务本身**。
+    // 搜索式 → 通讯录/联系人；列表扫描式 → 聊天/对话历史；只做导航 → 任务页所选。
     let navigate_only = choice.workflow == Workflow::NavigateOnly;
-    let need_nav = navigate_only || config.navigate_before_search;
+    let search_contact = choice.workflow == Workflow::SearchContact;
+    let scroll_list = choice.workflow == Workflow::ScrollListContact;
+    // 搜索式 → 通讯录图标；列表扫描式 → 聊天历史图标；只做导航 → 任务页所选。
+    let need_nav = navigate_only || search_contact || scroll_list || config.navigate_before_search;
 
-    // 模板从哪儿来，两种来源**都在这里收敛成"要点这一个图标"**：
-    //
-    // - 「只做导航」：本次请求选的那个图标名（运行参数）；
-    // - 另外两条路：配置里那组"联系人视图"图标（这台机器上的固定事实）。
-    //
-    // 核心层只认后者收敛出来的结果，所以下面两条分支里
-    // `nav_target_label` 与 `nav_icon_templates` **必须一起改**——
-    // 只改一个，日志里说的名字和实际匹配的模板就对不上了。
-    //
-    // 和上面几条同一个道理：**全部放在装配期**。区域比例非法、模板文件读不出来、
-    // 该配模板却没配——这些都会让任务注定失败，而装配失败**不会在任务列表里
-    // 留下记录**，装配成功才会登记。所以能提前判的一律提前判。
     if need_nav {
-        // 搜索区与阈值两处共用，所以只验一次。
         let strip = runner_config.nav_strip;
         if let Err(err) = strip.validate() {
             return Err(format!(
@@ -914,8 +979,6 @@ pub fn build_runner(
         if navigate_only {
             let name = choice.nav_target.trim();
             if name.is_empty() {
-                // 空 = 界面上还没选。**不兜底**：随便挑一个图标去点，
-                // 症状会是"任务照常跑完，只是点到了别的地方"。
                 return Err(
                     "「只做导航」要指定点哪一个图标，而现在还没选。\
                      到「图标库」页把那个图标截下来存好，再回到「任务」页的\
@@ -926,12 +989,30 @@ pub fn build_runner(
             runner_config.nav_target_label = name.to_string();
             runner_config.nav_icon_templates =
                 load_nav_icon_templates(icons_dir, &[name.to_string()], name)?;
-        } else {
-            // 切的是"联系人视图"。这个名字是**这一组配置的含义**，
-            // 不是某个具体图标的目录名——组里可能有好几个名字（不同版本各存一份）。
-            runner_config.nav_target_label = "联系人".to_string();
+        } else if scroll_list {
+            // 列表扫描式：先切到「聊天 / 对话历史」页，再扫会话列表。
+            let names = resolve_nav_icon_names(
+                icons_dir,
+                &config.chat_history_nav_templates,
+                &["聊天", "微信"],
+                "对话历史",
+                "用于对话历史导航",
+            )?;
+            runner_config.nav_target_label = names[0].clone();
             runner_config.nav_icon_templates =
-                load_nav_icon_templates(icons_dir, &config.nav_icon_templates, "联系人")?;
+                load_nav_icon_templates(icons_dir, &names, &names[0])?;
+        } else {
+            // 搜索式，或旧开关 navigate_before_search：切「通讯录 / 联系人」。
+            let names = resolve_nav_icon_names(
+                icons_dir,
+                &config.nav_icon_templates,
+                &["通讯录", "联系人"],
+                "通讯录/联系人",
+                "用于联系人导航",
+            )?;
+            runner_config.nav_target_label = names[0].clone();
+            runner_config.nav_icon_templates =
+                load_nav_icon_templates(icons_dir, &names, &names[0])?;
         }
     }
 

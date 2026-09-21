@@ -151,6 +151,28 @@
 | `apps/desktop/src/components/IconLibraryPanel.tsx` | 983 | 800 | ✅ **已拆**（1064 → 808 → 800）。列表搬成 `IconList.tsx`(204)，两段结果预览搬成 `NavResultSections.tsx`(140)。T26 删掉「用于聊天历史导航」那一组后又减了 8 行 |
 | `apps/desktop/src/components/RuntimePanel.tsx` | 596 | 288 | ✅ **已拆**（858 → 288）。按「归属」拆成四个同级组件：`RunChoiceFields`(270，运行参数) / `TargetWindowSection`(202) / `AdvancedParamsSection`(192) / `TypingTextSection`(87)。见 `docs/todo.md` T17 |
 
+★★ **2026-09-21 复测：上表「现在」那一列已经全部过期，而且七行**都**又涨了。**
+实测值（跑的就是 §10 那条 `find`）：`lib.rs` **2189**、`runner/mod.rs` **1350**、
+`runtime.rs` **1025**、`crates/vision/src/template.rs` **904**、
+`IconLibraryPanel.tsx` **847**、`winapi.rs` **843**、`CalibrationPanel.tsx` **726**。
+也就是说「只减不增」在这几处**实际没守住**。本轮（T29 决策轨迹 + 离线重放）
+往 `lib.rs` / `runner/mod.rs` 里加了什么、为什么没先拆，写在
+`docs/todo.md` T29 的「落地（2026-09-21 完成）」一节；**下一批拆分见 `docs/todo.md` T17**
+——别以为上表那些旧数字还成立。
+
+★ **T29 新建的四个文件都低于上限**，两刀都可照抄
+（`policy/trail.rs` 369 + `trail/verdicts.rs` 176 + `trail/tests.rs` 119、`dropdown.rs` 469）：
+
+1. 先把测试搬成 `xxx/tests.rs`（`mod tests;` 一行）——⚠️ **光抽测试并不必然把主体压到
+   上限以下**：`trail.rs` 抽完仍有 **529 行**（主体自己就 527 行），于是走了第二刀；
+2. 再按**职责**切：`trail/verdicts.rs` 搬走的是"每块文字为什么"（**措辞**），
+   父模块留"选中谁"（**判据**）。②③ 读同一份中间结果，所以**没有**开出第二处判据（§1.3）。
+
+⚠️ 两处踩过的坑：子模块的函数要 `pub(super) fn`（否则父模块调不到）；
+`use super::*` **不会**把父模块的 `use` 带过来（同 §9 里 `winapi.rs` 那条），
+这次是子模块里的 `Verdict` 报 `E0425`/`E0433`——缺什么就自己写
+`use crate::diagnostics::Verdict;`。
+
 ⚠️ **`lib.rs` 这次给出了一个可复用的做法**：新功能有近百行、眼看着要破基线时，
 **先把它整段搬成一个同级模块**（`cursor_trace.rs`，与 `capture_hotkey.rs` 同款），
 而不是硬往里塞。搬移的要点：

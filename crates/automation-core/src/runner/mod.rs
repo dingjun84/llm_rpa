@@ -11,16 +11,26 @@
 //! 端口是同步的，因此超时是**协作式**的：每个步骤返回后校验是否超期。
 //! 阻塞在端口内部的调用无法被抢占，平台层需要为自己的阻塞操作设置内部超时。
 
+mod decision;
 mod list;
 mod message;
 mod navigate;
 mod search;
+
+/// 由「结论 + 轨迹」拼出一条决策记录（见 [`decision`]）。
+///
+/// 公开出来是给**离线重放**用的：`tools/replay` 拿盘上那一帧重跑判据之后，
+/// 要拼出同一条决策记录给人看。自己再写一遍措辞就等于开了第二处判据的源
+/// （`CONVENTIONS.md` §1.3），而这句"结论是什么"恰恰是重放要对比的东西。
+pub use decision::name_match_decision;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::audit::{AuditEntry, AuditSink, MemorySendLedger, MessageDigest, NoopAudit, SendLedger};
+use crate::candidates::describe_candidates;
+use crate::diagnostics::{Decision, DiagnosticRecorder, MatchTrail, Observation, ReplayInput};
 use crate::ports::{
     AutomationError, ContactMatcher, DesktopPlatform, EvidenceRecorder, HumanConfirmation,
     IconLocator, IconPrior, IconQuery, IconTemplate, LocalOcr, Point, Rect, ScreenMetrics,
@@ -196,12 +206,12 @@ pub const DEFAULT_ICON_PRIOR_SCORE_TOLERANCE: f32 = 0.05;
 /// 换成别的靶标（企业微信）时改这一项即可，不用改代码。
 pub const DEFAULT_PROFILE_CHAT_ENTRY_TEXT: &str = "发消息";
 
-/// 搜索下拉列表里"联系人"那一组的标题文字。
+/// 搜索下拉列表里可作为「联系人」的分组标题（默认「联系人 / 最常使用」）。
 ///
-/// 下拉是**分组**的（联系人 / 聊天记录 / 群聊…），而只有"联系人"这一组
-/// 下面才是人。这个标题是靶标相关的文字，所以做成配置而不是写死——
-/// 写死的话，换一个客户端就会表现为"下拉里找不到联系人"。
-pub const DEFAULT_SEARCH_CONTACT_GROUP_LABEL: &str = "联系人";
+/// 下拉是**分组**的（联系人 / 最常使用 / 聊天记录 / 群聊…）。Mac 微信上同一个人
+/// 有时只出现在「最常使用」底下，所以默认两项都认；配置里仍是一个字符串，
+/// 用 `/`、`、` 或空白分隔多项。写死单一标题的话，换客户端会表现为「下拉里找不到人」。
+pub const DEFAULT_SEARCH_CONTACT_GROUP_LABEL: &str = "联系人 / 最常使用";
 
 /// 会话列表滚动时的默认落点：**上下居中、左右偏右一点**。
 ///
@@ -246,15 +256,15 @@ pub enum Workflow {
     NavigateOnly,
     /// 用顶部搜索框查找联系人，打开与他的聊天，把正文填进输入框后停下。
     ///
-    /// 完整链路：点导航图标切视图 → 点搜索框 → 逐字输入姓名 →
-    /// 在下拉列表的「联系人」分组里找到他并点击 → 核验资料页 →
-    /// 资料页滚到底 → 点「发消息」→ 核验聊天标题 → 聚焦输入框 →
-    /// 逐字输入正文 → 停在 [`TaskState::Prepared`]。
+    /// 完整链路：点「联系人」导航（已在该页可点一下但画面不变）→
+    /// 点顶部搜索框 → 逐字输入姓名 → 在下拉「联系人」分组里点他 →
+    /// 核验资料页 → 能看见「发消息」就不滚，否则滚到底 → 点「发消息」→
+    /// 核验聊天标题 → 聚焦输入框 → 逐字输入正文 → 停在 [`TaskState::Prepared`]。
     SearchContact,
     /// 在**会话列表**里滚动扫描查找联系人，然后打开聊天、准备消息。
     ///
-    /// 这是本项目最早实现的那条路，保留它是因为它和搜索式互补：
-    /// 列表扫描不依赖搜索框能不能触发联想，而搜索式不依赖列表里滚得到人。
+    /// 完整链路：先点「聊天 / 对话历史」导航回到会话列表 → 在列表里滚动 OCR
+    /// 找人 → 点开会话 → 准备消息。与搜索式互补：不依赖搜索框联想。
     ScrollListContact,
 }
 
@@ -532,48 +542,6 @@ pub fn settle_poll_interval(timeout: Duration) -> Duration {
     (timeout / SETTLE_POLL_DIVISOR).max(MIN_SETTLE_POLL)
 }
 
-/// 一帧最多记多少个文字块、总共多少个字符（见 [`describe_candidates`]）。
-///
-/// 取值依据：联系人列表一屏最多也就 20 来行、每行名字 10~20 字，
-/// 24 块 / 600 字符足够覆盖一整屏。再多出来的多半是乱码碎块。
-const OCR_LOG_MAX_BLOCKS: usize = 24;
-const OCR_LOG_MAX_CHARS: usize = 600;
-
-/// 把一帧识别到的文字拼成一行，供事后回答「OCR 到底读成了什么」。
-///
-/// 为什么要截断：一帧乱码可能识别出上百个碎块，全写进日志会把真正有用的那几行
-/// 淹掉。**截断会显式标出来**（写一个 `…`），不是悄悄丢掉——否则
-/// 「本来只读到 24 块」和「读到 200 块、这里只显示 24 块」看起来一模一样，
-/// 而这两种情况的含义完全不同。
-fn describe_candidates(candidates: &[TextBox]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut used = 0usize;
-    for item in candidates.iter().take(OCR_LOG_MAX_BLOCKS) {
-        let text = item.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        // 识别结果里可能带换行，压成字面量 `\n`，保住日志「一行一条」的格式。
-        let text = text.replace('\n', "\\n");
-        let len = text.chars().count();
-        if used + len > OCR_LOG_MAX_CHARS {
-            parts.push("…".to_string());
-            break;
-        }
-        used += len;
-        parts.push(text);
-    }
-    if candidates.len() > OCR_LOG_MAX_BLOCKS {
-        parts.push(format!(
-            "（共 {} 块，只列前 {}）",
-            candidates.len(),
-            OCR_LOG_MAX_BLOCKS
-        ));
-    }
-    parts.join(" / ")
-}
-
-
 /// 注入的端口集合。
 pub struct RunnerPorts {
     pub platform: Arc<dyn DesktopPlatform>,
@@ -622,6 +590,7 @@ pub struct WorkflowRunner {
     audit: Arc<dyn AuditSink>,
     ledger: Arc<dyn SendLedger>,
     evidence: Option<Arc<dyn EvidenceRecorder>>,
+    diagnostics: Option<Arc<dyn DiagnosticRecorder>>,
     config: RunnerConfig,
 }
 
@@ -632,6 +601,7 @@ impl WorkflowRunner {
             audit: Arc::new(NoopAudit),
             ledger: Arc::new(MemorySendLedger::new()),
             evidence: None,
+            diagnostics: None,
             config,
         }
     }
@@ -649,6 +619,15 @@ impl WorkflowRunner {
     /// 注入失败证据记录器。未注入时不保存任何画面。
     pub fn with_evidence_recorder(mut self, recorder: Arc<dyn EvidenceRecorder>) -> Self {
         self.evidence = Some(recorder);
+        self
+    }
+
+    /// 注入过程诊断记录器。未注入时不留下任何画面。
+    ///
+    /// 与 [`Self::with_evidence_recorder`] 是两条独立的线：证据是脱敏后的审计件，
+    /// 诊断是给人复盘用的原图。只接一条、两条都接、都不接，都允许。
+    pub fn with_diagnostic_recorder(mut self, recorder: Arc<dyn DiagnosticRecorder>) -> Self {
+        self.diagnostics = Some(recorder);
         self
     }
 
@@ -849,14 +828,29 @@ impl<'a> Run<'a> {
     fn ensure_calibrated(&self) -> Result<Rect, AutomationError> {
         let expected = self.window.ok_or(AutomationError::ClientNotReady)?;
         let current = self.runner.ports.platform.focus_wecom()?;
-        if current != expected {
+        // 尺寸必须一致；位置允许几个点抖动（置前/动画），否则任务永远走不到点击，
+        // 操作者只会看到「鼠标完全没动」。
+        if current.width != expected.width || current.height != expected.height {
+            return Err(AutomationError::ScreenChanged);
+        }
+        const POS_SLOP: i32 = 4;
+        if (current.x - expected.x).abs() > POS_SLOP
+            || (current.y - expected.y).abs() > POS_SLOP
+        {
             return Err(AutomationError::ScreenChanged);
         }
         let metrics = self.runner.ports.platform.screen_metrics()?;
-        if Some(metrics) != self.metrics {
-            return Err(AutomationError::ScreenChanged);
+        if let Some(prev) = self.metrics {
+            if prev.width != metrics.width || prev.height != metrics.height {
+                return Err(AutomationError::ScreenChanged);
+            }
+            if (prev.scale_factor - metrics.scale_factor).abs() > 0.01 {
+                return Err(AutomationError::ScreenChanged);
+            }
         }
-        Ok(expected)
+        // 必须把**当前**矩形交给 guarded_click：回传旧 expected 时，
+        // 校验会在移动之后因 1px 抖动再次失败。
+        Ok(current)
     }
 
 
@@ -936,8 +930,76 @@ impl<'a> Run<'a> {
     ///
     /// 刻意**不**更新 `last_frame`：失败证据记录器靠 OCR 文字框做遮盖，
     /// 这里没有文字框，把这一帧当证据会在盘上留下未脱敏的画面。
+    ///
+    /// 但**要**交给诊断记录器：它记的正是"当时画面上是什么样"，
+    /// 而"画面动没动"恰恰是最需要看原图的一类判断。
     fn capture_frame(&self, region: Rect, label: &str) -> Result<Screenshot, AutomationError> {
-        self.with_retry(label, || self.runner.ports.platform.capture(region))
+        let shot = self.with_retry(label, || self.runner.ports.platform.capture(region))?;
+        // `None` = 这一步没做 OCR：没有"OCR 输入图"可留，诊断那边也不该凭空造一张。
+        self.report(label, region, &shot, &[], None);
+        Ok(shot)
+    }
+
+    /// 把这一步「看了哪块区域、读到了什么文字」交给诊断记录器。
+    ///
+    /// `ocr_raw` 是这一步 OCR 引擎的原始输出（没做 OCR 就是 `None`，见
+    /// [`Observation::ocr_raw`]）——它与画面、文字框**同源交出**，
+    /// 免得"哪次原始输出属于哪一步"要靠时序去猜。
+    ///
+    /// 未注入记录器时是一次空转——**判据只有这一个调用点**，
+    /// 免得将来某条分支漏报，复盘时看不出"少了哪一步"。
+    fn report(
+        &self,
+        label: &str,
+        region: Rect,
+        frame: &Screenshot,
+        boxes: &[TextBox],
+        ocr_raw: Option<&str>,
+    ) {
+        let Some(recorder) = self.runner.diagnostics.as_ref() else {
+            return;
+        };
+        recorder.observe(
+            self.task.id,
+            &Observation { label, region, frame, text_boxes: boxes, ocr_raw },
+        );
+    }
+
+    /// 把一次判定的**结论 + 轨迹**交给诊断记录器。
+    ///
+    /// 与 [`Self::report`] 同理：**判据只有一处，上报也只有这一个调用点**。
+    /// `step` 用来与上一条 [`Self::report`] 对齐（同一步先看画面、再下判断）。
+    fn report_decision(&self, step: &str, mut decision: Decision) {
+        let Some(recorder) = self.runner.diagnostics.as_ref() else {
+            return;
+        };
+        decision.step = step.to_string();
+        recorder.decide(self.task.id, &decision);
+    }
+
+    /// 在候选集里挑出目标联系人，并把**每个候选为什么**交给诊断记录器。
+    ///
+    /// 判据一律问匹配器；轨迹也由匹配器自己给出（[`ContactMatcher::find_unique_exact_match_with_trail`]）。
+    /// 编排层不重写"这个候选行不行"——它只把匹配器说的记下来。
+    fn match_contacts(
+        &self,
+        step: &str,
+        expected_name: &str,
+        candidates: &[TextBox],
+    ) -> Result<TextBox, AutomationError> {
+        let (result, trail) = self.runner.ports.matcher.find_unique_exact_match_with_trail(
+            expected_name,
+            candidates,
+            self.cfg().min_confidence,
+        );
+        let decision = decision::name_match_decision(
+            &trail,
+            expected_name,
+            self.cfg().min_confidence,
+            &result,
+        );
+        self.report_decision(step, decision);
+        result
     }
 
     /// 截图 + 识别，仅对可重试的瞬时错误重试。
@@ -951,11 +1013,15 @@ impl<'a> Run<'a> {
         // 白白多截几次图。
         let value = self.with_retry(step, || {
             let shot = self.runner.ports.platform.capture(region)?;
-            let boxes = self.runner.ports.ocr.recognize(&shot)?;
-            Ok((shot, boxes))
+            // 走 `recognize_with_raw`：文字框照旧，另把引擎 stdout 原文带出来交给诊断。
+            // 它**只在这一次尝试里有效**，所以必须在这一层取出并当场上报——
+            // 放到外面去取，重试之后拿到的就是另一次调用的原文了。
+            let (boxes, raw) = self.runner.ports.ocr.recognize_with_raw(&shot)?;
+            Ok((shot, boxes, raw))
         })?;
-        self.last_frame = Some(value.clone());
-        Ok(value)
+        self.last_frame = Some((value.0.clone(), value.1.clone()));
+        self.report(step, region, &value.0, &value.1, Some(&value.2));
+        Ok((value.0, value.1))
     }
 
     /// 卡死守卫：系统必须认为客户端窗口**正在响应**。
@@ -1162,12 +1228,22 @@ impl<'a> Run<'a> {
             return Ok(());
         }
 
-        // ── 切换视图（可选）────────────────────────────────────────
+        // ── 切换视图（模板匹配）────────────────────────────────────
         //
-        // 图标上没有文字，OCR 读不到它，所以"先切到联系人视图"这一步只能靠
-        // 模板匹配。它必须在查找之前——查找假定"现在看的就是目标视图"。
-        if self.cfg().navigate_before_search {
-            self.advance(TaskState::NavigatingToView, None)?;
+        // 图标上没有文字，OCR 读不到。装配期已按工作流塞好模板与目标名：
+        //   - 搜索式 → 通讯录 / 联系人
+        //   - 列表扫描式 → 聊天 / 对话历史（先回到会话列表再扫）
+        // 若本来就停在目标页，点一下画面不变，只记警告、不转人工。
+        let must_navigate = matches!(
+            workflow,
+            Workflow::SearchContact | Workflow::ScrollListContact
+        ) || self.cfg().navigate_before_search;
+        if must_navigate {
+            let label = self.cfg().nav_target_label.clone();
+            self.advance(
+                TaskState::NavigatingToView,
+                Some(format!("目标：{label}图标")),
+            )?;
             self.navigate_to_view()?;
         }
 
@@ -1256,13 +1332,11 @@ impl<'a> Run<'a> {
         let header = self.resolve(self.cfg().chat_header, "聊天标题区")?;
         let (header_shot, header_boxes) = self.capture_and_recognize(header, "聊天标题识别")?;
         self.evidence.push(format!("chat_header#{}", header_shot.fingerprint));
-        let header_result = self.runner.ports.matcher.find_unique_exact_match(
-            &self.task.external_contact_name,
-            &header_boxes,
-            self.cfg().min_confidence,
-        );
-        // 判据一律问匹配器。这里原来写死了逐字相等，于是放宽匹配能选中联系人、
-        // 却在标题核验处被判「不一致」——明明点对了人，任务还是转人工。
+        // 判据一律问匹配器，轨迹也由匹配器给出（[`Self::match_contacts`]）。这里原来写死了
+        // 逐字相等，于是放宽匹配能选中联系人、却在标题核验处被判「不一致」——
+        // 明明点对了人，任务还是转人工。
+        let header_result =
+            self.match_contacts("聊天标题识别", &self.task.external_contact_name, &header_boxes);
         let header_matched = header_result
             .as_ref()
             .map(|found| self.runner.ports.matcher.accepts(&self.task.external_contact_name, found))

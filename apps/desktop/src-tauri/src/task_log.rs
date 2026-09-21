@@ -15,18 +15,74 @@
 //! `lib.rs` 早就贴着基线，所以这一段整段搬出来——加字段、加一行日志时
 //! 改的是这里，不必再去挤 `lib.rs` 的额度。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use automation_core::{SendTask, TaskId, Workflow};
+use automation_core::{Failure, SendTask, TaskId, TaskState, Workflow};
 
 use crate::runtime::{RunChoice, RuntimeConfig};
 
+/// 一次任务一个目录：`data/tasks/<任务ID>/`。
+///
+/// ## 为什么从一个日志文件改成一个目录
+///
+/// 一次任务产出的东西不止日志：还有每一步的过程诊断图（`steps/`）和拼起来的
+/// 总图（`overview.png`）。放进同一个目录，事后只要打开一个文件夹就能看全，
+/// 不必在 `data/` 下按文件名前缀去捞。
+pub const TASKS_DIR: &str = "tasks";
+
+/// 任务日志的文件名（每个任务目录里固定叫这个）。
+pub const LOG_FILE_NAME: &str = "task.log";
+
+/// 过程诊断图的子目录名（任务目录里）。
+pub const STEPS_DIR: &str = "steps";
+
+/// **未标注**的 OCR 原料子目录名（任务目录里）。
+///
+/// 与 `steps/` 的分工：`steps/` 那些图上面**画了框和字**（给人看），
+/// 拿它们重跑 OCR 会读出另一套结果；这里存的是当时**真正喂给 OCR 的那张图**
+/// 与引擎的 stdout 原文，是"重跑一次 OCR"唯一可用的原料（`docs/todo.md` T30）。
+pub const RAW_DIR: &str = "raw";
+
+/// 过程诊断总图的文件名（任务目录里）。
+pub const OVERVIEW_FILE_NAME: &str = "overview.png";
+
+/// 结构化事件流的文件名（任务目录里）。
+///
+/// 与 `task.log` 的分工：那个是**给人读**的叙述，这个是**给程序读**的事件流
+/// （界面「过程重放」与 `tools/replay` 都读它，见 `task_diagnostics/events.rs`）。
+pub const EVENTS_FILE_NAME: &str = "events.jsonl";
+
+/// 一个任务的目录。
+pub fn task_dir(data_dir: &Path, task_id: TaskId) -> PathBuf {
+    data_dir.join(TASKS_DIR).join(task_id.to_string())
+}
+
+/// 一个任务的日志文件。
+pub fn task_log_path(data_dir: &Path, task_id: TaskId) -> PathBuf {
+    task_dir(data_dir, task_id).join(LOG_FILE_NAME)
+}
+
 /// 把一行后台活动追加到任务日志。
 ///
-/// 刻意保持极简：纯追加、每行带毫秒时间戳、**写完立刻 flush**——
+/// 刻意保持极简：纯追加、每行带时间戳、**写完立刻 flush**——
 /// 这样进程被强杀或崩溃时，已经写下的内容仍然在盘上。
 pub fn append_task_log(path: &Path, line: &str) {
+    append_raw_line(path, &format!("[{}] {line}", now_stamp()));
+}
+
+/// 追加一行**原样**文本（不加时间戳前缀）。
+///
+/// 事件流（`events.jsonl`）要的是纯 JSON，加前缀就没法解析了。
+/// 这里的"建目录 → 追加 → flush"三件事与 [`append_task_log`] **共用一份实现**：
+/// 各写一份的话，漏掉 `create_dir_all` 的那一份会静默失败——
+/// 现象是"跑完一个任务，这个文件一个字节都没有"，而任务本身可能一切正常。
+///
+/// 目录不存在时**顺手建出来**：调用方只管给路径，不该还要记得先 `create_dir_all`。
+pub fn append_raw_line(path: &Path, line: &str) {
     use std::io::Write;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -34,12 +90,19 @@ pub fn append_task_log(path: &Path, line: &str) {
     else {
         return;
     };
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let _ = writeln!(file, "[{ms}] {line}");
+    let _ = writeln!(file, "{line}");
     let _ = file.flush();
+}
+
+/// 当前时刻，**本地时区、给人读**的格式：`2026-09-21 17:52:01.123`。
+///
+/// ## 为什么不再用 Unix 毫秒
+///
+/// 原来是 `[1789985467562]`。排查时要把这个数换算成"那是几点几分"才能对上
+/// 界面上的操作，而这一步每次都得在脑子里做一遍——日志正是给人读的，
+/// 就不该逼人做这种换算。毫秒保留到最后三位：同一秒内相邻的两步要分得出先后。
+pub fn now_stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
 /// 落一份**开跑前的配置快照**，返回日志文件路径。
@@ -156,4 +219,212 @@ pub fn write_start_header(
         }
     }
     append_task_log(log_path, "=== 状态轨迹 ===");
+}
+
+
+
+/// 读出整份任务日志（界面「过程日志」面板用）。
+pub fn read_task_log(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|err| {
+        format!("读不到任务日志 {}：{err}", path.display())
+    })
+}
+
+/// 数据目录里所有任务日志（按修改时间新→旧）。
+///
+/// 两种布局都要收：`data/tasks/<任务ID>/task.log`（现在）与
+/// `data/task-xxxxxxxx.log`（历史任务）。**旧的不能不收**——那会让界面上的
+/// 「任务历史」在升级后凭空少掉一截，看起来像数据丢了，而文件其实还在盘上。
+pub fn list_task_log_paths(data_dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(data_dir.join(TASKS_DIR)) {
+        paths.extend(
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().join(LOG_FILE_NAME))
+                .filter(|p| p.is_file()),
+        );
+    }
+
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        paths.extend(
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("task-") && n.ends_with(".log"))
+                        .unwrap_or(false)
+                }),
+        );
+    }
+
+    paths.sort_by_key(|p| {
+        std::cmp::Reverse(
+            p.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        )
+    });
+    paths
+}
+
+/// 从日志路径推任务 ID。
+///
+/// 新布局取**目录名**（它就是完整 UUID）；旧布局取文件名，去掉 `task-` 前缀。
+/// 判据只有这一处——`read_task_log` 与「任务历史」都靠它，两处各写一份的话，
+/// 迟早会出现"列表里点得开、打开却没有内容"。
+pub fn task_id_from_path(path: &Path) -> String {
+    let is_new_layout = path.file_name().and_then(|n| n.to_str()) == Some(LOG_FILE_NAME);
+    if is_new_layout {
+        if let Some(dir) = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+            return dir.to_string();
+        }
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .trim_start_matches("task-")
+        .to_string()
+}
+
+/// 从日志文件粗解析一份可展示的任务摘要（重启后恢复「任务历史」用）。
+///
+/// 解析失败返回 `None`，不把坏文件塞进列表。
+pub fn summary_from_log(path: &Path) -> Option<crate::TaskView> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut id = String::new();
+    let mut contact = String::new();
+    let created_by = "（来自日志）".to_string();
+    let mut state = TaskState::Failed;
+    let mut failure_code: Option<String> = None;
+    let mut failure_reason: Option<String> = None;
+    let mut detail: Option<String> = None;
+    let mut nav_target = String::new();
+
+    for raw in text.lines() {
+        // 去掉 `[ms] ` 时间戳前缀
+        let line = raw
+            .find(']')
+            .map(|i| raw[i + 1..].trim_start())
+            .unwrap_or(raw);
+        if let Some(rest) = line.strip_prefix("任务 ID    : ") {
+            id = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("目标联系人 : ") {
+            contact = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("导航目标   : ") {
+            nav_target = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("终态     : ") {
+            state = TaskState::from_str_name(rest.trim()).unwrap_or(TaskState::Failed);
+        } else if let Some(rest) = line.strip_prefix("失败码   : ") {
+            failure_code = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("失败原因 : ") {
+            failure_reason = Some(rest.trim().to_string());
+        } else if line.contains(" -> ") && detail.is_none() {
+            // 留最后一条状态行给 detail 更有用；这里先记下，后面覆盖
+            detail = Some(line.to_string());
+        }
+        if line.contains(" -> ") {
+            detail = Some(line.to_string());
+        }
+    }
+    if id.is_empty() {
+        id = task_id_from_path(path);
+    }
+    if contact.is_empty() || contact.starts_with("（不适用") {
+        if !nav_target.is_empty() && nav_target != "（没选）" {
+            contact = format!("导航：{nav_target}");
+        } else {
+            contact = "（只做导航）".into();
+        }
+    }
+    let failure = match (failure_code, failure_reason) {
+        (Some(code), reason) => Some(Failure {
+            code,
+            reason: reason.unwrap_or_default(),
+        }),
+        (None, Some(reason)) if !reason.is_empty() => Some(Failure {
+            code: "FROM_LOG".into(),
+            reason,
+        }),
+        _ => None,
+    };
+    Some(crate::TaskView {
+        id,
+        external_contact_name: contact,
+        text: String::new(),
+        text_length: 0,
+        created_by,
+        state,
+        state_label: state.describe().to_string(),
+        detail,
+        failure,
+        evidence: Vec::new(),
+        history: Vec::new(),
+        awaiting_confirmation: false,
+        evidence_artifacts: Vec::new(),
+        log_path: Some(path.display().to_string()),
+        from_log: true,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 写日志要顺手把任务目录建出来。
+    ///
+    /// **为什么钉住它**：`create(true)` 在父目录不存在时**静默失败**，
+    /// 现象是"跑完一个任务，日志一个字节都没有"——而任务本身可能一切正常，
+    /// 于是看起来像"日志功能坏了"，实际只是少了一次 `create_dir_all`。
+    #[test]
+    fn writing_a_line_creates_the_task_directory_and_stamps_the_time() {
+        let root = temp_root("append");
+        let path = task_log_path(&root, TaskId::nil());
+
+        append_task_log(&path, "=== 任务开始 ===");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = text.lines().next().unwrap();
+        assert!(line.ends_with("=== 任务开始 ==="), "实际：{line}");
+        let stamp = line.trim_start_matches('[').split(']').next().unwrap();
+        // 可读的本地时间（而不是 Unix 毫秒）：能被按同一个格式解回来。
+        assert!(
+            chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S%.3f").is_ok(),
+            "时间戳应当是给人读的「年-月-日 时:分:秒.毫秒」，实际：{stamp}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 升级后「任务历史」必须两种布局都列出来。
+    ///
+    /// **为什么钉住它**：旧的 `data/task-*.log` 不收，界面上就会凭空少一截历史，
+    /// 看起来像数据丢了，而文件其实都还在盘上。
+    #[test]
+    fn the_history_lists_both_the_new_directory_and_the_old_flat_file() {
+        let root = temp_root("both_layouts");
+        let id = TaskId::nil();
+        append_task_log(&task_log_path(&root, id), "=== 任务开始 ===");
+        let old = root.join("task-abcd1234.log");
+        append_task_log(&old, "=== 任务开始 ===");
+
+        let paths = list_task_log_paths(&root);
+
+        assert_eq!(paths.len(), 2, "两种布局都要收：{paths:?}");
+        assert!(paths.contains(&task_log_path(&root, id)));
+        assert!(paths.contains(&old));
+        assert_eq!(task_id_from_path(&task_log_path(&root, id)), id.to_string());
+        assert_eq!(task_id_from_path(&old), "abcd1234");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("llm-rpa-log-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
 }

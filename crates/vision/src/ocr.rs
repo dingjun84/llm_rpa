@@ -96,9 +96,33 @@ impl ExternalOcr {
         self
     }
 
-    fn run(&self, image: &Screenshot) -> VisionResult<Vec<TextBox>> {
+    fn run(&self, image: &Screenshot) -> VisionResult<(Vec<TextBox>, String)> {
         let png = encode_png(&to_rgba(image)?)?;
+        self.recognize_png_bytes(png)
+    }
 
+    /// 用**已经编码好的 PNG 字节**跑一次识别，返回文字块与 stdout 原文。
+    ///
+    /// 与 [`LocalOcr::recognize`] 的区别只在入口：那条路吃的是 BGRA 像素，
+    /// 要先编码一次。诊断留下的 `raw/NN-*.png` 就是**当时喂进来的那串字节**，
+    /// 离线重跑（`tools/replay`）要把它原样喂回去——再解码、再编码一次，
+    /// 等于给"重跑的到底是不是当时那张图"多加一道可疑环节
+    /// （`docs/todo.md` T30 的「可重跑的现场」）。
+    pub fn recognize_png(&self, png: &[u8]) -> VisionResult<(Vec<TextBox>, String)> {
+        self.recognize_png_bytes(png.to_vec())
+    }
+
+    /// 同上，但直接收下 PNG 的所有权——省掉一次几十 KB 的复制。
+    fn recognize_png_bytes(&self, png: Vec<u8>) -> VisionResult<(Vec<TextBox>, String)> {
+        let output = self.spawn_with(png)?;
+        // 原始输出**原样**留下（连同末尾换行）：它就是"那次到底读出了什么"的凭证，
+        // 将来换引擎、换平台时可以直接 diff 两份 stdout，而不是 diff 我们解析后的结构。
+        let raw = String::from_utf8_lossy(&output).to_string();
+        Ok((parse_ocr_json(&raw)?, raw))
+    }
+
+    /// 起一个 OCR 子进程，把 `png` 写进它的标准输入，读回标准输出。
+    fn spawn_with(&self, png: Vec<u8>) -> VisionResult<Vec<u8>> {
         let mut child = Command::new(&self.command)
             .args(&self.args)
             .stdin(Stdio::piped())
@@ -151,12 +175,19 @@ impl ExternalOcr {
         if timed_out {
             return Err(VisionError::OcrTimeout(self.timeout));
         }
-        parse_ocr_json(&String::from_utf8_lossy(&output))
+        Ok(output)
     }
 }
 
 impl LocalOcr for ExternalOcr {
     fn recognize(&self, image: &Screenshot) -> Result<Vec<TextBox>, AutomationError> {
+        self.run(image).map(|(boxes, _)| boxes).map_err(AutomationError::from)
+    }
+
+    fn recognize_with_raw(
+        &self,
+        image: &Screenshot,
+    ) -> Result<(Vec<TextBox>, String), AutomationError> {
         self.run(image).map_err(AutomationError::from)
     }
 }

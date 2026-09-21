@@ -18,6 +18,7 @@ import { DEFAULT_REGIONS } from "./RegionCalibration";
 import { buildItemLook, CalibrationSteps } from "./CalibrationSteps";
 import { CaptureTrigger } from "./CaptureTrigger";
 import { RegionCanvas, type CanvasBox, type Rect4 } from "./RegionCanvas";
+import { CalibrationProfiles } from "./CalibrationProfiles";
 import { StaleMarksNotice } from "./StaleMarksNotice";
 
 interface Props {
@@ -511,7 +512,7 @@ export function CalibrationPanel({
             照着截图把每个界面里要用到的区域框出来。框的位置存成
             <strong>相对窗口的比例</strong>，所以窗口挪动不用重标；但
             <strong>窗口尺寸改了要重标</strong>——界面元素是固定像素宽的。
-            标完记得点「保存配置」，坐标会写进配置文件，供后续编排读取。
+            先在上方按缩放「记录窗口尺寸」，再框区域；标完点「保存配置」。同一缩放再记录会覆盖那一份。任务开跑按当前缩放自动挑选。
           </p>
         </div>
         <div className="guide-head-actions">
@@ -537,6 +538,9 @@ export function CalibrationPanel({
         busy={busy}
         onPrune={pruneStale}
       />
+
+      <CalibrationProfiles draft={draft} onPatch={onPatch} busy={busy} />
+
 
       <div className="guide-grid">
         {plan && (
@@ -576,7 +580,7 @@ export function CalibrationPanel({
 
               {!windowReady && (
                 <p className="notice notice-error">
-                  还没填窗口类名——先在「任务」页点「指认窗口」把鼠标停在目标窗口上，
+                  还没填窗口类名——先在本页上方点「指认窗口」把鼠标停在目标窗口上，
                   或手工填一个类名。截图与任务执行用的是<strong>同一套</strong>定位规则。
                 </p>
               )}

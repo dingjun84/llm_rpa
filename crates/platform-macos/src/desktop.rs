@@ -24,6 +24,24 @@ pub struct MacOSDesktop {
     target: Mutex<Option<WindowRef>>,
 }
 
+
+fn metrics_for_window_rect(rect: Rect) -> ScreenMetrics {
+    let (width, height, scale_factor) = macosapi::metrics_for_rect(rect);
+    if width == 0 || height == 0 {
+        let (width, height) = macosapi::primary_screen_size();
+        return ScreenMetrics {
+            width,
+            height,
+            scale_factor: macosapi::scale_factor_for_rect(rect),
+        };
+    }
+    ScreenMetrics {
+        width,
+        height,
+        scale_factor,
+    }
+}
+
 impl MacOSDesktop {
     pub fn new(config: MacOSDesktopConfig) -> Self {
         Self {
@@ -70,7 +88,8 @@ impl MacOSDesktop {
         if rect.is_degenerate() {
             return Err(AutomationError::ClientNotReady);
         }
-        Ok((rect, self.screen_metrics()?))
+        // 缩放必须用**窗口所在屏**，与任务装配 `screen_metrics` 同一套。
+        Ok((rect, metrics_for_window_rect(rect)))
     }
 
     fn locate(&self) -> Result<WindowRef, AutomationError> {
@@ -145,6 +164,17 @@ impl MacOSDesktop {
             ));
         }
         Ok(())
+    }
+
+
+    fn require_accessibility(&self) -> Result<(), AutomationError> {
+        if macosapi::accessibility_trusted() {
+            return Ok(());
+        }
+        Err(AutomationError::NeedsHumanReview(
+            "未授予「辅助功能」权限，系统会静默忽略鼠标移动与点击。请到「系统设置 → 隐私与安全性 → 辅助功能」中启用本应用；若还需要截屏/找窗口，请同时开启「屏幕录制」。"
+                .into(),
+        ))
     }
 
     fn ensure_cursor_over_target(&self, at: Point, target: WindowRef) -> Result<(), AutomationError> {
@@ -285,7 +315,20 @@ impl DesktopPlatform for MacOSDesktop {
         macosapi::resize_window(w, width, height).map_err(AutomationError::Platform)
     }
 
+    fn measure_target_window(&self) -> Result<(Rect, ScreenMetrics), AutomationError> {
+        self.measure()
+    }
+
     fn screen_metrics(&self) -> Result<ScreenMetrics, AutomationError> {
+        // 已定位到目标窗时，用它所在显示器；否则退回主屏。
+        // 记录窗口尺寸（measure）与任务挑选标定都走这里的缩放语义。
+        if let Ok(w) = self.current_target() {
+            if let Ok(rect) = macosapi::window_rect(w) {
+                if !rect.is_degenerate() {
+                    return Ok(metrics_for_window_rect(rect));
+                }
+            }
+        }
         let (width, height) = macosapi::primary_screen_size();
         if width == 0 || height == 0 {
             return Err(AutomationError::Platform("无法读取主显示器尺寸".into()));
@@ -324,12 +367,20 @@ impl DesktopPlatform for MacOSDesktop {
     }
 
     fn guarded_click(&self, target: Point, expected_window: Rect) -> Result<(), AutomationError> {
-        let w = self.verify_guard(expected_window)?;
+        self.require_accessibility()?;
+        // 先滑过去：原先把 verify_guard 放在移动前，窗口矩形稍有变化就直接返回，
+        // 操作者会看到「完全没动鼠标」，无法区分是坐标错还是守卫拦了。
         macosapi::move_cursor(target.x, target.y, self.config.pointer_speed_px_per_sec)
             .map_err(AutomationError::Platform)?;
-        self.verify_guard(expected_window)?;
+        let w = self.verify_guard(expected_window)?;
         self.ensure_cursor_over_target(target, w)?;
         macosapi::left_click().map_err(AutomationError::Platform)
+    }
+
+    fn move_pointer(&self, target: Point) -> Result<(), AutomationError> {
+        self.require_accessibility()?;
+        macosapi::move_cursor(target.x, target.y, self.config.pointer_speed_px_per_sec)
+            .map_err(AutomationError::Platform)
     }
 
     fn scroll(
@@ -338,13 +389,13 @@ impl DesktopPlatform for MacOSDesktop {
         notches: i32,
         expected_window: Rect,
     ) -> Result<(), AutomationError> {
-        let target = self.verify_guard(expected_window)?;
+        self.require_accessibility()?;
         if notches == 0 {
             return Ok(());
         }
         macosapi::move_cursor(at.x, at.y, self.config.pointer_speed_px_per_sec)
             .map_err(AutomationError::Platform)?;
-        self.verify_guard(expected_window)?;
+        let target = self.verify_guard(expected_window)?;
         self.ensure_cursor_over_target(at, target)?;
         macosapi::scroll_wheel(notches).map_err(AutomationError::Platform)
     }

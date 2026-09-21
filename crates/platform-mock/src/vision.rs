@@ -4,7 +4,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use automation_core::{
-    AutomationError, ContactMatcher, LocalOcr, Screenshot, StrictContactMatcher, TextBox,
+    AutomationError, ContactMatcher, LocalOcr, MatchTrail, Screenshot, StrictContactMatcher,
+    TextBox,
 };
 
 use crate::fault::Fault;
@@ -95,6 +96,20 @@ impl MockContactMatcher {
     pub fn call_count(&self) -> usize {
         *self.calls.lock().unwrap()
     }
+
+    /// 计数 + 「让这一次匹配失败」的注入。
+    ///
+    /// **两条匹配入口共用它**：编排层现在拿到的是带轨迹的那一条（
+    /// [`ContactMatcher::find_unique_exact_match_with_trail`]），
+    /// 注入若只挂在老那条上，`force_failure` 就会静默失效——
+    /// 测试照样绿，而被测的失败分支一次都没跑到。
+    fn guard(&self) -> Result<(), AutomationError> {
+        *self.calls.lock().unwrap() += 1;
+        if let Some(fault) = self.forced.lock().unwrap().take() {
+            return Err(fault.into_error());
+        }
+        Ok(())
+    }
 }
 
 impl ContactMatcher for MockContactMatcher {
@@ -104,11 +119,27 @@ impl ContactMatcher for MockContactMatcher {
         candidates: &[TextBox],
         min_confidence: f32,
     ) -> Result<TextBox, AutomationError> {
-        *self.calls.lock().unwrap() += 1;
-        if let Some(fault) = self.forced.lock().unwrap().take() {
-            return Err(fault.into_error());
-        }
+        self.guard()?;
         self.inner.find_unique_exact_match(expected_name, candidates, min_confidence)
+    }
+
+    /// 委托内层的**同一条判据**（含轨迹）。替身自己不给轨迹——
+    /// 轨迹必须由判据产出（`CONVENTIONS.md` §1.3），照抄一份就成了第二套判据。
+    fn find_unique_exact_match_with_trail(
+        &self,
+        expected_name: &str,
+        candidates: &[TextBox],
+        min_confidence: f32,
+    ) -> (Result<TextBox, AutomationError>, MatchTrail) {
+        if let Err(err) = self.guard() {
+            let trail = MatchTrail {
+                rule: "（替身注入了故障，没有走到判据）",
+                relaxed: false,
+                candidates: Vec::new(),
+            };
+            return (Err(err), trail);
+        }
+        self.inner.find_unique_exact_match_with_trail(expected_name, candidates, min_confidence)
     }
 
     /// 委托内层策略 —— 替身不改变判据，只额外支持注入失败。

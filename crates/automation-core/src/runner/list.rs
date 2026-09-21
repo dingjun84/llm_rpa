@@ -151,10 +151,12 @@ impl Run<'_> {
                 ));
             }
 
-            match self.runner.ports.matcher.find_unique_exact_match(
+            // 判据与轨迹都交给匹配器（[`Self::match_contacts`]）：编排层不写"哪一行算命中"，
+            // 也不另写一份理由——那样两条线迟早不一致。
+            match self.match_contacts(
+                "联系人识别",
                 &self.task.external_contact_name,
                 &candidates,
-                self.cfg().min_confidence,
             ) {
                 Ok(matched) => return Ok(Some(matched)),
                 // 歧义：滚动解决不了，立刻停下。

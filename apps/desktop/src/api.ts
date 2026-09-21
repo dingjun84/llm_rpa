@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
@@ -13,6 +13,7 @@ import type {
   RuntimeConfig,
   RuntimeInfo,
   StartTaskRequest,
+  TaskReplayData,
   TaskView,
   WindowGeometry,
   WindowPreview,
@@ -36,6 +37,52 @@ export function startTask(request: StartTaskRequest): Promise<string> {
 
 export function listTasks(): Promise<TaskView[]> {
   return invoke<TaskView[]>("list_tasks");
+}
+
+/** 读出某次任务的过程日志全文（data/task-*.log）。 */
+export function readTaskLog(taskId: string): Promise<string> {
+  return invoke<string>("read_task_log", { taskId });
+}
+
+/**
+ * 读出某次任务的过程事件流（每一步看到了什么 + 怎么判的）。
+ *
+ * 与 [`readTaskLog`] 的分工：那个给的是**给人读**的叙述，这个给的是
+ * 界面「过程重放」要的结构化材料（见 `types.ts` 的 `ReplayEvent`）。
+ */
+export function readTaskEvents(taskId: string): Promise<TaskReplayData> {
+  return invoke<TaskReplayData>("read_task_events", { taskId });
+}
+
+/**
+ * 在系统文件管理器里打开这次任务的过程诊断目录，返回打开的是哪个目录。
+ *
+ * 排查时要看 `raw/` 下那张未标注的输入图、或者把 `events.jsonl` 交给
+ * `tools/replay` 重跑，所以得能直接找到那堆材料。
+ * 旧布局的任务没有目录，后端会**报错**（不是打开 `data/`）——界面照原样显示这句话。
+ */
+export function openTaskDir(taskId: string): Promise<string> {
+  return invoke<string>("open_task_dir", { taskId });
+}
+
+/**
+ * 把盘上一张图的**绝对路径**变成 WebView 能直接读的 URL。
+ *
+ * ## 为什么走 asset 协议、而不是把图读成 base64 回传
+ *
+ * 一张 200KB 的 PNG 变成 base64 是 270KB 的字符串，逐帧翻看时这点开销
+ * 全压在 IPC 上；asset 协议由 WebView 自己去取，只走 URL。
+ *
+ * ## 两个前提，缺一图就取不到（会 403）
+ *
+ * 1. `tauri.conf.json` 的 `assetProtocol.enable` 打开，且路径所在目录
+ *    进了 scope——数据目录那条由后端在启动时放行（`allow_process_images`）；
+ * 2. 传进来的必须是**后端拼好的绝对路径**（`ReplayReadEvent.image_path`）。
+ *    前端自己拼相对路径会踩分隔符的坑：Windows 上是 `\`，而 scope 是按
+ *    目录做前缀匹配的，混进 `/` 就匹配不上。
+ */
+export function assetUrl(path: string): string {
+  return convertFileSrc(path);
 }
 
 export function getTask(taskId: string): Promise<TaskView> {

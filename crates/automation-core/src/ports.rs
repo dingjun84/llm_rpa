@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::diagnostics::MatchTrail;
+
 pub type TaskId = Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +267,25 @@ pub trait DesktopPlatform: Send + Sync {
     fn is_responsive(&self) -> Result<bool, AutomationError>;
 
     /// 读取当前显示器分辨率与缩放比例，供点击前的标定校验使用。
+    /// 只读探测目标窗几何与**该窗所在显示器**指标（不聚焦、不截屏）。
+    ///
+    /// 用于「记录窗口尺寸」与任务装配期按缩放挑选标定。默认实现只回
+    /// [`Self::screen_metrics`]（无窗口矩形）；真实桌面后端应覆盖为定位目标窗后
+    /// 按窗口矩形取所在屏缩放，与运行中的 [`Self::screen_metrics`] 同源。
+    fn measure_target_window(&self) -> Result<(Rect, ScreenMetrics), AutomationError> {
+        self.screen_metrics().map(|metrics| {
+            (
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: metrics.width as i32,
+                    height: metrics.height as i32,
+                },
+                metrics,
+            )
+        })
+    }
+
     fn screen_metrics(&self) -> Result<ScreenMetrics, AutomationError>;
 
     /// 捕获指定屏幕区域。调用方不得传入企业微信窗口外的区域。
@@ -272,6 +293,12 @@ pub trait DesktopPlatform: Send + Sync {
 
     /// 点击前验证当前前台窗口与预期窗口一致；不满足则拒绝输入。
     fn guarded_click(&self, target: Point, expected_window: Rect) -> Result<(), AutomationError>;
+
+    /// 只把光标滑到 `target`，不点击、不做窗口守卫。
+    ///
+    /// 用于「先让人看见程序认的位置，再校验/点击」：任务路径若在守卫处失败，
+    /// 操作者至少能看到鼠标有没有滑到绿框对应的地方。
+    fn move_pointer(&self, target: Point) -> Result<(), AutomationError>;
 
     /// 在 `at` 处滚动鼠标滚轮，用于在联系人列表里向下翻找。
     ///
@@ -343,6 +370,18 @@ pub trait DesktopPlatform: Send + Sync {
 /// OCR 实现必须仅使用本地模型和本机内存中的图像。
 pub trait LocalOcr: Send + Sync {
     fn recognize(&self, image: &Screenshot) -> Result<Vec<TextBox>, AutomationError>;
+
+    /// 识别，并顺手交出引擎 stdout 的**原文**：`(文字框, 原文)`。
+    ///
+    /// 原文是"那次到底读出了什么"的凭证（理由见 `docs/todo.md` T30）；
+    /// 空串 = 没留下原文（替身引擎或引擎本身不给），**不是**"读到了空"。
+    /// 默认实现只转调 [`Self::recognize`]，所以测试替身不必为了诊断而改。
+    fn recognize_with_raw(
+        &self,
+        image: &Screenshot,
+    ) -> Result<(Vec<TextBox>, String), AutomationError> {
+        Ok((self.recognize(image)?, String::new()))
+    }
 }
 
 /// 图标定位端口：在一帧**局部截图**里用模板匹配找出一个小图的位置。
@@ -406,6 +445,32 @@ pub trait ContactMatcher: Send + Sync {
     /// 判据只有一处权威：本方法。`find_unique_exact_match` 负责「在候选集里挑一个」，
     /// 本方法负责「这一个行不行」，两者必须对同一个名字给出同样的答案。
     fn accepts(&self, expected_name: &str, candidate: &TextBox) -> bool;
+
+    /// 与 [`Self::find_unique_exact_match`] 同一条判据，但**顺带交出轨迹**。
+    ///
+    /// 返回的每一条 [`Verdict`] 说清"这个候选过没过、为什么"——一张标注图能回答
+    /// 「看到了什么」，回答不了「为什么这么判」，而后者才是排查时要的
+    /// （2026-09-21 的现场：失败文案说下拉里没有「联系人」分组，而同一帧里
+    /// 明明有这三个字，是置信度不够还是归一化改写了它，日志里一个字都没记）。
+    ///
+    /// ## 为什么有默认实现，而默认实现又不给轨迹
+    ///
+    /// 有默认实现是为了让**现有实现者不必为此改动**（测试替身尤其如此）。
+    /// 默认不给轨迹，是因为轨迹必须由判据自己产出（`CONVENTIONS.md` §1.3）——
+    /// 让端口这层拼一份"看起来像理由"的东西，就成了第二套判据：
+    /// 它迟早与真正的判据不一致，而轨迹恰恰是用来判断判据的。
+    /// 换句话说：**给不出轨迹就如实空着**，不要编。
+    fn find_unique_exact_match_with_trail(
+        &self,
+        expected_name: &str,
+        candidates: &[TextBox],
+        min_confidence: f32,
+    ) -> (Result<TextBox, AutomationError>, MatchTrail) {
+        (
+            self.find_unique_exact_match(expected_name, candidates, min_confidence),
+            MatchTrail { rule: "（该匹配器不提供轨迹）", relaxed: false, candidates: Vec::new() },
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,3 +493,6 @@ pub trait HumanConfirmation: Send + Sync {
 pub trait EvidenceRecorder: Send + Sync {
     fn record(&self, task_id: TaskId, label: &str, frame: &Screenshot, text_boxes: &[TextBox]);
 }
+
+// 排查材料的端口（`Observation` / `DiagnosticRecorder`）在 `crate::diagnostics`：
+// 本文件已经贴着 500 行的硬上限，新端口一律搬成同级模块。

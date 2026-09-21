@@ -5,9 +5,11 @@ import type { IconEntry, IconVariant } from "../types";
 
 interface Props {
   entries: IconEntry[];
-  /** 配置里「用于联系人导航」那组名字（原始写法）。 */
-  configuredNames: string[];
-  /** 配置里引用了、但图标库里已经没有的名字（被删了，或者图标库目录被改过）。 */
+  /** 配置里「用于联系人导航」那组名字。 */
+  contactNames: string[];
+  /** 配置里「用于对话历史导航」那组名字。 */
+  chatHistoryNames: string[];
+  /** 配置里引用了、但图标库里已经没有的名字。 */
   dangling: string[];
   disabled: boolean;
   /** 目标窗口类名填了没有：没填就没法匹配，那几个按钮要禁用。 */
@@ -16,7 +18,8 @@ interface Props {
   probing: string | null;
   /** 正在点击的那一组；`null` = 没在跑。 */
   clicking: string | null;
-  onToggleUse: (entry: IconEntry, on: boolean) => void;
+  onToggleContact: (entry: IconEntry, on: boolean) => void;
+  onToggleChatHistory: (entry: IconEntry, on: boolean) => void;
   onProbe: (names: string[], label: string) => void;
   onClick: (names: string[], label: string) => void;
   onRemove: (entry: IconEntry) => void;
@@ -38,13 +41,15 @@ interface Props {
  */
 export function IconList({
   entries,
-  configuredNames,
+  contactNames,
+  chatHistoryNames,
   dangling,
   disabled,
   windowReady,
   probing,
   clicking,
-  onToggleUse,
+  onToggleContact,
+  onToggleChatHistory,
   onProbe,
   onClick,
   onRemove,
@@ -66,7 +71,10 @@ export function IconList({
       <ul className="icon-list">
         {entries.map((entry) => {
           const key = normalizeName(entry.name);
-          const usedForContact = configuredNames.some(
+          const usedForContact = contactNames.some(
+            (name) => normalizeName(name) === key,
+          );
+          const usedForChatHistory = chatHistoryNames.some(
             (name) => normalizeName(name) === key,
           );
           const broken = !entry.usable;
@@ -125,20 +133,25 @@ export function IconList({
               </ul>
 
               <div className="icon-actions">
-                {/* 这一个勾选框回答的是**"联系人视图"是哪个图标**——
-                    查找式任务在开始之前会先点它一下把视图切过去。
-                    它是一份**配置**（这台机器上的固定事实），不是"本次要点哪个"：
-                    后者在「任务」页的「要点哪一个图标」里选，那儿列的是图标库本身。
-                    勾错了不会报错，只会拿另一个图标的模板去匹配然后转人工，
-                    所以配错的那一组是**空的**时，装配期会直接拒绝并说清是哪一组。 */}
+                {/* 两套勾选：搜索式先点「联系人」；列表扫描式先点「对话历史」回到会话列表。
+                    「只做导航」在任务页另选图标，不受这两个勾选约束。 */}
                 <label className="field-check icon-use">
                   <input
                     type="checkbox"
                     checked={usedForContact}
                     disabled={disabled || broken}
-                    onChange={(event) => onToggleUse(entry, event.target.checked)}
+                    onChange={(event) => onToggleContact(entry, event.target.checked)}
                   />
                   <span>用于联系人导航</span>
+                </label>
+                <label className="field-check icon-use">
+                  <input
+                    type="checkbox"
+                    checked={usedForChatHistory}
+                    disabled={disabled || broken}
+                    onChange={(event) => onToggleChatHistory(entry, event.target.checked)}
+                  />
+                  <span>用于对话历史导航</span>
                 </label>
                 <button
                   type="button"
@@ -151,22 +164,32 @@ export function IconList({
                 <button
                   type="button"
                   className={isArmed ? "danger" : undefined}
-                  disabled={disabled || broken || !windowReady || clicking !== null}
-                  title="会真的在客户端窗口上点一下鼠标"
+                  disabled={
+                    disabled ||
+                    broken ||
+                    !windowReady ||
+                    clicking !== null ||
+                    probing !== null
+                  }
+                  title="第一下：滑到匹配位置（不点击）；第二下：真的点下去"
                   onClick={() => {
                     if (isArmed) {
                       setArmed(null);
                       void onClick([entry.name], entry.name);
                     } else {
                       setArmed(entry.name);
+                      // 第一下先走「测试匹配」同款滑移，便于确认坐标；第二下才点击。
+                      void onProbe([entry.name], entry.name);
                     }
                   }}
                 >
                   {clicking === entry.name
                     ? "点击中…"
-                    : isArmed
-                      ? "再点一次＝真的点下去"
-                      : "定位并点击"}
+                    : probing === entry.name
+                      ? "定位中…"
+                      : isArmed
+                        ? "再点一次＝真的点下去"
+                        : "定位并点击"}
                 </button>
                 <button
                   type="button"

@@ -105,7 +105,7 @@ const toWindowBox = (box: Box, preview: WindowPreview): Box => {
  *
  * ## 名字是给谁看的
  *
- * 给**人**看的。配置里存的也是名字（`nav_icon_templates`），界面上从不显示路径——
+ * 给**人**看的。配置里存的也是名字（联系人／对话历史两套列表），界面上从不显示路径——
  * 路径是抄不错才怪的东西，而"聊天""通讯录"这种名字一眼就能对上。
  *
  * ## 一个名字 = 一组图
@@ -133,6 +133,7 @@ export function IconLibraryPanel({
   const [preview, setPreview] = useState<WindowPreview | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [selection, setSelection] = useState<Box | null>(null);
+  const [previewZoom, setPreviewZoom] = useState(true);
   const [name, setName] = useState("");
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -172,14 +173,18 @@ export function IconLibraryPanel({
     setSelection(null);
   }, [preview]);
 
-  const configuredNames = draft.nav_icon_templates;
+  const contactNames = draft.nav_icon_templates ?? [];
+  const chatHistoryNames = draft.chat_history_nav_templates ?? [];
   const libraryNames = useMemo(
     () => new Set(entries.map((entry) => normalizeName(entry.name))),
     [entries],
   );
-  /** 配置里引用了、但图标库里已经没有的名字（被删了，或者被手工改过配置）。 */
-  const dangling = configuredNames.filter(
-    (name) => name.trim() !== "" && !libraryNames.has(normalizeName(name)),
+  /** 配置里引用了、但图标库里已经没有的名字（两套勾选合并）。 */
+  const dangling = [...contactNames, ...chatHistoryNames].filter(
+    (name, index, all) =>
+      name.trim() !== "" &&
+      !libraryNames.has(normalizeName(name)) &&
+      all.findIndex((n) => normalizeName(n) === normalizeName(name)) === index,
   );
   /** 输入框里那个名字是不是**已经存在**：决定保存按钮是"新建"还是"补一张"。 */
   const existing = useMemo(
@@ -293,22 +298,29 @@ export function IconLibraryPanel({
   };
 
   /**
-   * 把一个图标勾进 / 摘出「联系人导航」那一组。
+   * 把一个图标勾进 / 摘出某一组导航配置。
    *
-   * ## 这一组是**配置**，不是"本次要点哪个图标"
-   *
-   * 它回答的是"这台机器上，联系人视图是哪个图标"——查找式任务在开始之前
-   * 会先点它一下把视图切过去。而"这一次要点哪一个"是**运行参数**，
-   * 在「任务」页的「要点哪一个图标」里选，那儿列的是图标库本身。
-   *
-   * 两者混起来过：那个下拉曾经只有两个写死的选项，其中一个（聊天历史）
-   * 只服务诊断路线，于是图标库里四五个图标在下拉里选不出来。现在
-   * 诊断路线直接从图标库选，这一组就只剩上面这一个用途。
+   * 两套勾选都是**配置**（这台机器上的固定事实），不是「本次要点哪个」：
+   * - 联系人导航 → 搜索式开始前先点它
+   * - 对话历史导航 → 列表扫描式开始前先点它，回到会话列表
+   * 「只做导航」在任务页另选图标，不受这里约束。
    */
-  const toggleUse = (entry: IconEntry, on: boolean) => {
+  const toggleInList = (
+    list: string[],
+    entry: IconEntry,
+    on: boolean,
+  ): string[] => {
     const key = normalizeName(entry.name);
-    const rest = draft.nav_icon_templates.filter((name) => normalizeName(name) !== key);
-    onPatch({ nav_icon_templates: on ? [...rest, entry.name] : rest });
+    const rest = list.filter((name) => normalizeName(name) !== key);
+    return on ? [...rest, entry.name] : rest;
+  };
+  const toggleContact = (entry: IconEntry, on: boolean) => {
+    onPatch({ nav_icon_templates: toggleInList(contactNames, entry, on) });
+  };
+  const toggleChatHistory = (entry: IconEntry, on: boolean) => {
+    onPatch({
+      chat_history_nav_templates: toggleInList(chatHistoryNames, entry, on),
+    });
   };
 
   /** 删掉一整组（含全部变体）。 */
@@ -321,17 +333,31 @@ export function IconLibraryPanel({
       // 名字没了，配置里那一条就是死的——留着它，任务装配时必然报
       // 「图标库里没有这个图标」。顺手一起摘掉，并在提示里说明白。
       const key = normalizeName(entry.name);
-      const stillUsed = configuredNames.some((name) => normalizeName(name) === key);
-      if (stillUsed) {
+      const inContact = contactNames.some((name) => normalizeName(name) === key);
+      const inChat = chatHistoryNames.some((name) => normalizeName(name) === key);
+      if (inContact || inChat) {
         onPatch({
-          nav_icon_templates: configuredNames.filter(
-            (name) => normalizeName(name) !== key,
-          ),
+          ...(inContact
+            ? {
+                nav_icon_templates: contactNames.filter(
+                  (name) => normalizeName(name) !== key,
+                ),
+              }
+            : {}),
+          ...(inChat
+            ? {
+                chat_history_nav_templates: chatHistoryNames.filter(
+                  (name) => normalizeName(name) !== key,
+                ),
+              }
+            : {}),
         });
       }
       setNotice(
         `已删除「${entry.name}」${count > 1 ? `（连带 ${count} 张图）` : ""}` +
-          (stillUsed ? "，并把它从导航模板里摘掉了（记得点「保存配置」）。" : "。"),
+          (inContact || inChat
+            ? "，并把它从导航模板里摘掉了（记得点「保存配置」）。"
+            : "。"),
       );
       await refresh();
     } catch (err) {
@@ -419,9 +445,10 @@ export function IconLibraryPanel({
         这件事只能靠<strong>模板匹配</strong>：拿一张图标的小图，在画面里找它最像的位置。
         <br />
         这一页就是造那张小图的地方：<strong>截一张窗口画面 → 在图上框住图标 → 起个名字存下来</strong>。
-        存好之后可以立刻「定位并点击」试一下。要让查找式任务在开始前先切到联系人视图，
-        勾上「用于联系人导航」；而「只做导航」那条工作流是<strong>在「任务」页
-        直接从这个列表里选一个</strong>（它除了点图标什么都不做，所以不受这个勾选框约束）。
+        存好之后可以立刻「定位并点击」试一下。勾选用途：
+        <strong>用于联系人导航</strong>（搜索式先点它）／
+        <strong>用于对话历史导航</strong>（列表扫描式先点它回到会话列表）。
+        「只做导航」在「任务」页另选图标，不受这两个勾选约束。
         <br />
         <strong>一个名字可以存多张图</strong>：同一个图标在选中 / 未选中 / 带气泡提醒 /
         气泡里数字不一样时长得都不一样，而它们指的是同一个图标。名字填一样的再存一次就是
@@ -517,21 +544,33 @@ export function IconLibraryPanel({
             <div className="crop-save">
               {selection && windowBox ? (
                 <div className="crop-zoom-wrap">
-                  <div
-                    className="crop-zoom"
-                    style={{
-                      width: windowBox.width * CROP_ZOOM,
-                      height: windowBox.height * CROP_ZOOM,
-                      backgroundImage: `url(${preview.image})`,
-                      backgroundSize: `${preview.width * CROP_ZOOM}px ${preview.height * CROP_ZOOM}px`,
-                      backgroundPosition: `-${selection.x * CROP_ZOOM}px -${selection.y * CROP_ZOOM}px`,
-                    }}
-                  />
-                  <span className="field-hint">
-                    框：预览 {selection.width}×{selection.height} → 窗口{" "}
-                    {windowBox.width}×{windowBox.height} @({windowBox.x}, {windowBox.y})
-                    （左边是放大 {CROP_ZOOM} 倍的效果）
-                  </span>
+                  {previewZoom ? (
+                    <div
+                      className="crop-zoom"
+                      style={{
+                        width: windowBox.width * CROP_ZOOM,
+                        height: windowBox.height * CROP_ZOOM,
+                        backgroundImage: `url(${preview.image})`,
+                        backgroundSize: `${preview.width * CROP_ZOOM}px ${preview.height * CROP_ZOOM}px`,
+                        backgroundPosition: `-${selection.x * CROP_ZOOM}px -${selection.y * CROP_ZOOM}px`,
+                      }}
+                    />
+                  ) : null}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <label className="field-hint" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                      <input
+                        type="checkbox"
+                        checked={previewZoom}
+                        disabled={disabled}
+                        onChange={(event) => setPreviewZoom(event.target.checked)}
+                      />
+                      预览放大 {CROP_ZOOM} 倍（仅显示，不改保存像素）
+                    </label>
+                    <span className="field-hint">
+                      框：预览 {selection.width}×{selection.height} → 窗口{" "}
+                      {windowBox.width}×{windowBox.height} @({windowBox.x}, {windowBox.y})
+                    </span>
+                  </div>
                 </div>
               ) : (
                 <span className="field-hint">还没有框——在图上拖一下。</span>
@@ -636,13 +675,15 @@ export function IconLibraryPanel({
 
         <IconList
           entries={entries}
-          configuredNames={configuredNames}
+          contactNames={contactNames}
+          chatHistoryNames={chatHistoryNames}
           dangling={dangling}
           disabled={disabled}
           windowReady={windowReady}
           probing={probing}
           clicking={clicking}
-          onToggleUse={toggleUse}
+          onToggleContact={toggleContact}
+          onToggleChatHistory={toggleChatHistory}
           onProbe={runProbe}
           onClick={runClick}
           onRemove={remove}
@@ -653,15 +694,15 @@ export function IconLibraryPanel({
           <button
             type="button"
             disabled={
-              disabled || probing !== null || configuredNames.length === 0 || !windowReady
+              disabled ||
+              probing !== null ||
+              (contactNames.length === 0 && chatHistoryNames.length === 0) ||
+              !windowReady
             }
-            onClick={() =>
-              runProbe(
-                // 量的是"我配的这些到底行不行"——同一套阈值、同一个搜索区。
-                configuredNames,
-                "全部已选图标",
-              )
-            }
+            onClick={() => {
+              const names = [...new Set([...contactNames, ...chatHistoryNames])];
+              runProbe(names, "全部已选图标");
+            }}
           >
             {probing === "全部已选图标" ? "匹配中…" : "测试全部已选图标"}
           </button>
@@ -684,22 +725,20 @@ export function IconLibraryPanel({
             }
           />
           <span>
-            <span className="field-label">任务开始前先点击导航图标跳转</span>
+            <span className="field-label">额外：开始前再点一次「联系人」图标</span>
             <span className="field-hint">
-              打开后，任务在查找联系人之前会先匹配一次图标、点它一下。打开时必须
-              <strong>至少勾一张「用于联系人导航」</strong>，否则任务在装配期就被拒绝
-              （不会在任务列表里留下一条注定失败的记录）。
-              <br />
-              「只做导航」那条工作流<strong>不受这个开关控制</strong>：
-              导航就是它的全部内容，所以它一定会去点图标，也就一定要求模板。
+              搜索式与列表扫描式<strong>已经各自会先点导航</strong>
+              （联系人／对话历史），一般不用再开这个。
+              打开后会在流程里再强制点一次「用于联系人导航」里的图标。
+              「只做导航」不受此开关影响。
             </span>
           </span>
         </label>
 
-        {draft.navigate_before_search && configuredNames.length === 0 && (
+        {draft.navigate_before_search && contactNames.length === 0 && (
           <p className="notice notice-warn">
-            已经打开，但<strong>一个图标都没勾</strong>——这样保存下去，
-            点「开始任务」时会在装配期被直接拒绝。在上面勾一个「用于联系人导航」。
+            已经打开，但<strong>没勾「用于联系人导航」</strong>——
+            点「开始任务」时可能在装配期被拒绝。请在上面勾一个。
           </p>
         )}
 

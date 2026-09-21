@@ -141,8 +141,24 @@ mod imp {
         (0, 0)
     }
 
+    pub fn primary_screen_pixel_size() -> (u32, u32) {
+        (0, 0)
+    }
+
     pub fn primary_scale_factor() -> f32 {
         1.0
+    }
+
+    pub fn scale_factor_at_point(_x: f64, _y_top_left: f64) -> f32 {
+        1.0
+    }
+
+    pub fn scale_factor_for_rect(_rect: Rect) -> f32 {
+        1.0
+    }
+
+    pub fn metrics_for_rect(_rect: Rect) -> (u32, u32, f32) {
+        (0, 0, 1.0)
     }
 
     pub fn capture_region(_region: Rect) -> MacResult<CapturedFrame> {
@@ -158,6 +174,29 @@ mod imp {
     }
 
     pub fn move_cursor(_x: i32, _y: i32, _speed_px_per_sec: f64) -> MacResult<()> {
+        Err(unsupported())
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct CircleTrace {
+        pub center: (i32, i32),
+        pub radius: i32,
+        pub steps: u32,
+        pub duration: Duration,
+        pub end: (i32, i32),
+    }
+
+    impl CircleTrace {
+        pub fn end_distance_px(&self) -> i32 {
+            0
+        }
+    }
+
+    pub fn move_cursor_circle(
+        _center: (i32, i32),
+        _radius: i32,
+        _speed_px_per_sec: f64,
+    ) -> MacResult<CircleTrace> {
         Err(unsupported())
     }
 

@@ -6,20 +6,6 @@ interface Props {
 }
 
 /**
- * 比例输入（0–1）的取值。
- *
- * 输入框清空或内容不是数字时**保留原值**，不要退回 0：
- * 退回 0 会把「正在删掉重输」这个中间状态变成「落点跑到最左边」，
- * 而 0 恰好是个合法值，看起来就像配置已经生效了。
- */
-const ratioFromInput = (raw: string, fallback: number) => {
-  if (raw.trim() === "") return fallback;
-  const value = Number(raw);
-  if (!Number.isFinite(value)) return fallback;
-  return Math.min(1, Math.max(0, value));
-};
-
-/**
  * 「超时」与「滚动查找联系人」两组参数。
  *
  * ## 为什么单独成文件
@@ -117,38 +103,6 @@ export function AdvancedParamsSection({ draft, onPatch }: Props) {
             />
           </label>
           <label>
-            <span>滚动落点 横向</span>
-            <input
-              type="number"
-              min={0}
-              max={1}
-              step={0.01}
-              value={draft.scroll_anchor.x}
-              onChange={(event) =>
-                update("scroll_anchor", {
-                  ...draft.scroll_anchor,
-                  x: ratioFromInput(event.target.value, draft.scroll_anchor.x),
-                })
-              }
-            />
-          </label>
-          <label>
-            <span>滚动落点 纵向</span>
-            <input
-              type="number"
-              min={0}
-              max={1}
-              step={0.01}
-              value={draft.scroll_anchor.y}
-              onChange={(event) =>
-                update("scroll_anchor", {
-                  ...draft.scroll_anchor,
-                  y: ratioFromInput(event.target.value, draft.scroll_anchor.y),
-                })
-              }
-            />
-          </label>
-          <label>
             <span>滚动停稳等待</span>
             <input
               type="number"
@@ -171,11 +125,8 @@ export function AdvancedParamsSection({ draft, onPatch }: Props) {
           滚完上限、或画面已经不再变化（滚到底了），任务会转人工处理。
         </span>
         <span className="field-hint">
-          <strong>滚动落点</strong>是鼠标停在哪里滚（相对联系人候选区的比例），
-          默认 <code>0.62 / 0.5</code> 即<strong>上下居中、左右偏右一点</strong>。
-          不用正中心是因为候选区左边界把左侧图标栏和头像列一起圈了进来，
-          正中心恰好压在头像列上；偏右落到名字那一列更稳。
-          两个值都必须在 0–1 之间，填到范围外任务会直接报错而不是凑合着滚。
+          <strong>滚动落点</strong>改在「界面标定」页调（跟区域框同一份、按缩放保存）。
+          这里只留「滚几次 / 每轮几格 / 停稳等待」这类与具体像素无关的次数参数。
         </span>
         <span className="field-hint">
           <strong>滚动停稳等待</strong>（毫秒，<code>0</code> = 不等）是滚完之后

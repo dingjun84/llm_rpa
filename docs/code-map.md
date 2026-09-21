@@ -21,9 +21,11 @@
 | `crates/platform-windows` | 真实平台：Win32 截屏/焦点/鼠标/键盘/剪贴板 + **全局热键** + 只读探针 | 改系统动作、排查「鼠标不动」 |
 | `crates/platform-mock` | 演练替身：五个端口的假实现 + 场景注入 | 加演练场景、改故障注入 |
 | `crates/storage` | SQLite：审计、发送台账、证据落盘 | 改落库结构、改清理策略 |
-| `apps/desktop/src-tauri` | **IPC 命令层 + 装配**：24 个命令、配置草稿/持久化、`build_runner`、**启动日志** | 加界面按钮、加配置项（改这里最多） |
-| `apps/desktop/src` | React 界面：配置面板、任务、图标库 | 改界面 |
+| `apps/desktop/src-tauri` | **IPC 命令层 + 装配**：27 个命令、配置草稿/持久化、`build_runner`、**启动日志** | 加界面按钮、加配置项（改这里最多） |
+| `apps/desktop/src` | React 界面：配置面板、任务、图标库、**过程重放** | 改界面 |
 | `tools/winocr` | 独立 OCR 子进程（`Windows.Media.Ocr`） | 改 OCR 输出格式或放大倍数 |
+| `tools/macosocr` | 同一契约的 macOS 实现（`Vision` 框架，`--upscale`） | 在 Mac 上跑 OCR / 改放大倍数 |
+| `tools/replay` | **离线重放事件流**：拿盘上那一帧重跑判据，回答「19 块里为什么没找到」；加 `--ocr` 还能把 `raw/` 那张干净图喂回本机引擎，回答「卡在哪一层」 | 排查「它为什么这么判」、改阈值试结论、判断是读错了还是判错了（`cargo run -p replay -- data/tasks/<任务ID> [--min-confidence 0.70] [--ocr auto] [--upscale 3]`） |
 | `apps/webview-probe` | 独立渲染探针，**与主应用零代码依赖**，删掉不影响主应用 | 排查「界面出不来」 |
 
 ## 2. 依赖方向
@@ -45,9 +47,22 @@
                              │ invoke / listen
                     apps/desktop/src（React）
 
-  tools/winocr         独立子进程，不依赖任何内部 crate，只走 stdin/stdout JSON
+  tools/winocr / macosocr   独立子进程，不依赖任何内部 crate，只走 stdin/stdout JSON
+  tools/replay         依赖 automation-core（判据本体）与 vision（引擎调用 + stdout 解析）
   apps/webview-probe   独立探针，与主应用无代码依赖
 ```
+
+★ `tools/replay` 这一条是**判据只有一处**（`CONVENTIONS.md` §1.3）撑起来的：
+它重跑的是 `automation-core` 里那个函数本身，所以「改个阈值结论会不会变」的答案
+来自判据，而不是来自重新解释一遍盘上的记录。格式定义在 `apps/desktop` 那侧
+（`task_diagnostics/events.rs`），重放工具只读不写。
+
+★ **`tools/replay` 依赖 `vision` 一条要理解清**（2026-09-21 加真 OCR 时改的）：
+它只用了 `vision::ocr::ExternalOcr`（起引擎 + 解析 stdout + `recognize_png`）。
+理由同样是"只有一处"：重跑出来的文字块必须与**盘上那份可比**，而盘上那份也是
+`vision::parse_ocr_json` 解出来的——自己再写一套解析，两次读数的差异里就会混进
+"两个解析器的差异"，那份报告也就不可信了。它**仍不依赖** `storage` /
+`platform-*` / `apps/desktop`。
 
 三个必须记住的点：
 
@@ -66,12 +81,16 @@
 | --- | --- | --- | --- |
 | `src/ports.rs` | 388 | **五个端口的 trait 定义** + `AutomationError` + `IconQuery`/`IconPrior` | `DesktopPlatform`、`LocalOcr`、`IconLocator`、`ContactMatcher`、`HumanConfirmation` |
 | `src/state.rs` | 532 | 任务状态枚举与合法迁移 | `TaskState` |
-| `src/runner/mod.rs` | 1224 | **编排骨架**：配置、端口、主循环、通用工具 | `WorkflowRunner`、`RunnerConfig`、`execute()` |
+| `src/runner/mod.rs` | 1350 | **编排骨架**：配置、端口、主循环、通用工具 | `WorkflowRunner`、`RunnerConfig`、`execute()` |
 | `src/runner/search.rs` | 440 | **搜索式工作流**（工作流 3） | `search_contact_by_keyword`、`pick_contact_from_dropdown`、`open_chat_from_profile` |
 | `src/runner/list.rs` | 261 | **列表扫描式**（原有那条路） | `locate_contact`、`sweep_contact_list`、`scroll_to_top` |
 | `src/runner/navigate.rs` | 163 | 导航图标模板匹配 + 点击（工作流 1 / 2） | `navigate_to_view`、`nav_prior` |
 | `src/runner/message.rs` | 131 | 聚焦输入框 + 逐字填正文 | `prepare_message` |
 | `src/policy.rs` | 445 | `ContactMatcher` 的实现：逐字精确匹配 + 宽松开关 | `ExactNameMatcher` |
+| `src/policy/trail.rs` | 369 | ★★ **姓名匹配的判据本体**：结论（选中谁）与轨迹（每块为什么）**同一次交出** | `strict_judge`、`contains_judge`、`name_match_decision` |
+| `src/policy/trail/verdicts.rs` | 176 | 轨迹的**措辞**层：逐块写「过 / 淘汰 + 理由」 | `verdicts_strict`、`verdicts_relaxed` |
+| `src/dropdown.rs` | 469 | ★★ **搜索下拉挑人**这条判据（多分组 + 多命中取最上面），同样一次交出结论与轨迹 | `judge_dropdown`、`parse_search_contact_group_labels` |
+| `src/diagnostics.rs` | 174 | ★★ **诊断契约**：一条轨迹长什么样（这块文字过没过 + 理由）、一次判定怎么记（判据名 / 阈值 / 候选 / 重跑参数） | `Verdict`、`MatchTrail`、`Decision`、`ReplayInput`、`DiagnosticRecorder` |
 | `src/regions.rs` | 174 | 比例区域 → 像素矩形换算 | `RelativeRegion` |
 | `src/audit.rs` | 185 | 审计契约（只存长度/哈希/时间） | `AuditSink`、`SendLedger` |
 | `src/lib.rs` | 18 | 模块声明与 re-export | — |
@@ -117,7 +136,7 @@
 
 | 文件 | 行数 | 职责 | 关键符号 |
 | --- | --- | --- | --- |
-| `src/ocr.rs` | 242 | `ExternalOcr`：截图 → PNG → 子进程 stdin → JSON stdout | `ExternalOcr`、`UnconfiguredOcr` |
+| `src/ocr.rs` | 273 | `ExternalOcr`：截图 → PNG → 子进程 stdin → JSON stdout。★ `recognize_png` 吃的就是**那串 PNG 字节**（`raw/NN-*.png` 存的就是它）——离线重跑要原样喂回去，重新解码再编码等于给"跑的是不是当时那张图"多加一道可疑环节 | `ExternalOcr`、`UnconfiguredOcr` |
 | `src/template.rs` | 793 | 纯 Rust NCC 模板匹配（等价 `TM_CCOEFF_NORMED`），逐通道平均。★ **分数不够时**再报"每个模板的前 3 个候选"（`top_candidates` / `candidate_report`）—— 只报最高分分不出「模板对不上画面」和「搜索区里根本没有它」这两件事 | 匹配函数、失败诊断 |
 | `src/pixels.rs` | 274 | **BGRA / 自上而下**的像素约定、裁切、放大 | — |
 | `src/evidence.rs` | 116 | 证据脱敏（每个文字框涂成中灰） | — |
@@ -151,8 +170,12 @@
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `src/lib.rs` | 1793 | **24 个 IPC 命令** + `with_commands` 注册（含**托管状态**）。★ 任务日志**不在这里**了，见 `task_log.rs` |
+| `src/lib.rs` | 2219 | **27 个 IPC 命令** + `with_commands` 注册（含**托管状态**）。★ 任务日志**不在这里**了，见 `task_log.rs`；过程事件流的读盘在 `task_replay.rs`。⚠️ **已破 `CONVENTIONS.md` §9 的存量基线（1903），见那一节的 2026-09-21 复测** |
 | `src/task_log.rs` | 159 | ★ **任务日志的两件事**：`append_task_log`（纯追加、带毫秒时间戳、写完 flush）+ `write_start_header`（开跑前那份**配置快照**——"当时到底按哪份配置跑的"）。★ 快照里的**运行参数**（模式 / 工作流 / 导航目标）全部取自 `RunChoice`，与界面上选的必须一致。T27 从 `lib.rs` 整段搬出来（那一百来行是"写日志"的活，与"装配 / 登记 / 起线程"不是一回事） |
+| `src/task_diagnostics.rs` | 287 | ★★ **过程诊断的落盘侧**（T29）：每个任务一个目录 `data/tasks/<ID>/`，逐步存标注图 + 总图 + `events.jsonl` + 人读的 `task.log` + **`raw/`（未标注的 OCR 输入图 + 引擎 stdout 原文）**。★★ **判据执行到哪就记到哪**：记的是判据**自己**交出来的轨迹，不是在编排层再复述一遍（否则迟早和判据不一致） |
+| `src/task_diagnostics/events.rs` | 198 | ★★ **`events.jsonl` 的格式（唯一一处定义）**：`read`（这一步看到了什么：图 + 区域 + 每块文字与坐标与置信度 + **可重跑的原料 `ocr_input`/`ocr_raw`**）+ `decision`（这一步怎么判的：判据 / 阈值 / 每个候选过没过 + 理由 / 重跑要的参数）。`tools/replay` 只**读**这个格式 |
+| `src/task_diagnostics/page.rs` | 67 | 把这一步的图 + 识别框 + 区域渲染成一张**标注图**（排查时先看它） |
+| `src/task_replay.rs` | 171 | ★★ **「过程重放」的读盘侧**（T29）：读出事件流给界面，并把图补成**绝对路径**（asset 协议按目录前缀匹配，路径里的分隔符不能让前端猜）。★ `task_dir_for` 是**任务目录在哪的唯一判据**（界面「打开任务目录」按钮也走它）。⚠️ 旧布局的任务只有日志、没有目录 ⇒ 如实报"没有重放材料"，不拿空面板冒充 |
 | `src/cursor_trace.rs` | 141 | ★ **「画圆」自检**（`draw_cursor_circle` + `CircleTraceView`）。★ 回报里带 **`end` / `end_distance_px`**（走完之后**实测**的光标位置与它到圆心的距离）—— "命令返回了"不等于"光标真的动了"，这是唯一能分辨的判据。单独成模块是为了让 `lib.rs` 不破基线；命令**仍注册在 `lib.rs`**。⚠️ 跨模块的命令必须是 `pub`（私有 ⇒ `E0603: macro import ... is private`）。见 `docs/todo.md` T24 |
 | `src/startup_log.rs` | 165 | ★★ **启动期落文件日志**（`data/startup.log`）。GUI 没有控制台，而"窗口还没出现就退出"这类故障的现场**全在窗口出现之前**——这是唯一的现场。第一行截断、之后追加；**写失败一律静默**（观测手段不该成为新的失败点）；数据目录建不出来时**退回工作目录**记。另装了一个 panic 钩子（**包一层原钩子，不替换**）。见 `docs/todo.md` T25 |
 | `src/tests.rs` | 88 | `lib.rs` 的用例（测试文件不限行数） |
@@ -171,7 +194,7 @@
 | `src/icon_library/tests.rs` | 470 | 图标库测试（名字校验、定位、读写、坏文件） |
 | `src/confirmation.rs` | 127 | `HumanConfirmation` 实现（oneshot 等待界面确认） |
 
-**24 个 IPC 命令清单**（`lib.rs` 里搜 `#[tauri::command]`；
+**27 个 IPC 命令清单**（`lib.rs` 里搜 `#[tauri::command]`；
 前端调用点见 `apps/desktop/src/api.ts`，**两边名字一一对应**）：
 
 ```text
@@ -181,10 +204,21 @@ pick_target_window    launch_client        record_window_geometry  probe_nav_ico
 list_icons            delete_icon          delete_icon_variant  save_icon_from_crop
 click_icon            list_calibration_plan  validate_area_mark  prune_stale_marks
 workflow_requirements register_capture_hotkey  unregister_capture_hotkey
-draw_cursor_circle
+draw_cursor_circle    read_task_log        read_task_events     open_task_dir
 ```
 
-最后两个在 `capture_hotkey.rs` 里（不在 `lib.rs`），注册句柄由 `HotkeyState` 托管。
+`read_task_log` 与 `read_task_events` 是一对（T29）：前一个给的是**给人读**的叙述，
+后一个给的是**每一步看到什么、怎么判的**（`task_replay.rs`）。
+
+`open_task_dir` 是「过程重放」页上那个按钮：在系统文件管理器里打开任务目录，
+材料就摊在那儿（`raw/` 那张干净图、「拖给 `tools/replay` 的 `events.jsonl`」）。
+★ 它走 **Rust 侧的 `tauri-plugin-opener`**（`app.opener().reveal_item_in_dir`），
+不是前端 JS 那套插件 API——JS 调插件命令要在 capability 里放行，
+而这里只需要打开一个后端自己算出来的路径（插件已在 `run()` 里 `init`）。
+⚠️ 旧布局的任务没有目录时**报错**，不打开 `data/`。
+
+`register_capture_hotkey` / `unregister_capture_hotkey` 这两个在 `capture_hotkey.rs` 里
+（不在 `lib.rs`），注册句柄由 `HotkeyState` 托管。
 热键命中时后端只发一条 `calibration://capture-hotkey` 事件，**不自己截图**——
 截哪张图取决于界面正在标定哪个界面和配置草稿，只有界面知道。见
 `docs/windows-mvp-interface.md`「截图的三种触发方式」。
@@ -221,8 +255,8 @@ draw_cursor_circle
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `App.tsx` | 536 | **持有配置草稿 `draft`**（四个页签改同一份）+ **持有运行参数 `runChoice`**（不进草稿、不置 `dirty`）+ **持有 `requirement`**（当前工作流要不要填联系人/正文、还缺哪块标定）+ 页签切换。★ `requirement` 放这里是因为它有**两个**消费者（`TaskForm` 与 `RunChoiceFields`），各取一次会有两份可能不同步的答案 |
-| `api.ts` | 381 | 所有 `invoke` 封装 + 事件订阅。**要改命令名先看这里** |
+| `App.tsx` | 628 | **持有配置草稿 `draft`**（几个页签改同一份）+ **持有运行参数 `runChoice`**（不进草稿、不置 `dirty`）+ **持有 `requirement`**（当前工作流要不要填联系人/正文、还缺哪块标定）+ 页签切换（含 T29 的「过程重放」页签与 `openReplay`）。★ `requirement` 放这里是因为它有**两个**消费者（`TaskForm` 与 `RunChoiceFields`），各取一次会有两份可能不同步的答案。⚠️ 超 500 行且没记过基线，见 T17 |
+| `api.ts` | 428 | 所有 `invoke` 封装 + 事件订阅。**要改命令名先看这里** |
 | `types.ts` | 794 | 与 Rust 侧 serde 结构对应的类型（含 `Workflow` / **`RunChoice`** / `StartTaskRequest` / `TaskFormValues` / `CircleTraceView` / `HotkeyRequest`）。★ `RunChoice.nav_target` 是**图标库里的目录名**（`string`），**不是**枚举——见 `docs/todo.md` T26。★ `WorkflowRequirement` 带 `needs_contact` / `needs_message`（T27） |
 | `taskDisplay.ts` | 18 | `contactLabel`：任务列表与「当前任务」两处都显示收件人，空名字**不是"漏填了"**（「只做导航」根本不找人），所以给它一句话。**只写一处**，否则改文案必漏一处 |
 | `countdown.ts` | 92 | ★ **「先倒数、到点再动手」的唯一实现**（`useCountdown` / `COUNTDOWN_TICK_MS` / `remainingSeconds`）。**到点判据是「现在 ≥ 截止时刻」**，别在任何调用点改成"把间隔累加起来"。秒数留在各调用点（截图 8 秒 / 画圆 3 秒） |
@@ -236,20 +270,41 @@ draw_cursor_circle
 | `components/IconList.tsx` | 204 | 图标库**列表**：一行一个图标 + 全部变体缩略图 + 「用于联系人导航」勾选 + 测试匹配 / 定位并点击 / 删除。★ 它**自带两个"两下确认"状态**（`armed` / `armDelete`）—— 主面板不必知道"哪个按钮上了膛"。⚠️ 「用于聊天历史导航」那个勾选框**已删**（T26）：它的旧用途（给写死的 `NavTarget::History` 喂模板）不存在了 |
 | `components/NavResultSections.tsx` | 140 | 「匹配结果」「点击结果」两段**只读预览**（含 `ShotOverlay`：整窗图 + 搜索区蓝虚线 + 命中框 + 点击点）。★ 纯展示，**不判断结果对不对**——那句话是后端 `probe.notice` / `click.notice` 下发的 |
 | `iconNames.ts` | 15 | ★ **`normalizeName`（图标名的比较键）**。它是**判据**（"算不算同一个图标"），只能有一处 —— 主面板与 `IconList` 都从这里取 |
+| `replayView.ts` | 101 | ★★ **事件流 → "一步一步"的配对逻辑**（T29）：一步 = 一次「看图」+ 它后面**最近一次同名、还没被配走**的「判定」。★★ **只写这一处**（组件里再写一遍的症状是「图上这一步、表里是另一步的结论」，而两边都是真实数据，看不出错）。★ 盘上/工具侧的同一条规则在 `tools/replay/src/lib.rs::run`，改一处要看另一处 |
+| `components/TaskReplay.tsx` | 285 | ★★ **「过程重放」页**（T29）：左图右表 —— 左边是那一步**当时的画面**（`convertFileSrc` + 后端补好的绝对路径），右边是**为什么这么判**（结论 + 每个候选过没过 + 逐条理由）。默认停在**失败那一步**。★ 「材料目录」旁边有**「打开任务目录」按钮**（`openTaskDir`）：材料（`raw/` 那张干净图、`events.jsonl`）都摊在那儿，不然人得自己拼 UUID 路径。⚠️ 图取不到就显示"这一步没有图"，不要让整页塌掉 |
 | `components/CalibrationPanel.tsx` | 722 | 界面标定页：左栏场景 + 项清单，右栏截图与画布；含失效项清理出口。⚠️ 超基线，见 T17 |
 | `components/CaptureTrigger.tsx` | 280 | **截图的三种触发方式**：立刻 / 延时倒计时 / 全局热键。倒计时走 `countdown.ts`。为什么必须有后两种见 `windows-mvp-interface.md` |
 | `components/CursorMotionPanel.tsx` | 162 | 「轨迹自检」页：点按钮 → 倒计时 3 秒 → 光标画一圈（**画完不回起点**）。半径 = 本程序窗口**短边**的一半。★ 结果里那行「实测终点 · 离圆心 N 像素」是**唯一**能分辨"它到底动没动"的东西（走对了 N ≈ 半径，N≈0 就是没动）。见 `docs/todo.md` T24 |
 | `components/RegionCanvas.tsx` | 323 | 可拖拽画布：移动 / 八向缩放 / 空白处拉新框 |
 | `components/RegionCalibration.tsx` | 83 | ★ **不再是组件**：只剩 `DEFAULT_REGIONS`（四块区域的默认比例，后端是单一来源、这里只能手抄）与 `regionsAreValid`（保存前校验）。四个区域**只在「界面标定」页标**，旧的手填数字面板已删 |
 | `components/WindowPicker.tsx` | 172 | 倒计时悬停取窗口。⚠️ **它不用 `countdown.ts`**：那个定时器每跳一次还要顺便采一次"光标下是哪个窗口"，数与采必须同一拍 |
-| `components/TaskForm.tsx` / `TaskHistory.tsx` / `StateTimeline.tsx` / `ConfirmationDialog.tsx` | 121 / 73 / 86 / 59 | 任务发起、历史、状态轨迹、人工确认。`TaskForm` **不碰「走哪条路」**，那是 `App.handleStart` 补进请求的。★★ `TaskForm` 按 `needsContact` / `needsMessage`（**后端下发**，T27）决定那两个框显不显示、按钮能不能点；⚠️ 这两个值是 `boolean \| null`，**`null`（还没问到）一律放行**——拒绝是看得见的，点不动是看不见的 |
+| `components/TaskForm.tsx` / `TaskHistory.tsx` / `StateTimeline.tsx` / `ConfirmationDialog.tsx` | 121 / 95 / 86 / 59 | 任务发起、历史、状态轨迹、人工确认。`TaskForm` **不碰「走哪条路」**，那是 `App.handleStart` 补进请求的。★★ `TaskForm` 按 `needsContact` / `needsMessage`（**后端下发**，T27）决定那两个框显不显示、按钮能不能点；⚠️ 这两个值是 `boolean \| null`，**`null`（还没问到）一律放行**——拒绝是看得见的，点不动是看不见的。★ `TaskHistory` 每一条底下有「过程重放」入口（T29，`onReplay` → `App.openReplay`）；它是 `div` 套按钮，**不是按钮套按钮**（HTML 会被浏览器拆开） |
+
+### 3.8 `tools/` —— 仓库外挂的小工具（不在 workspace 依赖链上）
+
+| 文件 | 行数 | 职责 |
+| --- | --- | --- |
+| `replay/src/lib.rs` | 410 | ★★ **重放本体**：读 `events.jsonl` → 配帧（**与界面同一条配对规则**：同名、最近一次、还没被配走）→ 重跑判据 → 可选真 OCR → 归因。入口 `replay_dir_with_ocr` |
+| `replay/src/ocr.rs` | 213 | ★★ **真 OCR 重跑**：`Engine`（发现 / 起进程 / 喂 `raw/` 那张干净图）、`diff_boxes`（两次读数的差异）。★ 配对是**文字相同里挑最近的**，不是按序号（同一句话会出现多次） |
+| `replay/src/layer.rs` | 173 | ★★ **归因到层**：`attribute`（卡在 OCR / 判据 / 坐标 / 分不出）+ **「沾边」这条规矩的唯一实现**（`needles` / `touches_text`，报告也用它） |
+| `replay/src/report.rs` | 268 | 把结果排成**给人看**的文本。★ 归因写在最前面、结论单列一行、差异逐条列（上限 `DIFF_LIMIT`）。⚠️ 输出是终端纯文本，**不许出现 Markdown 加粗**（`CONVENTIONS.md` §8） |
+| `replay/src/main.rs` | 129 | 手写参数解析（`--min-confidence` / `--ocr` / `--upscale`）。★ 没找到引擎时**只提醒不报错**：判据重跑本身仍然有用 |
+| `replay/src/tests.rs` | 360 | 重放回归 + **现场 fixture 的生成器**（`#[ignore]`，改判据措辞后重跑它一次） |
+| `replay/src/ocr_tests.rs` | 295 | ★ 真 OCR 那几条（**假引擎 `sh` 脚本**，只造临时目录与假 PNG，不依赖现场素材）。⚠️ `#[cfg(all(test, unix))]` |
+| `macosocr/macosocr.swift` | — | macOS 侧引擎（`Vision`）。契约与 `tools/winocr` 相同：PNG 走 stdin、JSON 数组走 stdout |
 
 ## 4. ★ 需求 → 文件（反向索引）
 
 | 我要做的事 | 打开这些 |
 | --- | --- |
 | 改状态机流程 / 加一个状态 | `automation-core/src/state.rs` + `runner/mod.rs` 的 `execute()` + `apps/desktop/src/types.ts` + `components/StateTimeline.tsx` |
-| 改联系人匹配规则（含宽松匹配） | `automation-core/src/policy.rs`。**判据只有这一处**，别在 runner 里另写 `==` |
+| 改联系人匹配规则（含宽松匹配） | `automation-core/src/policy.rs`（匹配器："什么算逐字相等"）+ **`policy/trail.rs`**（**判据本体**，结论与轨迹同源）。**判据只有这一处**，别在 runner 里另写 `==`。★ 改完顺手跑 `cargo run -p replay`，看旧现场上结论变没变 |
+| 改搜索下拉怎么挑人（分组 / 阈值 / 多命中取哪一行） | `automation-core/src/dropdown.rs` 的 `judge_dropdown`。**判据只有这一处**，`runner/search.rs` 只调它 |
+| **排查「判定为什么这么判」**（同一屏、同一份 OCR，为什么它没找到） | ① 界面「过程重放」页（`TaskReplay.tsx`，默认停在失败那一步：左图右表；旁边有「打开任务目录」按钮）；② `data/tasks/<任务ID>/task.log`（人读的叙述）+ `events.jsonl`（逐步的看到了什么 / 怎么判的）+ `steps/*.png`（标注图）+ `overview.png`（一次看全）+ **`raw/*.png`（未标注的输入图，可重跑）**；③ 要**改个阈值试一下**：`cargo run -p replay -- data/tasks/<任务ID> --min-confidence 0.70`。★ 图只能回答"看到了什么"，"为什么这么判"看右边的候选表 |
+| **判断「是 OCR 读错了，还是判据判错了」**（同一张干净图上的争议） | `cargo run -p replay -- data/tasks/<任务ID> --ocr auto [--upscale 3]`：把 `raw/` 那张**未标注**的图喂回本机引擎，读数一比就有结论（`tools/replay/src/layer.rs` 的 `attribute`）。★ 只对**盘上没过**的步骤跑（过了的没有"卡在哪一层"可言）。★ 引擎的启动参数**没记进事件流**，所以默认不传参数；读数对不上时第一个该试的是 `--upscale`（同一张图、不同倍率的结论**可以不同**）。⚠️ 拿 `steps/*.png`（叠了框的）重跑是错的——那是另一套读数 |
+| **把一次现场收编成一条回归用例**（T30 的「现场 → 用例」） | ① 现场材料在原位：`data/tasks/<任务ID>/`；② 收编时**整份拷成** `data/cases/<用例名>/`，本机回归跑它；③ 要进仓库的**只有人工造的假场景**：`tools/replay/tests/fixtures/`（人名为假，由 `tools/replay/src/tests.rs` 里那个 `#[ignore]` 生成器重跑重写）。★★ **现场与用例都只在 `data/` 下，永不入库**（`.gitignore` 的 `/data/`、`**/cases/`、`**/fixtures/**/*.png`）；代价是 CI 只能跑假场景，"OCR 级"的验证只有本机能做（见 `docs/todo.md` T30） |
+| 改**事件流的格式**（加一种事件 / 加一个字段） | `src-tauri/src/task_diagnostics/events.rs`（**格式只有这一处定义**）+ `types.ts` 的 `ReplayEvent` + **`tools/replay`（读盘那侧要跟着改，否则离线重放读不懂）**。★ 加字段不算"含义变过"（`SCHEMA_VERSION` 不动），但要**同时**改 `tools/replay/src/tests.rs` 里造事件流的那两个助手，否则回归用的假场景会缺字段 |
+| 改「过程重放」页显示哪一步 / 怎么配对 | `apps/desktop/src/replayView.ts`（配对规则，只此一处）+ `components/TaskReplay.tsx`（展示）。★ 同一张盘 `tools/replay/src/lib.rs::run` 也要一起看——两个消费者必须用同一条配对规则 |
 | **改搜索式工作流**（工作流 3：点搜索框 → 下拉挑人 → 资料页 → 发消息） | `runner/search.rs`。资料页那一套（核验 / 滚到底 / 找入口）也在这里 |
 | **改列表扫描式**（原有那条：滚会话列表认名字） | `runner/list.rs` |
 | **改「只做导航」**（工作流 1 / 2） | `runner/navigate.rs`（判据与点击）+ `vision/src/template.rs`（匹配算法） |
@@ -273,7 +328,7 @@ draw_cursor_circle
 | 改**截图的触发方式**（延时秒数、热键界面） | `components/CaptureTrigger.tsx`（界面）→ `src-tauri/src/capture_hotkey.rs`（命令）→ `platform-windows/src/hotkey.rs`（注册与消息循环）。⚠️ 延时秒数**刻意写死**，理由在该组件顶部 |
 | 改**全局热键允许哪些键** | `platform-windows/src/hotkey.rs` 的 `HotkeyKey`。**判据只有这一处**：界面故意用自由文本输入而**不列候选表**，就是为了不出现第二处 |
 | 排查「按了热键没反应」 | 先看界面上「已生效：Ctrl+Alt+S」在不在（不在 = 没注册成功，错误文案就在旁边）；再看 `capture_hotkey.rs` 的事件是否发到了界面 |
-| 排查「鼠标不动 / 点了没反应」 | 先看 `task-<ID前8位>.log`（`REFERENCE.md` §11.2 的排查顺序）；再动 `winapi/input.rs`（点击/滚轮）或 `winapi/cursor.rs`（光标怎么走） |
+| 排查「鼠标不动 / 点了没反应」 | 先看 `task-<ID前8位>.log`（`REFERENCE.md` §11.2 的排查顺序）；★ 2026-09-21 起同一件事还有两样材料：`data/tasks/<任务ID>/`（逐步的**标注图** + `events.jsonl`）与界面的**「过程重放」**页（左图右表）。再动 `winapi/input.rs`（点击/滚轮）或 `winapi/cursor.rs`（光标怎么走） |
 | **排查「窗口一闪就退出」/ 启动不起来** | 先看 `data/startup.log`（`startup_log.rs` 写的）。启动期故障**全发生在窗口出现之前**，这是唯一现场。★ 若连它都没有 ⇒ 程序根本没跑到 `run()`（缺 DLL、被拦、双击的不是这个 exe）。`run.cmd` 现在会**等 4 秒确认进程还活着**，失败就把这份日志打出来 |
 | 改审计字段 / 加发送台账 | `storage/src/{db,store}.rs` + `automation-core/src/audit.rs` |
 | 改证据脱敏方式 | `vision/src/evidence.rs`（涂灰逻辑）+ `storage/src/evidence.rs`（落盘与清理） |
@@ -372,6 +427,7 @@ draw_cursor_circle
 | `apps/desktop/src-tauri/tests/ipc_flow.rs` | 1547 | IPC 全链路（`MockRuntime`）+ **装配期该拒绝什么** + 热键命令的往返与校验 | `cargo test -p desktop` |
 | `apps/desktop/src-tauri/tests/live_smoke.rs` | 508 | 实机冒烟 | 手动 |
 | `apps/desktop/src-tauri/tests/live_wechat.rs` | 453 | **实机验证**（真实鼠标键盘，`#[ignore]`，强制 `stop_before_send`） | 见该文件头部注释 |
+| `tools/replay/src/{tests,ocr_tests}.rs` | 360 / 295 | **离线重放**（判据重跑 + 报告排版）与**真 OCR 归因**（假引擎，不依赖现场素材；`#[cfg(test, unix)]`） | `cargo test -p replay` |
 
 全量：`CARGO_INCREMENTAL=0 cargo test --workspace --no-fail-fast`
 （`--no-fail-fast` 不能省，否则首个失败目标会中断整轮）。

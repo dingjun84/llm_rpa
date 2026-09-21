@@ -68,17 +68,17 @@ export function TypingTextSection({ draft, onPatch }: Props) {
       </label>
 
       <label className="field">
-        <span className="field-label">搜索下拉里「联系人」分组的标题</span>
+        <span className="field-label">搜索下拉里联系人分组标题（可多项）</span>
         <input
           type="text"
           value={draft.search_contact_group_label}
           onChange={(event) => update("search_contact_group_label", event.target.value)}
         />
         <span className="field-hint">
-          下拉是<strong>分组</strong>的（联系人 / 聊天记录 / 群聊…），
-          只有「联系人」这一组下面才是人。编排时会先找这个标题，
-          再<strong>只往它下方</strong>找匹配输入词的那一行——
-          否则会把「聊天记录里提到这个名字」当成联系人，点进去就是别的地方。
+          下拉是<strong>分组</strong>的。默认「联系人 / 最常使用」——Mac 微信上人有时
+          只出现在「最常使用」底下。可写多项，用 <code>/</code>、<code>、</code> 或空白隔开；
+          编排时对每一项各自找标题，只在该标题与下一个已知分区标题（群聊 / 聊天记录 /
+          公众号 / 小程序）之间找人——否则会把「聊天记录里提到这个名字」当成联系人。
           同样不能留空。
         </span>
       </label>

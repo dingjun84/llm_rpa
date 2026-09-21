@@ -109,6 +109,15 @@ pub fn encode_png(image: &RgbaImage) -> VisionResult<Vec<u8>> {
     Ok(buffer.into_inner())
 }
 
+/// 把 PNG 字节解回图像。
+///
+/// 存在的理由是**不让调用方也依赖 `image`**：诊断图要先编码落盘、
+/// 再读回来拼总图（编码后只有几十 KB，比常驻一张解码图省得多），
+/// 而"怎么解码 PNG"是视觉层的活，不该漏到命令层去。
+pub fn decode_png(bytes: &[u8]) -> VisionResult<RgbaImage> {
+    Ok(image::load_from_memory(bytes)?.to_rgba8())
+}
+
 /// 按最大宽度等比缩小；宽度已在限制内时**原样借用**，不做任何复制。
 ///
 /// 用途是压小经 IPC 送进界面的预览图：一张 4K 窗口截图编码成 PNG 再转 base64

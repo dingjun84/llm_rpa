@@ -7,26 +7,15 @@
 //! 所以它们既要在编排上分开（`Workflow`），也要在代码上分开，
 //! 免得改一条路时误伤另一条。
 //!
-//! 这里的东西全都只被这条路用到：`normalize_text` / `resolve_extra` /
-//! `profile_scroll_anchor` 也一样（列表式不读任何"新增区域"，
-//! 它只用有出厂默认值的 `regions` 那四项）。
+//! 这里的东西全都只被这条路用到：`resolve_extra` / `profile_scroll_anchor` 也一样
+//! （列表式不读任何"新增区域"，它只用有出厂默认值的 `regions` 那四项）。
+//!
+//! ⚠️ **判据本身不在这里**：`在下拉里挑人`那条判据搬到了 [`crate::dropdown`]，
+//! 因为离线重放要拿同一份判据重跑（`docs/todo.md` T29）。这里只剩"怎么走到那一步"。
 
 use super::*;
 
-/// 把一行识别结果压成"只留可见字符"的形式，用于**包含**判断。
-///
-/// ## 为什么必须归一化
-///
-/// `Windows.Media.Ocr` 经常在字与字之间塞进空格（实测把「外部测试联系人」
-/// 读成「外部 测试 联系人」），全角与半角也会混。不归一化的话，
-/// "下拉里那一行是否包含输入的关键词"就会因为一个空格而判否——
-/// 而现象是"搜出来的联系人一个都没匹配上"，看起来像搜索没生效。
-///
-/// 只去掉空白与控制字符，**不做同音字/近形字替换**：那是另一回事，
-/// 而且会引入"看起来像就算匹配"这种本项目明确拒绝的判据。
-pub(super) fn normalize_text(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace() && !c.is_control()).collect()
-}
+use crate::dropdown::{judge_dropdown, normalize_text};
 
 impl Run<'_> {
     /// 取一个**新增区域**（标定页里那些还没有出厂默认值的项）并换算成屏幕坐标。
@@ -137,7 +126,7 @@ impl Run<'_> {
         //
         // 失败时顺手核对一次搜索框里到底是什么。**只在失败路径上做**：
         // 顺利时它是一次多余的截图 + 一次多余的识别，而顺利时没有任何疑问要回答。
-        match self.pick_contact_from_dropdown(&boxes, &keyword) {
+        match self.pick_contact_from_dropdown(&boxes, &keyword, "搜索下拉识别") {
             Ok(hit) => Ok(hit),
             Err(err) => Err(self.diagnose_search_field(err, search, &keyword)),
         }
@@ -180,104 +169,32 @@ impl Run<'_> {
     }
 }
 impl Run<'_> {
-    /// 在下拉列表里挑出目标联系人。
+    /// 在下拉列表里挑出目标联系人，并把**每个候选为什么**交给诊断记录器。
     ///
-    /// ## 判据（操作者 2026-09-19 指定）
+    /// 判据本身在 [`crate::dropdown::judge_dropdown`]：**同一个函数**同时产出结论与轨迹
+    /// （见那边的模块文档）。这里只把配置喂进去、把结论用起来、把轨迹交出去——
+    /// 一句判据都不再写，免得"界面上看到的理由"与"实际用的规则"各说各话
+    /// （`CONVENTIONS.md` §1.3）。
     ///
-    /// 下拉列表是**分组**的：先一行「联系人」标题，标题下面才是匹配到的人；
-    /// 再往下可能还有「聊天记录」「群聊」之类的分组。所以不能整块找
-    /// "文字包含输入词"——那样会把聊天记录里提到这个名字的消息也算进来，
-    /// 点下去就点进了别的地方。
-    ///
-    /// 规则：取「联系人」标题**下方**、文字**包含**输入词的块。
-    ///
-    /// - 找不到「联系人」标题 ⇒ 转人工（这一屏根本没有联系人分组）
-    /// - 标题下方一个都没匹配上 ⇒ 转人工
-    /// - 匹配上多个 ⇒ 转人工（同名，或者备注里也带着这个名字），列出候选
-    ///
-    /// ## 为什么是"包含"而不是逐字相等
-    ///
-    /// 下拉里的行常带着附加信息（备注名、微信号），逐字相等会一个都匹配不上。
-    /// 这是操作者明确要求的判据，代价是**可能**选中一行只是"备注里含这个名字"
-    /// 的记录——所以下面那两道"多个就转人工"的闸门不能省。
+    /// `step` 是这一步在任务日志里的名字（与上面那次 `capture_and_recognize` 用的同一个），
+    /// 决策记录靠它对上那一帧画面。
     pub(super) fn pick_contact_from_dropdown(
         &self,
         boxes: &[TextBox],
         keyword: &str,
+        step: &str,
     ) -> Result<TextBox, AutomationError> {
-        let group = self.cfg().search_contact_group_label.trim().to_string();
-        let group_needle = normalize_text(&group);
-        let needle = normalize_text(keyword);
-        let min_confidence = self.cfg().min_confidence;
-
-        // ── 先找出「联系人」这个分组标题 ────────────────────────────
-        //
-        // **先要逐字相等，找不到才退到「包含」**。
-        //
-        // 只用「包含」是不够的，而且会错得很隐蔽：下拉里的聊天记录行常常长成
-        // 「和 张三 的聊天」，它**也**含「联系人」这三个字。于是一旦按
-        // "最上面那个含「联系人」的块"去认标题，就可能认到一行聊天记录上，
-        // 而它下面根本没有联系人分组——后面整段判据全部错位，
-        // 症状是"点到了不相干的一行"，看不出是标题认错了。
-        //
-        // 逐字相等先命中就轮不到聊天记录行来冒充；退到「包含」是留给
-        // OCR 把标题多读出一个字符的情况（那是"包含"要兜的原始场景）。
-        // 两级都取**最上面**那一个：同一个词可能因为排版被拆成两块。
-        let title = boxes
-            .iter()
-            .filter(|b| b.confidence >= min_confidence)
-            .filter(|b| normalize_text(&b.text) == group_needle)
-            .min_by_key(|b| b.bounds.y)
-            .or_else(|| {
-                boxes
-                    .iter()
-                    .filter(|b| b.confidence >= min_confidence)
-                    .filter(|b| normalize_text(&b.text).contains(&group_needle))
-                    .min_by_key(|b| b.bounds.y)
-            });
-        let Some(title) = title else {
-            return Err(AutomationError::NeedsHumanReview(format!(
-                "搜索下拉列表里没有找到「{group}」这一组，读到 {} 块文字。\
-                 常见原因：关键词没匹配到任何联系人（下拉里只有聊天记录或群聊），\
-                 或者「搜索下拉列表」区域标定偏了。",
-                boxes.len()
-            )));
-        };
-
-        // 标题**下方**的块，按 y 取——OCR 给出的块顺序不保证是按位置排的。
-        let below_title = title.bounds.y + title.bounds.height;
-        let hits: Vec<&TextBox> = boxes
-            .iter()
-            .filter(|b| b.confidence >= min_confidence)
-            .filter(|b| b.bounds.y >= below_title)
-            .filter(|b| normalize_text(&b.text).contains(&needle))
-            .collect();
-
-        match hits.len() {
-            1 => Ok(hits[0].clone()),
-            0 => {
-                let seen: Vec<TextBox> = boxes
-                    .iter()
-                    .filter(|b| b.bounds.y > title.bounds.y)
-                    .cloned()
-                    .collect();
-                Err(AutomationError::NeedsHumanReview(format!(
-                    "「{group}」分组下方没有匹配「{keyword}」的那一行。\
-                     这一组下方的文字是：{}",
-                    describe_candidates(&seen)
-                )))
-            }
-            count => {
-                let names: Vec<&str> = hits.iter().map(|b| b.text.trim()).collect();
-                Err(AutomationError::AmbiguousVision(format!(
-                    "「{group}」分组下方有 {count} 行都匹配「{keyword}」：{}。\
-                     拒绝猜测该点哪一个——同名或备注里含这个名字时，点错人会把消息发错对象。",
-                    names.join(" / ")
-                )))
-            }
-        }
+        let judgement = judge_dropdown(
+            boxes,
+            keyword,
+            &self.cfg().search_contact_group_label,
+            self.cfg().min_confidence,
+        );
+        self.report_decision(step, judgement.decision);
+        judgement.result
     }
 }
+
 impl Run<'_> {
     /// 搜索式：点一下下拉列表里那一行，进入这个人的**资料页**。
     ///

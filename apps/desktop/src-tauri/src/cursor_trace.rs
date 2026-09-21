@@ -133,9 +133,51 @@ pub fn draw_cursor_circle<R: Runtime>(app: AppHandle<R>) -> Result<CircleTraceVi
             end_distance_px: trace.end_distance_px(),
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        use platform_macos::{macosapi, MacOSDesktopConfig};
+
+        let window = app
+            .get_webview_window("main")
+            .ok_or_else(|| "找不到本程序的主窗口".to_string())?;
+        let size = window
+            .inner_size()
+            .map_err(|err| format!("读不到本程序窗口的尺寸：{err}"))?;
+
+        let radius = (size.width.min(size.height) / 2) as i32;
+        if radius <= 0 {
+            return Err(format!(
+                "本程序窗口太小（{}×{}），算不出半径——先把窗口拉大一点。",
+                size.width, size.height
+            ));
+        }
+
+        if !macosapi::accessibility_trusted() {
+            return Err(
+                "未授予「辅助功能」权限，系统会静默忽略鼠标移动。请到「系统设置 → 隐私与安全性 → 辅助功能」中启用本应用；若还需要截屏/找窗口，请同时开启「屏幕录制」。"
+                    .into(),
+            );
+        }
+
+        let speed_px_per_sec = MacOSDesktopConfig::default().pointer_speed_px_per_sec;
+        let center = macosapi::cursor_position()?;
+        let trace = macosapi::move_cursor_circle(center, radius, speed_px_per_sec)?;
+
+        Ok(CircleTraceView {
+            center: [trace.center.0, trace.center.1],
+            radius: trace.radius,
+            window_width: size.width,
+            window_height: size.height,
+            steps: trace.steps,
+            duration_ms: trace.duration.as_millis() as u64,
+            speed_px_per_sec,
+            end: [trace.end.0, trace.end.1],
+            end_distance_px: trace.end_distance_px(),
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = app;
-        Err("鼠标轨迹自检目前只支持 Windows".to_string())
+        Err("鼠标轨迹自检目前只支持 Windows / macOS".to_string())
     }
 }

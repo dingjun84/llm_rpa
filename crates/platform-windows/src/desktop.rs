@@ -47,6 +47,24 @@ pub struct WindowsDesktop {
     target: Mutex<Option<isize>>,
 }
 
+
+fn metrics_for_window_rect(rect: Rect) -> ScreenMetrics {
+    let (width, height, scale_factor) = winapi::metrics_for_rect(rect);
+    if width == 0 || height == 0 {
+        let (width, height) = winapi::primary_screen_size();
+        return ScreenMetrics {
+            width,
+            height,
+            scale_factor: winapi::scale_factor_for_rect(rect),
+        };
+    }
+    ScreenMetrics {
+        width,
+        height,
+        scale_factor,
+    }
+}
+
 impl WindowsDesktop {
     pub fn new(config: WindowsDesktopConfig) -> Self {
         Self { config, target: Mutex::new(None) }
@@ -104,7 +122,8 @@ impl WindowsDesktop {
         if rect.is_degenerate() {
             return Err(AutomationError::ClientNotReady);
         }
-        Ok((rect, self.screen_metrics()?))
+        // 缩放必须用**窗口所在屏**，与任务装配 `screen_metrics` 同一套。
+        Ok((rect, metrics_for_window_rect(rect)))
     }
 
     fn locate(&self) -> Result<HWND, AutomationError> {
@@ -346,7 +365,19 @@ impl DesktopPlatform for WindowsDesktop {
         winapi::resize_window(hwnd, width, height).map_err(AutomationError::Platform)
     }
 
+    fn measure_target_window(&self) -> Result<(Rect, ScreenMetrics), AutomationError> {
+        self.measure()
+    }
+
     fn screen_metrics(&self) -> Result<ScreenMetrics, AutomationError> {
+        // 已定位到目标窗时，用它所在显示器；否则退回主屏。
+        if let Ok(hwnd) = self.current_target() {
+            if let Ok(rect) = winapi::window_rect(hwnd) {
+                if !rect.is_degenerate() {
+                    return Ok(metrics_for_window_rect(rect));
+                }
+            }
+        }
         let (width, height) = winapi::primary_screen_size();
         if width == 0 || height == 0 {
             return Err(AutomationError::Platform("无法读取主显示器尺寸".into()));
@@ -396,7 +427,12 @@ impl DesktopPlatform for WindowsDesktop {
         winapi::left_click().map_err(AutomationError::Platform)
     }
 
-    fn scroll(
+        fn move_pointer(&self, target: Point) -> Result<(), AutomationError> {
+        winapi::move_cursor(target.x, target.y, self.config.pointer_speed_px_per_sec)
+            .map_err(AutomationError::Platform)
+    }
+
+fn scroll(
         &self,
         at: Point,
         notches: i32,

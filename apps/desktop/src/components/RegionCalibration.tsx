@@ -33,7 +33,7 @@ import type { RegionConfig } from "../types";
  * 和后端不一样的区域。
  *
  * `contact_panel` 的左边界是 0.14 而不是 0.0：微信会话列表左侧的导航图标栏
- * 与头像列会被 OCR 按行并进联系人姓名里（实测把「丁俊」读成「0 丁俊」），
+ * 与头像列会被 OCR 按行并进联系人姓名里（实测把「李四」读成「0 李四」），
  * 而姓名匹配是**逐字精确**的，多一个字就永远匹配不上。
  * 详细实测数据见 `automation_core::DEFAULT_CONTACT_PANEL` 的文档。
  */

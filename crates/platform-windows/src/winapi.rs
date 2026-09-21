@@ -14,9 +14,11 @@ use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HWND, LPARAM, MAX_PATH, POINT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    GetDeviceCaps, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HGDIOBJ, LOGPIXELSX, SRCCOPY,
+    GetDeviceCaps, GetMonitorInfoW, MonitorFromRect, ReleaseDC, SelectObject, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, LOGPIXELSX, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 // `PrintWindow` 虽然在 user32 里，但 windows-rs 把它归到了 `Storage::Xps` 下。
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::DataExchange::{
@@ -473,6 +475,8 @@ pub fn primary_screen_size() -> (u32, u32) {
 }
 
 /// 主显示器的缩放比例（1.0 表示 100%）。
+///
+/// 标定与任务挑选请用 [`scale_factor_for_rect`]：多显示器 DPI 不同时主屏值会记错档。
 pub fn primary_scale_factor() -> f32 {
     unsafe {
         let dc = GetDC(None);
@@ -486,6 +490,49 @@ pub fn primary_scale_factor() -> f32 {
         } else {
             dpi as f32 / 96.0
         }
+    }
+}
+
+/// 窗口矩形所在显示器的缩放（有效 DPI / 96）。
+pub fn scale_factor_for_rect(rect: Rect) -> f32 {
+    let (_, _, scale) = metrics_for_rect(rect);
+    scale
+}
+
+/// 窗口所在显示器的逻辑像素尺寸 + 缩放（与 [`scale_factor_for_rect`] 同一套屏）。
+pub fn metrics_for_rect(rect: Rect) -> (u32, u32, f32) {
+    let win_rect = windows::Win32::Foundation::RECT {
+        left: rect.x,
+        top: rect.y,
+        right: rect.x.saturating_add(rect.width),
+        bottom: rect.y.saturating_add(rect.height),
+    };
+    unsafe {
+        let monitor = MonitorFromRect(&win_rect, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut width = 0u32;
+        let mut height = 0u32;
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            width = (info.rcMonitor.right - info.rcMonitor.left).max(0) as u32;
+            height = (info.rcMonitor.bottom - info.rcMonitor.top).max(0) as u32;
+        }
+        let mut dpi_x = 0u32;
+        let mut dpi_y = 0u32;
+        let scale = if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok()
+            && dpi_x > 0
+        {
+            dpi_x as f32 / 96.0
+        } else {
+            primary_scale_factor()
+        };
+        if width == 0 || height == 0 {
+            let (w, h) = primary_screen_size();
+            return (w, h, scale);
+        }
+        (width, height, scale)
     }
 }
 
