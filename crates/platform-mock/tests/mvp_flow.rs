@@ -2340,12 +2340,79 @@ fn a_failed_search_reports_what_is_actually_in_the_search_box() {
     );
 }
 
-/// 资料页里找不到「发消息」入口 ⇒ 转人工，并指向那两个可能的原因。
+/// 资料页上没有「发消息」入口 ⇒ **跳过它**，改由聊天页标题定夺。
+///
+/// ## 为什么这不再是一次失败（2026-09-22 实测改的）
+///
+/// 落到聊天页时，右上栏顶部显示的也是目标的名字，所以「资料页上认到了人」
+/// 这一关拦不住——**只有"资料页上有没有那个入口"分得出来**。原来这里是一记
+/// 硬失败（`data/tasks/775ce13e-…` 的现场：截图里明明已经停在聊天页、底部
+/// 输入框都在，任务却报"资料页里没有找到「发消息」"并以 `NeedsHumanReview`
+/// 结束），而失败文案把人引向"标定偏了 / 客户端版本变了"，与真实原因相反。
+///
+/// 这里钉住三件事：
+/// - 认到人、却没有入口 ⇒ 不报错，少一次点击（就是「发消息」那一下）；
+/// - `OpeningChatFromProfile` **仍然走**——"找过入口"确实是这一步做的事；
+/// - 该走完的照样走完：正文仍填进输入框，最终仍会发出去。
 #[test]
-fn a_profile_without_the_chat_entry_is_a_human_review() {
+fn a_profile_without_the_chat_entry_is_skipped() {
     let mut script = search_script(CONTACT);
     // 资料页滚到底之后读到的是别的东西，没有「发消息」。
     script[2] = ScriptedCall::Ok(vec![tb("朋友圈", 300, 0.99)]);
+    let fixture = search_fixture(script);
+
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
+
+    let states = fixture.progress.states();
+    assert!(
+        states.contains(&TaskState::OpeningChatFromProfile),
+        "这一步确实进过——「找过入口」就是它做的事：{states:?}"
+    );
+    assert!(
+        states.contains(&TaskState::VerifyingChatHeader),
+        "没有入口时要靠聊天页标题定夺：{states:?}"
+    );
+
+    // 五次点击：导航图标 / 搜索框 / 下拉行 / 输入框 / 发送按钮。
+    // 少的那一次正是「发消息」——"跳过入口"看得见的那一半。
+    assert_eq!(
+        fixture.desktop.clicks.lock().unwrap().len(),
+        5,
+        "没有入口就不该点它"
+    );
+    assert_eq!(fixture.desktop.send_count(), 1, "跳过的只是入口，消息照发");
+
+    // 判定过程要留在证据里：事后看日志的人得能分清"没有入口所以跳过"
+    // 与"资料页上压根没认到人"——两者的后续动作一样，光看终态分不出来。
+    assert!(
+        outcome.evidence.iter().any(|line| line.contains("已跳过")),
+        "证据里要写明跳过了那两步：{:?}",
+        outcome.evidence
+    );
+    assert!(
+        outcome
+            .evidence
+            .iter()
+            .any(|line| line.contains("资料页上没有") && line.contains("发消息")),
+        "证据里要写明是哪一种没走成（这里是没有入口）：{:?}",
+        outcome.evidence
+    );
+}
+
+/// 没有入口 **且** 聊天页标题也对不上 ⇒ 这时才报错，报的是"没有入口"那条。
+///
+/// 两条路都走不通时，成因必须说清楚：报**资料页**那条（它回答"那一次点击把界面
+/// 带到哪儿去了"），同时把标题核验的结果也留在证据里——它是"不在资料页"这个
+/// 判断的另一半依据。
+#[test]
+fn a_missing_chat_entry_whose_header_also_mismatches_is_a_human_review() {
+    let mut script = search_script(CONTACT);
+    // 资料页上认到了人，但没有「发消息」入口。
+    script[2] = ScriptedCall::Ok(vec![tb("朋友圈", 300, 0.99)]);
+    // 聊天页标题上是别人 ⇒ 两条路都没认下来。
+    script[3] = ScriptedCall::Ok(vec![tb("另一个联系人", 16, 0.99)]);
     let fixture = search_fixture(script);
 
     let outcome = fixture.run(&fixture.task());
@@ -2354,6 +2421,14 @@ fn a_profile_without_the_chat_entry_is_a_human_review() {
     let reason = outcome.failure.as_ref().map(|f| f.reason.clone()).unwrap_or_default();
     assert!(reason.contains("发消息"), "要说清找的是哪几个字：{reason}");
     assert!(reason.contains("界面标定"), "要指出可能是区域标偏了：{reason}");
+    assert!(
+        outcome
+            .evidence
+            .iter()
+            .any(|line| line.contains("聊天页标题也没认下来")),
+        "标题核验的结果不能丢：{:?}",
+        outcome.evidence
+    );
     assert_eq!(fixture.desktop.send_count(), 0);
 }
 
@@ -2458,7 +2533,7 @@ fn a_click_that_changes_nothing_is_reported_as_such() {
 /// 这里钉住三件事：
 /// - 资料页上读不到目标时**不报错**，改由聊天页标题那条判据定论；
 /// - `OpeningChatFromProfile` 这一步真的没走（少一次滚动、少一次点击）；
-/// - 该走完的照样走完：正文仍填进输入框，确认之后仍会发出去。
+/// - 该走完的照样走完：正文仍填进输入框，然后直接发出去。
 #[test]
 fn a_click_that_lands_in_an_existing_chat_skips_the_profile_page() {
     let fixture = search_fixture(vec![

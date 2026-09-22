@@ -1,6 +1,10 @@
 //! **搜索式工作流**（`Workflow::SearchContact`）：点搜索框 → 逐字输入 →
 //! 从联想下拉里挑人 → 资料页 → 点「发消息」→ 输入正文。
 //!
+//! ⚠️ 「资料页 → 点发消息」这半段**不是必经的**：目标已经有会话时，客户端在
+//! 点下拉那一行的当口就直接打开了那份聊天记录。两种落点的收尾是同一件事
+//! （核验聊天页标题），判据与顺序见 [`Run::open_chat_from_dropdown`]。
+//!
 //! 单独成文件是因为它与列表扫描式**看的是完全不同的界面**：
 //! 前者看顶部的联想下拉与右侧资料页，后者看左侧的会话列表。
 //! 两条路的失败现象一模一样（都是「找不到联系人」），而处置方向完全相反——
@@ -27,6 +31,30 @@ pub(super) enum ProfileReview {
     /// 资料页上就是他，可以点「发消息」了。
     Verified,
     /// 资料页上没看到目标。带着原因：万一后面那条路也走不通，
+    /// 它才是"为什么停下来"的答案（见 [`Run::open_chat_from_dropdown`]）。
+    NotFound(AutomationError),
+}
+
+/// [`Run::open_chat_from_profile`] 的结论。
+///
+/// 与 [`ProfileReview`] 是**同一个成因的另一半**：点完下拉那一行不保证落在资料页。
+/// 目标已经有会话时，客户端会直接打开那份聊天记录，而这时 `verify_profile`
+/// 往往还是会通过——聊天页右上栏顶部显示的也是他的名字。
+/// 于是"资料页上认到了人"这一条会漏掉这种落点，**只有资料页上有没有那个入口
+/// 才分得出来**。
+///
+/// 2026-09-22 实测（`data/tasks/775ce13e-…`）：界面其实已经停在聊天页上了
+/// （截图里能看到历史消息与底部输入框），资料区里读到的是聊天记录与时间戳，
+/// 一个「发消息」都没有。原来这一条会把任务判成失败，而失败文案
+/// （"资料页里没有找到「发消息」这个入口"）会把人引向"标定偏了 / 客户端版本变了"
+/// 这两个错误方向——真正发生的事只是"这一跳落在了别处"。
+///
+/// 所以这里也**不自己下结论**：找不到入口 ⇒ 交回调用方，由聊天页标题那道判据
+/// 定论。它才是"点对了人"的唯一结论，这里不再另立一套猜测。
+pub(super) enum ChatEntry {
+    /// 找到了入口并点了它。
+    Opened,
+    /// 没找到入口，**什么都没点**。带着原因：万一标题核验也过不去，
     /// 它才是"为什么停下来"的答案（见 [`Run::open_chat_from_dropdown`]）。
     NotFound(AutomationError),
 }
@@ -271,10 +299,20 @@ impl Run<'_> {
     /// ## 判据的顺序不能颠倒
     ///
     /// 先按**资料页**核验（它是常态，也是唯一能挡住重名的那一关），只有
-    /// "资料页上没有他"时才去问**聊天页标题区**。反过来先看标题区不行：
+    /// "资料页上没走成"时才去问**聊天页标题区**。反过来先看标题区不行：
     /// 资料页上那个名字也在右侧面板顶部，与本机标定的标题区只差 2 像素，
     /// 照它判断会把"还在资料页"认成"已经在聊天里"，接着那次输入就落在
     /// 没有输入框的界面上。
+    ///
+    /// ## "没走成"有两种表现（2026-09-22 补第二种）
+    ///
+    /// 1. [`ProfileReview::NotFound`]：资料页上没认到目标；
+    /// 2. [`ChatEntry::NotFound`]：资料页上认到了目标，**但没有「发消息」入口**。
+    ///
+    /// 第 2 种是实测补上的（`data/tasks/775ce13e-…`）：落到聊天页时，右上栏顶部
+    /// 也是他的名字，所以第 1 条拦不住；而"没有入口"原来是一记硬失败，于是
+    /// 一次**本来能走完**的任务被判成 `NeedsHumanReview`。两种表现的成因与处置
+    /// 完全一样，所以合成一条路只走一遍。
     ///
     /// 两条路最后都过同一道标题核验（[`Self::verify_chat_header`]）：
     /// "点对了人"只有它能定论，这里不另立一套"看起来像聊天页"的猜测。
@@ -283,22 +321,38 @@ impl Run<'_> {
         matched: &TextBox,
     ) -> Result<(), AutomationError> {
         self.click_dropdown_row(matched)?;
-        let profile_reason = match self.verify_profile()? {
-            ProfileReview::Verified => {
-                self.open_chat_from_profile()?;
-                self.advance(TaskState::VerifyingChatHeader, None)?;
-                return self.verify_chat_header();
-            }
+
+        // 「这一跳没落在资料页上」有两种表现：成因同一个（客户端直接打开了已有会话）、
+        // 处置也同一个（往下走标题核验）。
+        //   ① 资料页上没认到人 —— `ProfileReview::NotFound`；
+        //   ② 认到人了，可资料页上**没有那个入口** —— `ChatEntry::NotFound`。
+        //      （聊天页右上栏顶部也是他的名字，所以①漏得掉这一种，见 `ChatEntry`。）
+        // 所以合成一条路只走一遍，只在证据里分开说清是哪一种。
+        let reason = match self.verify_profile()? {
+            ProfileReview::Verified => match self.open_chat_from_profile()? {
+                ChatEntry::Opened => {
+                    self.advance(TaskState::VerifyingChatHeader, None)?;
+                    return self.verify_chat_header();
+                }
+                ChatEntry::NotFound(reason) => {
+                    self.evidence.push(format!(
+                        "资料页上没有「{}」这个入口（{reason}）——大概率这一跳压根\
+                         没落在资料页上。跳过它，改由聊天页标题定夺。",
+                        self.cfg().profile_chat_entry_text.trim()
+                    ));
+                    reason
+                }
+            },
             ProfileReview::NotFound(reason) => reason,
         };
 
-        // 资料页上没有他 ⇒ 多半是客户端直接打开了已有的会话。是不是，
+        // 资料页这一步没走成 ⇒ 多半是客户端直接打开了已有的会话。是不是，
         // 交给人就在聊天页上的那份判据去说——不再多截一帧、不再多一套判断。
         self.advance(TaskState::VerifyingChatHeader, None)?;
         match self.verify_chat_header() {
             Ok(()) => {
                 self.evidence.push(format!(
-                    "资料页上没认到目标（{profile_reason}），但聊天页标题就是目标 ⇒ \
+                    "没走成「资料页 / 点发消息」这一段（{reason}），但聊天页标题就是目标 ⇒ \
                      判定客户端直接打开了已有的会话，已跳过「资料页 / 点发消息」两步。"
                 ));
                 Ok(())
@@ -310,7 +364,7 @@ impl Run<'_> {
                 self.evidence.push(format!(
                     "（跳过资料页之后，聊天页标题也没认下来：{header_reason}）"
                 ));
-                Err(profile_reason)
+                Err(reason)
             }
         }
     }
@@ -392,7 +446,23 @@ impl Run<'_> {
     /// 资料页上那个入口**有文字**（默认「发消息」），而图标没有。有文字的
     /// 地方就用 OCR：模板必须由人对着资料页再截一张图，而文字判据不用。
     /// 实测发现读不到时再补模板那条退路——在那之前不做投机性的抽象。
-    pub(super) fn open_chat_from_profile(&mut self) -> Result<(), AutomationError> {
+    ///
+    /// ## 找不到入口为什么不报错（2026-09-22 改）
+    ///
+    /// 这条路上"没有入口"**不等于**"出了错"：目标已经有会话时，客户端在
+    /// [`Self::click_dropdown_row`] 那一下就直接打开了那份聊天记录，界面停在
+    /// **聊天页**上，资料页这一步压根没发生——而聊天页右上栏顶部显示的同样是
+    /// 他的名字，所以 [`Self::verify_profile`] 拦不住这一种。
+    ///
+    /// 于是这里返回 [`ChatEntry::NotFound`] 交回调用方，由聊天页标题那道判据
+    /// 定论（[`Self::open_chat_from_dropdown`]）。原来这里是硬失败，代价是
+    /// 一次**本来可以走完**的任务被判成 `NeedsHumanReview`，而且失败文案
+    /// （"资料页里没有找到「发消息」"）指向的是"标定偏了 / 客户端版本变了"，
+    /// 与真实原因相反。
+    ///
+    /// ⚠️ 注意这一步**已经**进了 [`TaskState::OpeningChatFromProfile`]：状态进
+    /// 了、入口没找到，两者不矛盾——"找过入口"本身就是这一步做的事。
+    pub(super) fn open_chat_from_profile(&mut self) -> Result<ChatEntry, AutomationError> {
         self.advance(TaskState::OpeningChatFromProfile, None)?;
         let profile = self.resolve_extra(self.cfg().contact_profile, "联系人资料区域")?;
         let body = self.resolve(self.cfg().chat_body, "聊天正文区")?;
@@ -419,13 +489,24 @@ impl Run<'_> {
             .filter(|b| b.confidence >= self.cfg().min_confidence)
             .filter(|b| normalize_text(&b.text).contains(&needle))
             .min_by_key(|b| b.bounds.y)
-            .cloned()
-            .ok_or_else(|| {
-                AutomationError::NeedsHumanReview(format!(
-                    "资料页里没有找到「{entry_text}」这个入口（已经滚到最下面）。\
-                     请确认这一项文字与当前客户端对得上，或到「界面标定」页核对「联系人资料区域」。"
-                ))
-            })?;
+            .cloned();
+
+        let entry = match entry {
+            Some(entry) => entry,
+            // 没找到入口 ⇒ **什么都不点**，把原因交回调用方。
+            // 文案保留原来的两个排查方向（这一项文字对不对、区域标没标偏）——
+            // 它们仍然是"真的站在资料页上却读不到入口"时的正确答案。
+            None => {
+                return Ok(ChatEntry::NotFound(AutomationError::NeedsHumanReview(
+                    format!(
+                        "资料页里没有找到「{entry_text}」这个入口（已经滚到最下面）。\
+                         请确认这一项文字与当前客户端对得上，或到「界面标定」页核对\
+                         「联系人资料区域」；若对方已经有会话，客户端会直接打开聊天，\
+                         这时没有入口是正常的，任务会靠聊天页标题继续。"
+                    ),
+                )))
+            }
+        };
 
         let screen = entry.bounds.to_screen(Point { x: profile.x, y: profile.y });
         let target = screen.center();
@@ -444,7 +525,7 @@ impl Run<'_> {
         self.wait_for_settle(body)?;
         self.last_click_reacted =
             Some(self.capture_frame(body, "打开聊天后")?.fingerprint != body_before);
-        Ok(())
+        Ok(ChatEntry::Opened)
     }
 }
 impl Run<'_> {
@@ -456,6 +537,14 @@ impl Run<'_> {
     /// 与 [`Self::scroll_to_top`] 是对称的，但刻意不复用同一个函数：那个滚的是
     /// 会话列表、用的是列表的落点；这个滚的是资料面板。合成一个带方向参数的函数，
     /// 会让"用错了落点"变成一次静默的滚错区域——而现象只是"找不到入口"。
+    ///
+    /// ⚠️ **落点不在资料页上时会怎样**（对方已有会话 ⇒ 界面停在聊天页，
+    /// 见 [`Self::open_chat_from_profile`] 的「找不到入口为什么不报错」一节）：
+    /// 滚轮方向按"向下 = 看更靠后的内容"定（[`DesktopPlatform::scroll`]），
+    /// 在聊天页里就是**朝向最新的那条消息**。也就是说这里要么什么都不做
+    /// （本来就在最底下），要么把聊天滚回最底下——**不会**滚进历史记录里。
+    /// 这一点值得写下来：否则"在聊天页上滚了资料面板"看起来像会把视图搞乱，
+    /// 而实际上它是安全的，跳过分支才敢照走不误。
     pub(super) fn scroll_profile_to_bottom(&mut self, profile: Rect) -> Result<(), AutomationError> {
         let mut previous: Option<String> = None;
         // 多滚一次是"空滚"：只有再滚一下、看到画面不再变化，才能确认已经到底。
