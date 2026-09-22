@@ -119,9 +119,14 @@ Draft
                     → OpeningChatFromProfile → VerifyingChatHeader
                     → PreparingMessage → Sending → VerifyingDelivery → Completed
 
-   ★ 点完下拉那一行**不一定**落在资料页：对方已有会话时客户端直接打开那份聊天记录，
-     于是 `VerifyingProfile` 直接跳到 `VerifyingChatHeader`（少走 `OpeningChatFromProfile`）。
-     这条边是刻意允许的，判据顺序见 `docs/todo.md` T32。
+   ★ 点完下拉那一行**不一定**落在资料页：对方已有会话时客户端直接打开那份聊天记录。
+     这种情况有两种表现，都允许（判据顺序见 `docs/todo.md` T32）：
+     - 资料页上没认到目标 ⇒ `VerifyingProfile` 直接跳到 `VerifyingChatHeader`
+       （少走 `OpeningChatFromProfile`）；
+     - 资料页上认到了目标、却**没有「发消息」入口** ⇒ 照常走
+       `OpeningChatFromProfile`（这一步确实找过入口），再从那儿跳到
+       `VerifyingChatHeader`。聊天页右上栏顶部也是他的名字，所以前一条拦不住，
+       **必须**靠"有没有入口"分出来（2026-09-22 补）。
 
 ③ ScrollListContact（列表扫描式，原有那条）
    WaitingForClient → SearchingContact → VerifyingCandidate
