@@ -9,8 +9,8 @@ use std::time::Duration;
 use automation_core::{
     AuditEntry, CalibratedWindow, CancelToken, DiagnosticRecorder, IconLocator, IconTemplate,
     MemoryAudit, MemorySendLedger, Observation, ProgressSink, Rect, RunOutcome, RunnerConfig,
-    RunnerPorts, ScreenMetrics, SendTask, StateChange, TaskId, TaskState, Workflow, WorkflowRunner,
-    DEFAULT_NAV_STRIP,
+    RunnerPorts, ScreenMetrics, SendTask, StateChange, TaskId, TaskState, TextBox, Workflow,
+    WorkflowRunner, DEFAULT_NAV_STRIP,
 };
 use platform_mock::{
     tb, ConfirmationOutcome, Fault, MockDesktop, MockHumanConfirmation, MockIconLocator, MockOcr,
@@ -41,6 +41,31 @@ fn nav_template() -> IconTemplate {
     }
 }
 
+/// 「发送按钮区」那一步的识别结果 —— 插在两帧正文中间的那一段。
+///
+/// 自写脚本的用例都要带上它：发送动作是"在发送按钮区里认字 + 点它"，
+/// 所以 OCR 序列里多了一步。漏了它的报错会是
+/// 「发送按钮区里没有找到『发送』这两个字」，看起来像靶标文字对不上，
+/// 而不像"脚本少写了一段"——所以宁可在这里给个统一的取值。
+fn send_button_boxes() -> Vec<TextBox> {
+    MockScenario::happy(CONTACT, MESSAGE).send_button
+}
+
+/// 把「发送按钮」的位置告诉替身：落点在这块里的点击才算一次发送。
+///
+/// 取值从**配置**里换算（`config.send_button`），不另写一份坐标——
+/// 两边不一致时 `send_count` 会恒为 0，那十几条"绝不能发送"的断言
+/// 全部静默失效（照样绿，却什么都没测）。
+///
+/// ⚠️ 自建 runner 的用例（不走 `Fixture::build*`）必须自己调它。
+fn arm_send_button(desktop: &MockDesktop, config: &RunnerConfig) {
+    if let Some(region) = config.send_button {
+        if let Ok(rect) = region.resolve_within(desktop.window()) {
+            desktop.script_send_button(rect);
+        }
+    }
+}
+
 fn list_config() -> RunnerConfig {
     RunnerConfig {
         platform_label: "test".into(),
@@ -50,6 +75,13 @@ fn list_config() -> RunnerConfig {
         // 否则会在导航那一步就转人工，而现象看起来像列表查找坏了。
         nav_icon_templates: vec![nav_template()],
         nav_target_label: "聊天历史".into(),
+        // 「发送按钮区」：发送动作要在这块区域里认出按钮再点它。
+        //
+        // 真实模式下它来自「界面标定」页那一项 `send_button`（没标就不许开跑，
+        // 见 `runtime/requirements.rs`）。测试里给一块固定区域即可——
+        // 真正要紧的是替身按**同一块区域**判断"这次点击算不算发送"，
+        // 那件事由 `Fixture::build_full` 从本字段换算，不在这里另写一份。
+        send_button: Some(automation_core::RelativeRegion::new(0.86, 0.90, 0.13, 0.08)),
         ..Default::default()
     }
 }
@@ -178,6 +210,7 @@ impl Fixture {
         matcher: Arc<dyn automation_core::ContactMatcher>,
         icons: Arc<dyn IconLocator>,
     ) -> Self {
+        arm_send_button(&desktop, &config);
         let desktop = Arc::new(desktop);
         let ocr = Arc::new(MockOcr::new(script));
         let confirmation = Arc::new(confirmation);
@@ -245,7 +278,14 @@ fn happy_path_reaches_completed() {
     assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
     assert!(outcome.succeeded());
     assert_eq!(fixture.desktop.send_count(), 1);
-    assert_eq!(fixture.desktop.pasted_texts(), vec![MESSAGE.to_string()]);
+    // 正文走的是**逐字输入**，不是粘贴：粘贴要过剪贴板（会覆盖操作者自己那份），
+    // 而这一步没有非用它不可的理由——搜索框与正文因此共用同一条输入路径。
+    assert!(
+        fixture.desktop.pasted_texts().is_empty(),
+        "发送不再经过剪贴板：{:?}",
+        fixture.desktop.pasted_texts()
+    );
+    assert_eq!(fixture.desktop.typed_texts(), vec![MESSAGE.to_string()]);
     assert_eq!(fixture.confirmation.call_count(), 1);
 }
 
@@ -282,7 +322,12 @@ fn ocr_only_receives_calibrated_sub_regions_never_the_full_window() {
     fixture.run(&fixture.task());
 
     let calls = fixture.ocr.calls.lock().unwrap().clone();
-    assert_eq!(calls, vec![(358, 634), (922, 72), (922, 518), (922, 518)]);
+    // 四块子区域，最后一帧（送达核验）与发送前那一帧尺寸相同：
+    // 候选区 → 标题 → 发送前正文 → **发送按钮区** → 发送后正文。
+    assert_eq!(
+        calls,
+        vec![(358, 634), (922, 72), (922, 518), (166, 58), (922, 518)]
+    );
     assert!(!calls.contains(&(1280, 720)), "不得扫描整屏");
 }
 
@@ -293,8 +338,12 @@ fn click_lands_on_the_matched_contact_centre_in_screen_coordinates() {
     fixture.run(&fixture.task());
 
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
-    // 三次受守卫的点击：导航图标 → 联系人 → 消息输入框。
-    assert_eq!(clicks.len(), 3, "应先点导航，再点联系人，再聚焦消息输入框");
+    // 四次受守卫的点击：导航图标 → 联系人 → 消息输入框 → 发送按钮。
+    assert_eq!(
+        clicks.len(),
+        4,
+        "应先点导航，再点联系人，再聚焦消息输入框，最后点发送按钮"
+    );
 
     // 期望值由**配置算出来**，不写死屏幕坐标。
     //
@@ -310,19 +359,45 @@ fn click_lands_on_the_matched_contact_centre_in_screen_coordinates() {
     // → 区域 (358,590,922,130)，中心 (819,655)
     assert_eq!(clicks[2].x, 819);
     assert_eq!(clicks[2].y, 655);
+
+    // 最后那一次必须落在「发送按钮区」里。这是"消息真的发出去了"的判据，
+    // 也是替身 `send_count` 唯一的来源——落到区外，消息就只是填进了输入框。
+    let button = list_config().send_button.expect("基线配置里有发送按钮区").resolve(DEFAULT_WINDOW);
+    assert!(
+        clicks[3].x >= button.x
+            && clicks[3].x < button.x + button.width
+            && clicks[3].y >= button.y
+            && clicks[3].y < button.y + button.height,
+        "发送那一次点击（{:?}）没有落在发送按钮区内（{:?}）",
+        clicks[3],
+        button
+    );
 }
 
+/// 正文必须落在**输入框**里，而这靠"先点一下输入框"保证。
+///
+/// 判据看的是**动作顺序**而不是最终状态：顺序反了（先敲字、再点输入框）
+/// 最终状态看起来一模一样，只是字落到了上一个有焦点的控件里。
 #[test]
-fn the_message_input_box_is_focused_before_pasting() {
+fn the_message_input_box_is_focused_before_typing() {
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
     let fixture = Fixture::new(&scenario);
     fixture.run(&fixture.task());
 
-    // 输入框必须**先**被点击，粘贴才会落到正确位置。
-    let clicks = fixture.desktop.clicks.lock().unwrap().clone();
-    let pasted = fixture.desktop.pasted.lock().unwrap().clone();
-    assert_eq!(clicks.len(), 3, "导航 + 联系人 + 输入框");
-    assert_eq!(pasted.len(), 1, "只应粘贴一次");
+    let operations = fixture.desktop.operations();
+    let typed_at = operations
+        .iter()
+        .position(|op| op == "type")
+        .expect("正文应当是逐字输入的：操作序列里没有 type");
+    let clicks_before = operations[..typed_at].iter().filter(|op| *op == "click").count();
+    assert_eq!(
+        clicks_before, 3,
+        "逐字输入正文之前应有三次点击：导航 / 联系人 / 输入框。实际序列：{operations:?}"
+    );
+
+    // 正文只输入一次，且不经剪贴板。
+    assert_eq!(fixture.desktop.typed_texts(), vec![MESSAGE.to_string()]);
+    assert!(fixture.desktop.pasted_texts().is_empty());
     assert!(fixture.desktop.send_count() >= 1);
 }
 
@@ -584,7 +659,11 @@ fn the_same_task_cannot_be_sent_twice() {
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
     let mut script = scenario.script();
     script.extend(scenario.script());
-    let desktop = Arc::new(MockDesktop::new());
+    let desktop = MockDesktop::new();
+    // 不走 `Fixture::build*` 的用例得自己把发送按钮的位置告诉替身，
+    // 否则"点发送"不会被记账，下面那条断言会变成恒真的空断言。
+    arm_send_button(&desktop, &list_config());
+    let desktop = Arc::new(desktop);
     let audit = Arc::new(MemoryAudit::new());
     let ledger = Arc::new(MemorySendLedger::new());
     let runner = WorkflowRunner::new(
@@ -654,7 +733,9 @@ fn transient_capture_failure_is_retried_and_recovers() {
         "失败原因：{:?}",
         outcome.failure
     );
-    assert_eq!(fixture.ocr.call_count(), 4, "失败的尝试不应触发识别");
+    // 五块区域各识别一次：候选区 / 标题 / 发送前正文 / 发送按钮 / 发送后正文。
+    // 那一次失败的 capture 不该计入——它连识别都没走到。
+    assert_eq!(fixture.ocr.call_count(), 5, "失败的尝试不应触发识别");
 }
 
 #[test]
@@ -722,11 +803,16 @@ fn audit_records_a_stable_failure_code_on_failure() {
     assert!(last.failure_reason.is_some());
 }
 
+/// 发送失败时，审计记录里**绝不能出现消息正文**。
+///
+/// 审计库是另一处存储，它的用途是"事后追责"，不是"存消息内容"。
+/// 这条用例让发送那一步失败，然后直接把整份审计渲染成文本搜一遍——
+/// 正文一旦被顺手写进去，这里立刻就会亮。
 #[test]
-fn audit_never_contains_the_clipboard_payload_of_a_failed_send() {
+fn audit_never_contains_the_message_body_after_a_failed_send() {
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
     let desktop = MockDesktop::new();
-    desktop.inject(|faults| faults.send = Some(Fault::platform("发送快捷键失败")));
+    desktop.inject(|faults| faults.send = Some(Fault::platform("点击发送按钮失败")));
     let fixture = Fixture::build(
         &scenario,
         desktop,
@@ -737,6 +823,15 @@ fn audit_never_contains_the_clipboard_payload_of_a_failed_send() {
     let outcome = fixture.run(&fixture.task());
 
     assert_eq!(outcome.state, TaskState::Failed);
+    // 先确认这一格真的走到了"就差按发送"的那一刻：否则这条用例会退化成
+    // 「没发送所以审计里没有正文」，一直绿着，却什么都没测。
+    assert!(
+        fixture.desktop.typed_texts().contains(&MESSAGE.to_string()),
+        "正文应已逐字填进输入框——失败发生在按发送那一步：{:?}",
+        fixture.desktop.typed_texts()
+    );
+    assert_eq!(fixture.desktop.send_count(), 0, "这一次点击失败了，不该记成发送成功");
+
     let rendered = format!("{:?}", fixture.entries());
     assert!(!rendered.contains(MESSAGE));
 }
@@ -754,6 +849,7 @@ fn scrolling_finds_a_contact_that_is_not_on_the_first_screen() {
         ScriptedCall::boxes(vec![tb(CONTACT, 20, 0.99)]),
         ScriptedCall::Ok(scenario.header.clone()),
         ScriptedCall::Ok(scenario.body_before.clone()),
+        ScriptedCall::Ok(send_button_boxes()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
     let fixture = Fixture::build_with_script(
@@ -789,6 +885,7 @@ fn scrolling_happens_at_the_configured_anchor_not_the_panel_center() {
         ScriptedCall::boxes(vec![tb(CONTACT, 20, 0.99)]),
         ScriptedCall::Ok(scenario.header.clone()),
         ScriptedCall::Ok(scenario.body_before.clone()),
+        ScriptedCall::Ok(send_button_boxes()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
     let config = RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() };
@@ -844,6 +941,7 @@ fn every_sweep_step_records_what_the_ocr_actually_read() {
         ScriptedCall::boxes(vec![tb(CONTACT, 20, 0.99)]),
         ScriptedCall::Ok(scenario.header.clone()),
         ScriptedCall::Ok(scenario.body_before.clone()),
+        ScriptedCall::Ok(send_button_boxes()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
     let fixture = Fixture::build_with_script(
@@ -909,6 +1007,7 @@ fn recording_what_was_read_can_be_switched_off() {
         ScriptedCall::boxes(vec![tb(CONTACT, 20, 0.99)]),
         ScriptedCall::Ok(scenario.header.clone()),
         ScriptedCall::Ok(scenario.body_before.clone()),
+        ScriptedCall::Ok(send_button_boxes()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
     let fixture = Fixture::build_with_script(
@@ -950,6 +1049,7 @@ fn the_log_records_where_the_cursor_will_go() {
         ScriptedCall::boxes(vec![tb(CONTACT, 20, 0.99)]),
         ScriptedCall::Ok(scenario.header.clone()),
         ScriptedCall::Ok(scenario.body_before.clone()),
+        ScriptedCall::Ok(send_button_boxes()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
     let config = RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() };
@@ -1010,6 +1110,7 @@ fn a_dirty_name_still_finds_the_contact_under_relaxed_matching() {
         ScriptedCall::boxes(vec![tb(&polluted, 20, 0.99), tb(&group_preview, 90, 0.99)]),
         ScriptedCall::Ok(scenario.header.clone()),
         ScriptedCall::Ok(scenario.body_before.clone()),
+        ScriptedCall::Ok(send_button_boxes()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
     let config = RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() };
@@ -1037,7 +1138,7 @@ fn a_dirty_name_still_finds_the_contact_under_relaxed_matching() {
 
     // 点击必须落在**姓名行**（被污染的那条）上，而不是更长的群预览行。
     let clicks = relaxed.desktop.clicks.lock().unwrap().clone();
-    assert_eq!(clicks.len(), 3, "导航 + 联系人 + 输入框");
+    assert_eq!(clicks.len(), 4, "导航 + 联系人 + 输入框 + 发送按钮");
     assert_eq!(
         (clicks[1].x, clicks[1].y),
         (panel.x + expected.x, panel.y + expected.y),
@@ -1182,6 +1283,7 @@ fn a_contact_pushed_to_the_top_by_a_new_message_is_found_on_the_second_sweep() {
         ScriptedCall::boxes(vec![tb(CONTACT, 20, 0.99)]),
         ScriptedCall::Ok(scenario.header.clone()),
         ScriptedCall::Ok(scenario.body_before.clone()),
+        ScriptedCall::Ok(send_button_boxes()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
     let fixture = Fixture::build_with_script(
@@ -1224,6 +1326,7 @@ fn a_single_sweep_misses_a_contact_that_jumped_to_the_top() {
         ScriptedCall::boxes(vec![tb(CONTACT, 20, 0.99)]),
         ScriptedCall::Ok(scenario.header.clone()),
         ScriptedCall::Ok(scenario.body_before.clone()),
+        ScriptedCall::Ok(send_button_boxes()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
     let fixture = Fixture::build_with_script(
@@ -1267,6 +1370,7 @@ fn every_scroll_is_followed_by_a_fresh_recognition() {
         ScriptedCall::boxes(vec![tb(CONTACT, 20, 0.99)]),
         ScriptedCall::Ok(scenario.header.clone()),
         ScriptedCall::Ok(scenario.body_before.clone()),
+        ScriptedCall::Ok(send_button_boxes()),
         ScriptedCall::Ok(scenario.body_after.clone()),
     ];
     let fixture = Fixture::build_with_script(
@@ -1278,8 +1382,8 @@ fn every_scroll_is_followed_by_a_fresh_recognition() {
 
     fixture.run(&fixture.task());
 
-    // 候选区识别 2 次（滚前 + 滚后）+ 标题 1 + 正文前 1 + 正文后 1 = 5
-    assert_eq!(fixture.ocr.call_count(), 5, "滚动之后必须重新识别");
+    // 候选区识别 2 次（滚前 + 滚后）+ 标题 1 + 正文前 1 + **发送按钮 1** + 正文后 1 = 6
+    assert_eq!(fixture.ocr.call_count(), 6, "滚动之后必须重新识别");
 }
 
 // ── 卡死检测 ────────────────────────────────────────────────────────────
@@ -1879,12 +1983,12 @@ fn the_navigation_defaults_are_off_and_the_strip_clears_the_avatar_column() {
 // 列表式用不到的标定区域（`main_search` / `search_dropdown` / `contact_profile`）。
 //
 // 编排器对 OCR 的调用顺序（与下面的脚本一一对应）：
-//   搜索下拉 → 资料页 → 资料页入口 → 聊天标题 → 发送前聊天正文 → 送达核验
+//   搜索下拉 → 资料页 → 资料页入口 → 聊天标题 → 发送前聊天正文 → 发送按钮 → 送达核验
 
 /// 搜索式要用的 OCR 脚本。
 ///
-/// 段数比预置场景多两段（资料页与它的入口要分别识别一次；发送之后还要再核验
-/// 一次聊天区），所以不能复用 `MockScenario::script()`，得自己排。
+/// 段数比预置场景多三段（资料页与它的入口要分别识别一次，发送按钮也要单独认一次），
+/// 所以不能复用 `MockScenario::script()`，得自己排。
 fn search_script(contact: &str) -> Vec<ScriptedCall> {
     vec![
         // 1. 联想下拉：先一行「联系人」分组标题，标题**下面**才是人。
@@ -1897,9 +2001,13 @@ fn search_script(contact: &str) -> Vec<ScriptedCall> {
         ScriptedCall::Ok(vec![tb(contact, 16, 0.99)]),
         // 5. 发送前的聊天正文（聚焦输入框之后截的那一帧）。
         ScriptedCall::Ok(vec![tb("上一条历史消息", 40, 0.99)]),
-        // 6. 发送之后的聊天正文：**必须带上正文本身**——送达核验认的就是
+        // 6. 发送按钮区。发送动作就一步：在这块区域里认出「发送」再点它。
+        //    命中框中心即点击落点，必须落进 `list_config()` 给的那块区域，
+        //    否则替身不认这次发送（`send_count` 会停在 0）。
+        ScriptedCall::Ok(send_button_boxes()),
+        // 7. 发送之后的聊天正文：**必须带上正文本身**——送达核验认的就是
         //    "聊天区里出现了这条消息"，读不到就转人工。
-        //    替身的 `send` 会让画面版本号 +1，所以指纹也一定变了，
+        //    点击会让画面版本号 +1，所以指纹也一定变了，
         //    这里只需要把该出现的那行字摆出来。
         ScriptedCall::Ok(vec![tb(MESSAGE, 60, 0.99)]),
     ]
@@ -1977,19 +2085,20 @@ fn the_search_workflow_sends_once_after_the_human_confirms() {
         "审计里要留下 Sending 这条记录"
     );
 
-    // ── 两条输入各走各的路 ──────────────────────────────────────
+    // ── 两条输入都走**逐字输入** ────────────────────────────────
     //
     // 搜索框必须**逐字敲**才会触发联想（粘贴的话下拉根本不弹，
-    // 现象看起来像"搜不到人"）；正文则是粘贴进输入框。
+    // 现象看起来像"搜不到人"）；正文也一样，一步都不经过剪贴板——
+    // 粘贴会覆盖操作者自己的剪贴板，而正文没有非用它不可的理由。
     assert_eq!(
-        fixture.desktop.typed_texts().first().map(String::as_str),
-        Some(CONTACT),
-        "搜索框里是逐字敲进去的关键词"
+        fixture.desktop.typed_texts(),
+        vec![CONTACT.to_string(), MESSAGE.to_string()],
+        "先逐字输入关键词，再逐字输入正文"
     );
-    assert_eq!(
-        fixture.desktop.pasted_texts(),
-        vec![MESSAGE.to_string()],
-        "正文用粘贴写入输入框"
+    assert!(
+        fixture.desktop.pasted_texts().is_empty(),
+        "全程不该用粘贴：{:?}",
+        fixture.desktop.pasted_texts()
     );
 
     // ── 状态轨迹必须经过资料页那两步 ────────────────────────────
@@ -2005,7 +2114,7 @@ fn the_search_workflow_sends_once_after_the_human_confirms() {
     }
 }
 
-/// 点导航 → 点搜索框 → 点下拉里那一行 → 点资料页入口 → 点输入框：**五次**点击。
+/// 点导航 → 点搜索框 → 点下拉里那一行 → 点资料页入口 → 点输入框 → **点发送按钮**。
 ///
 /// 为什么要数点击：少一次就少一个动作，而少的那一次**不一定报错**——
 /// 比如漏了点输入框，正文会敲进当时有焦点的控件里（最坏是搜索框，
@@ -2019,12 +2128,22 @@ fn the_search_workflow_clicks_every_control_it_needs() {
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
     assert_eq!(
         clicks.len(),
-        5,
-        "点击序列：联系人导航 / 搜索框 / 下拉行 / 资料页入口 / 输入框"
+        6,
+        "点击序列：联系人导航 / 搜索框 / 下拉行 / 资料页入口 / 输入框 / 发送按钮"
     );
-    // 粘贴正文与按发送都不是"点击"，所以这里仍然是五次——换成 Completed 之后
-    // 也不许多出来。多了就说明有人把发送改成了"点发送按钮"，那是另一个动作，
-    // 判据与快捷键完全不同。
+    // 发送那次点击必须落在「发送按钮区」里——落到区外，消息就只是填进了输入框。
+    let button = list_config()
+        .send_button
+        .expect("基线配置里有发送按钮区")
+        .resolve(DEFAULT_WINDOW);
+    let last = clicks[5];
+    assert!(
+        last.x >= button.x
+            && last.x < button.x + button.width
+            && last.y >= button.y
+            && last.y < button.y + button.height,
+        "发送那次点击（{last:?}）没有落在发送按钮区内（{button:?}）"
+    );
     assert_eq!(fixture.desktop.send_count(), 1);
 
     let window = fixture.desktop.window();
@@ -2437,7 +2556,9 @@ fn a_click_that_lands_in_an_existing_chat_skips_the_profile_page() {
         ScriptedCall::Ok(vec![tb(CONTACT, 16, 0.99)]),
         // 4. 发送前的聊天正文（聚焦输入框之后截的那一帧）。
         ScriptedCall::Ok(vec![tb("上一条历史消息", 40, 0.99)]),
-        // 5. 发送之后的聊天正文：送达核验要在这里读到刚发出去的那条消息。
+        // 5. 发送按钮区。
+        ScriptedCall::Ok(send_button_boxes()),
+        // 6. 发送之后的聊天正文：送达核验要在这里读到刚发出去的那条消息。
         ScriptedCall::Ok(vec![tb(MESSAGE, 60, 0.99)]),
     ]);
     let outcome = fixture.run(&fixture.task());
@@ -2451,22 +2572,22 @@ fn a_click_that_lands_in_an_existing_chat_skips_the_profile_page() {
         "已经进了聊天，就不该再走「从资料页进聊天」：{states:?}"
     );
 
-    // 四次点击：导航图标 / 搜索框 / 下拉行 / 输入框。
+    // 五次点击：导航图标 / 搜索框 / 下拉行 / 输入框 / 发送按钮。
     // 少了资料页那一次「发消息」——那正是"跳过资料页"看得见的那一半。
     assert_eq!(
         fixture.desktop.clicks.lock().unwrap().len(),
-        4,
+        5,
         "跳过资料页之后不该再有那次「发消息」的点击"
     );
     assert_eq!(
         fixture.desktop.typed_texts(),
-        vec![CONTACT.to_string()],
-        "跳过资料页不影响搜索框那一次逐字输入（正文走粘贴）"
+        vec![CONTACT.to_string(), MESSAGE.to_string()],
+        "搜索框那一次与正文那一次都是逐字输入"
     );
-    assert_eq!(
-        fixture.desktop.pasted_texts(),
-        vec![MESSAGE.to_string()],
-        "正文照样填进输入框"
+    assert!(
+        fixture.desktop.pasted_texts().is_empty(),
+        "全程不经过剪贴板：{:?}",
+        fixture.desktop.pasted_texts()
     );
     assert_eq!(fixture.desktop.send_count(), 1);
 

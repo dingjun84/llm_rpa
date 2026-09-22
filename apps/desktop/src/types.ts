@@ -428,6 +428,13 @@ export interface RuntimeConfig {
    * （群聊 / 聊天记录 / 公众号 / 小程序）之间找人。同样不能留空。
    */
   search_contact_group_label: string;
+  /**
+   * 聊天页输入框旁边那个发送按钮上的文字（默认「发送」）。
+   *
+   * 发送靠**点这个按钮**，不靠快捷键（发送键设置因人而异，按错只是多个换行）。
+   * 它要在「界面标定」的「发送按钮」那一块内被认出来。同样不能留空。
+   */
+  send_button_text: string;
 }
 
 /** 工作流。见 `RunChoice.workflow`。 */

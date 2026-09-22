@@ -432,9 +432,4 @@ impl DesktopPlatform for MacOSDesktop {
         macosapi::send_delete().map_err(AutomationError::Platform)?;
         self.verify_guard(expected_window).map(|_| ())
     }
-
-    fn send_message_shortcut(&self, expected_window: Rect) -> Result<(), AutomationError> {
-        self.verify_guard(expected_window)?;
-        macosapi::send_enter().map_err(AutomationError::Platform)
-    }
 }

@@ -16,7 +16,7 @@ use automation_core::{
     StrictContactMatcher, Workflow, WorkflowRunner, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
     DEFAULT_MIN_CONFIDENCE, DEFAULT_NAV_ICON_MIN_SCORE, DEFAULT_NAV_STRIP,
     DEFAULT_PROFILE_CHAT_ENTRY_TEXT, DEFAULT_PROFILE_SCROLL_ANCHOR, DEFAULT_REGIONS,
-    DEFAULT_SCROLL_ANCHOR, DEFAULT_SEARCH_CONTACT_GROUP_LABEL,
+    DEFAULT_SCROLL_ANCHOR, DEFAULT_SEND_BUTTON_TEXT, DEFAULT_SEARCH_CONTACT_GROUP_LABEL,
 };
 use platform_mock::{
     MockContactMatcher, MockDesktop, MockHumanConfirmation, MockIconLocator, MockOcr, MockScenario,
@@ -327,6 +327,15 @@ pub struct RuntimeConfig {
     /// 可写多项（`/`、`、`、空白分隔）。Mac 微信上人有时只出现在「最常使用」底下。
     /// 标题取错的话，会把「聊天记录里提到这个名字」当成联系人。
     pub search_contact_group_label: String,
+    /// 聊天页输入框旁边那个发送按钮上的文字（默认「发送」）。
+    ///
+    /// 发送**靠点这个按钮**，不靠快捷键——发送键设置（Enter / ⌘+Enter）
+    /// 因人而异，按错键的表现只是"输入框里多了个换行"，看起来像发送失败。
+    /// 与它配套的是「发送按钮」那一块标定（见 `CalibrationPanel` 的「历史对话」场景）。
+    ///
+    /// 同样是**靶标相关的文字**，换客户端版本或语言就可能不一样；
+    /// 对不上的症状是"消息填进输入框了，却没发出去"。
+    pub send_button_text: String,
     /// 界面标定出来的**新增区域**（键 = `calibration::ITEMS` 里的 `key`）。
     ///
     /// ## 为什么是 map，不是又一组具名字段
@@ -406,6 +415,7 @@ impl Default for RuntimeConfig {
             typing_interval_ms: 30,
             profile_chat_entry_text: DEFAULT_PROFILE_CHAT_ENTRY_TEXT.to_string(),
             search_contact_group_label: DEFAULT_SEARCH_CONTACT_GROUP_LABEL.to_string(),
+            send_button_text: DEFAULT_SEND_BUTTON_TEXT.to_string(),
             // 空表 = 一个新增区域都还没标。这不是"缺失"，是如实反映现状：
             // 界面会把它们显示成「未标定」，而不是画一个猜出来的框。
             area_marks: calibration::AreaMarks::new(),
@@ -502,6 +512,11 @@ impl RuntimeConfig {
             contact_profile: mark_region(self, "contact_profile"),
             profile_chat_entry_text: self.profile_chat_entry_text.clone(),
             search_contact_group_label: self.search_contact_group_label.clone(),
+            // 「发送按钮区」与上面那四个新增区域同一类：**没标就是 `None`**。
+            // 发送动作靠它定位，所以真实模式下没标会在点发送时如实报错，
+            // 而不是退回一个猜出来的坐标。
+            send_button: mark_region(self, "send_button"),
+            send_button_text: self.send_button_text.clone(),
             // 资料页是一整块可滚动内容，正中一定落在内容上，所以**不给配置项**：
             // 会话列表那个落点之所以可调，是因为要避开头像列与姓名列，
             // 而这里没有需要避开的东西。多一个旋钮就多一处会被设错的地方。
@@ -910,6 +925,11 @@ pub fn build_runner(
             &config.search_contact_group_label,
             "搜索下拉里联系人分组的标题",
             "search_contact_group_label",
+        ),
+        (
+            &config.send_button_text,
+            "发送按钮上的文字",
+            "send_button_text",
         ),
     ] {
         if value.trim().is_empty() {

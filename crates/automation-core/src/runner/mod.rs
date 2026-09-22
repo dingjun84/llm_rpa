@@ -208,6 +208,17 @@ pub const DEFAULT_ICON_PRIOR_SCORE_TOLERANCE: f32 = 0.05;
 /// 换成别的靶标（企业微信）时改这一项即可，不用改代码。
 pub const DEFAULT_PROFILE_CHAT_ENTRY_TEXT: &str = "发消息";
 
+/// 聊天页输入框旁边那个发送按钮上的文字（默认「发送」）。
+///
+/// 发送**靠点它**，不靠快捷键：客户的发送键设置（Enter / ⌘+Enter）因人而异，
+/// 而按错键的表现是"输入框里多了一个换行、消息没出去"——看起来像发送失败。
+/// 点按钮不依赖任何键盘设置。
+///
+/// 这是一项**与客户端文案绑定**的配置：换版本、换语言都可能变。
+/// 与之配套的还有「发送按钮区」那一块标定（见 `ItemSpec::key = "send_button"`），
+/// 文字找不到时先核对这两处，再怀疑界面。
+pub const DEFAULT_SEND_BUTTON_TEXT: &str = "发送";
+
 /// 搜索下拉列表里可作为「联系人」的分组标题（默认「联系人 / 最常使用」）。
 ///
 /// 下拉是**分组**的（联系人 / 最常使用 / 聊天记录 / 群聊…）。Mac 微信上同一个人
@@ -320,6 +331,24 @@ pub struct RunnerConfig {
     pub chat_body: RelativeRegion,
     /// 消息输入框区（相对窗口）。
     pub composer: RelativeRegion,
+    /// 发送按钮区（相对窗口）。**消息就靠点它发出去**。
+    ///
+    /// ## 为什么是一个"区域"而不是一个点
+    ///
+    /// 输入框的高度随内容变化（一行 → 多行），发送按钮跟着上下移动，
+    /// 而标定记下的是一块固定的比例区域。编排层在这块区域里**按文字**找按钮，
+    /// 按钮挪一点也照样点得中；直接点区域中心则会在输入框变高时落到按钮上方
+    /// 的空白处，现象只是"消息没发出去"。
+    ///
+    /// ## 为什么没有出厂默认值
+    ///
+    /// 与 `composer` 那四项不同：它在哪儿完全取决于这台机器上的窗口尺寸与
+    /// 输入框样式，猜一个默认值的症状是"任务照常跑完，只是点到了别的地方"。
+    /// `None` = 还没标定，编排层会如实报错并说清去哪儿标。
+    pub send_button: Option<RelativeRegion>,
+    /// 发送按钮上的文字，用来在 [`Self::send_button`] 区域里认出它。
+    /// 见 [`DEFAULT_SEND_BUTTON_TEXT`]。
+    pub send_button_text: String,
     /// 「只填不发」：把正文填进输入框后停在 [`TaskState::Prepared`]，绝不发送。
     ///
     /// 用于验证"定位 + 输入"这条链路是否准确，而不产生任何对外影响。
@@ -498,6 +527,8 @@ impl Default for RunnerConfig {
             chat_header: DEFAULT_CHAT_HEADER,
             chat_body: DEFAULT_CHAT_BODY,
             composer: DEFAULT_COMPOSER,
+            send_button: None,
+            send_button_text: DEFAULT_SEND_BUTTON_TEXT.to_string(),
             stop_before_send: false,
             max_scroll_attempts: 20,
             scroll_notches_per_step: 3,

@@ -703,7 +703,7 @@ pub fn fingerprint_of(pixels: &[u8], width: u32, height: u32) -> String {
 mod input;
 
 pub use input::{
-    left_click, scroll_wheel, send_ctrl_a, send_ctrl_v, send_delete, send_enter, send_unicode_text,
+    left_click, scroll_wheel, send_ctrl_a, send_ctrl_v, send_delete, send_unicode_text,
 };
 
 // ── 光标轨迹 ────────────────────────────────────────────────────────────

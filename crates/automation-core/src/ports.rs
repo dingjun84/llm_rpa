@@ -362,9 +362,6 @@ pub trait DesktopPlatform: Send + Sync {
     ///   变得无法从端口清单上看出来；
     /// - 前后校验前台窗口与标定一致，与其它输入动作同一套判据。
     fn clear_text_field(&self, expected_window: Rect) -> Result<(), AutomationError>;
-
-    /// 发送由配置限定的快捷键；不支持任意按键序列。
-    fn send_message_shortcut(&self, expected_window: Rect) -> Result<(), AutomationError>;
 }
 
 /// OCR 实现必须仅使用本地模型和本机内存中的图像。

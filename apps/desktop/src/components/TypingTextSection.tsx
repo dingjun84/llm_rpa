@@ -82,6 +82,22 @@ export function TypingTextSection({ draft, onPatch }: Props) {
           同样不能留空。
         </span>
       </label>
+
+      <label className="field">
+        <span className="field-label">发送按钮上的文字</span>
+        <input
+          type="text"
+          value={draft.send_button_text}
+          onChange={(event) => update("send_button_text", event.target.value)}
+        />
+        <span className="field-hint">
+          聊天页输入框旁边那个发送按钮上写的字（默认「发送」）。
+          发送<strong>靠点这个按钮</strong>，不靠快捷键：发送键设置（Enter /
+          ⌘+Enter）因人而异，按错键只是让输入框里多个换行，看起来像发送失败。
+          它要在「界面标定」里的「发送按钮」那一块内被认出来——文字与标定区
+          对不上时，任务会在发送前转人工，不会乱点。同样不能留空。
+        </span>
+      </label>
     </section>
   );
 }

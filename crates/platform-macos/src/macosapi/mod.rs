@@ -232,10 +232,6 @@ mod imp {
         Err(unsupported())
     }
 
-    pub fn send_enter() -> MacResult<()> {
-        Err(unsupported())
-    }
-
     pub fn send_unicode_text(_text: &str, _interval: Duration) -> MacResult<()> {
         Err(unsupported())
     }

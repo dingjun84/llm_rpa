@@ -40,14 +40,28 @@ use super::{mark_region, RunChoice, RuntimeConfig};
 ///
 /// 它连人都不找，只用导航区与图标模板。但它在**真实模式**下仍然要求
 /// 标定窗口尺寸——那是 `build_runner` 开头那道与工作流无关的检查。
-pub(super) fn required_marks(workflow: Workflow) -> &'static [&'static str] {
-    match workflow {
+///
+/// ## 为什么「发送按钮」的条件不是工作流，而是「只填不发」
+///
+/// 发不发消息由 [`RuntimeConfig::stop_before_send`] 一处说了算（见
+/// `runner/message.rs` 的模块文档），与走哪条路无关。所以只要这次真会走到
+/// 发送那一步，没标「发送按钮」就该在**装配期**被拦下：
+/// 否则任务会一路跑到填完正文、等人确认，才在点按钮那一步转人工——
+/// 那时它已经登记进列表了。
+pub(super) fn required_marks(config: &RuntimeConfig, workflow: Workflow) -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = match workflow {
         // 搜索式：点搜索框 → 在下拉里挑人 → 在资料页点「发消息」。
         // 这三块各自对应一步点击，缺任何一块都走不下去。
-        Workflow::SearchContact => &["main_search", "search_dropdown", "contact_profile"],
+        Workflow::SearchContact => vec!["main_search", "search_dropdown", "contact_profile"],
         // 列表扫描式只用 `regions.contact_panel`（必填、有默认值）。
-        Workflow::ScrollListContact | Workflow::NavigateOnly => &[],
+        Workflow::ScrollListContact | Workflow::NavigateOnly => Vec::new(),
+    };
+    // 「只做导航」连消息都不发，「只填不发」则刻意停在正文入框之后——
+    // 两种情况下发送按钮都用不上，不该拿它当门槛。
+    if !config.stop_before_send && workflow_inputs(workflow).message {
+        keys.push("send_button");
     }
+    keys
 }
 
 /// 缺哪些区域、分别叫什么（给操作者看的名字取自标定清单，**不在这里另起一份**）。
@@ -55,7 +69,7 @@ pub(super) fn required_marks(workflow: Workflow) -> &'static [&'static str] {
 /// 判据按**本次要跑的那条路**（`choice.workflow`）算，不按配置里那个默认值——
 /// 否则会出现「界面选了搜索式、后端按列表式检查」，缺的区域一个都不报。
 pub(super) fn missing_marks(config: &RuntimeConfig, choice: &RunChoice) -> Vec<String> {
-    required_marks(choice.workflow)
+    required_marks(config, choice.workflow)
         .iter()
         .filter(|key| mark_region(config, key).is_none())
         .map(|key| {
@@ -152,7 +166,7 @@ pub fn workflow_requirements(config: &RuntimeConfig) -> Vec<WorkflowRequirement>
             WorkflowRequirement {
                 workflow: *workflow,
                 label: workflow.describe().to_string(),
-                required: required_marks(*workflow)
+                required: required_marks(config, *workflow)
                     .iter()
                     .map(|key| MarkRequirement {
                         key: (*key).to_string(),

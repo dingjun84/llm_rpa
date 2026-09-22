@@ -44,6 +44,13 @@ pub struct MockDesktop {
     scroll_bottom: AtomicI32,
     screen_version: AtomicU32,
     send_count: AtomicU32,
+    /// 「发送按钮」所在的屏幕区域。
+    ///
+    /// 真实里点中它会让聊天区多出一条消息；替身必须模拟这条**因果**，
+    /// 否则"消息到底发没发出去"在测试里就没有可观察的载体——
+    /// 送达核验、以及十几条"绝不能发送"的断言全都靠它。
+    /// `None`（默认）= 还没告诉替身按钮在哪，此时点哪儿都不算发送。
+    send_button: Mutex<Option<Rect>>,
     /// 模拟客户端自己的最小窗口尺寸。
     ///
     /// 请求比它小的尺寸时**被夹到它**，而调用照样"成功"——真实的
@@ -85,6 +92,7 @@ impl MockDesktop {
             scroll_bottom: AtomicI32::new(DEFAULT_SCROLL_BOTTOM),
             screen_version: AtomicU32::new(0),
             send_count: AtomicU32::new(0),
+            send_button: Mutex::new(None),
             min_window_size: Mutex::new(None),
             clicks: Mutex::new(Vec::new()),
             pasted: Mutex::new(Vec::new()),
@@ -154,6 +162,20 @@ impl MockDesktop {
     /// 或者点在了列表的空白处——动作发出去了，界面没有任何反应。
     pub fn script_clicks_without_effect(&self) {
         self.clicks_change_screen.store(false, Ordering::SeqCst);
+    }
+
+    /// 告诉替身「发送按钮」在屏幕上的哪一块（屏幕坐标）。
+    ///
+    /// 落点在这块区域内的点击，会被记成一次**发送**：`send_count` +1。
+    /// 这是替身对"点发送按钮 ⇒ 消息出现在聊天区"这条因果的模拟——
+    /// 少了它，`send_count` 就永远停在 0，那十几条"绝不能在失败时发送"的
+    /// 断言会变成恒真，等于把安全网拆了。
+    ///
+    /// 取值应当与 `RunnerConfig::send_button` 换算出来的屏幕矩形**同源**
+    /// （测试夹具从同一份配置推），否则会出现"编排层点的地方"与
+    /// "替身认的地方"各写一份，而两者不一致时测试会安静地失去意义。
+    pub fn script_send_button(&self, rect: Rect) {
+        *self.send_button.lock().unwrap() = Some(rect);
     }
 
     /// 让 `is_responsive` 返回"未响应"，模拟客户端卡死。
@@ -309,8 +331,31 @@ impl DesktopPlatform for MockDesktop {
         }
         self.record("click");
         self.clicks.lock().unwrap().push(target);
+        // 点中发送按钮 ⇒ 消息发出去。这是替身要模拟的那条因果，
+        // 也是 `send_count` 唯一的来源（发送动作本身就是"点一下按钮"）。
+        let on_send_button = self.send_button.lock().unwrap().is_some_and(|button| {
+            target.x >= button.x
+                && target.x < button.x + button.width
+                && target.y >= button.y
+                && target.y < button.y + button.height
+        });
+        if on_send_button {
+            // 「发送这一步失败」与「普通点击失败」分开注入：前者发生时
+            // 正文已经在输入框里了，后者连视图都没切过去。
+            // 见 `MockFaults::send` 的文档。
+            if let Some(fault) = self.faults.lock().unwrap().send.take() {
+                return Err(fault.into_error());
+            }
+            self.record("send");
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+        }
         // 一次生效的点击会改变界面（选中会话、切换聊天），所以画面版本号 +1。
-        if self.clicks_change_screen.load(Ordering::SeqCst) {
+        //
+        // 点中发送按钮那一次**不受 `clicks_change_screen` 影响**：它带来的变化是
+        // "聊天区多出一条消息"，那是发送这件事本身的因果，与"这次点击生不生效"
+        // 这个模拟无关。混在一起的话，「点击没生效」那条用例会把送达核验
+        // 一起否掉，测出来的东西就跑偏了。
+        if on_send_button || self.clicks_change_screen.load(Ordering::SeqCst) {
             self.screen_version.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
@@ -374,20 +419,6 @@ fn scroll(
             return Err(AutomationError::ScreenChanged);
         }
         self.record("clear");
-        Ok(())
-    }
-
-    fn send_message_shortcut(&self, expected_window: Rect) -> Result<(), AutomationError> {
-        if let Some(fault) = self.faults.lock().unwrap().send.take() {
-            return Err(fault.into_error());
-        }
-        if expected_window != self.window() {
-            return Err(AutomationError::ScreenChanged);
-        }
-        self.record("send");
-        self.send_count.fetch_add(1, Ordering::SeqCst);
-        // 发送之后聊天区多了一条消息 —— 送达核验靠的就是这个变化。
-        self.screen_version.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }

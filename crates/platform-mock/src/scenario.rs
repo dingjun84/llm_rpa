@@ -27,6 +27,8 @@ pub struct MockScenario {
     pub header: Vec<TextBox>,
     /// 发送前聊天正文。
     pub body_before: Vec<TextBox>,
+    /// 「发送按钮区」的识别结果 —— 发送动作靠在这一块里认出按钮再点它。
+    pub send_button: Vec<TextBox>,
     /// 发送后聊天正文。
     pub body_after: Vec<TextBox>,
 }
@@ -41,6 +43,10 @@ impl MockScenario {
             panel: vec![tb(contact, 20, OK)],
             header: vec![tb(contact, 16, OK)],
             body_before: vec![tb("上一条历史消息", 40, OK)],
+            // 命中框的中心就是点击落点，而替身按"落点是否在发送按钮区内"
+            // 决定这次点击算不算发送——所以这一块必须**落得进那个区域**，
+            // 不能随手给一个很大的框（`tb` 的框宽 200，够用）。
+            send_button: vec![tb("发送", 20, OK)],
             body_after: vec![tb("上一条历史消息", 40, OK), tb(message, 90, OK)],
         }
     }
@@ -92,11 +98,15 @@ impl MockScenario {
         scenario
     }
 
+    /// 编排器对 OCR 的调用顺序：候选区 → 标题 → **发送前正文 → 发送按钮 → 发送后正文**。
+    ///
+    /// 发送按钮那一段是"填完正文、点发送"之间的一步，必须排在两帧正文中间。
     pub fn script(&self) -> Vec<ScriptedCall> {
         vec![
             ScriptedCall::Ok(self.panel.clone()),
             ScriptedCall::Ok(self.header.clone()),
             ScriptedCall::Ok(self.body_before.clone()),
+            ScriptedCall::Ok(self.send_button.clone()),
             ScriptedCall::Ok(self.body_after.clone()),
         ]
     }
@@ -110,7 +120,7 @@ mod tests {
     fn script_follows_the_documented_call_order() {
         let scenario = MockScenario::happy("张三", "你好");
         let script = scenario.script();
-        assert_eq!(script.len(), 4);
+        assert_eq!(script.len(), 5);
     }
 
     #[test]

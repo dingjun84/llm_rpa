@@ -127,9 +127,6 @@ pub trait DesktopPlatform: Send + Sync {
     ///
     /// 同样受前台守卫约束：动作前后都校验 `expected_window`。
     fn type_text(&self, text: &str, expected_window: Rect) -> Result<(), AutomationError>;
-
-    /// 发送由配置限定的快捷键；不支持任意按键序列。
-    fn send_message_shortcut(&self, expected_window: Rect) -> Result<(), AutomationError>;
 }
 ```
 

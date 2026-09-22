@@ -946,10 +946,6 @@ pub fn send_delete() -> MacResult<()> {
     chord(0x33, CGEventFlags::empty())
 }
 
-pub fn send_enter() -> MacResult<()> {
-    chord(0x24, CGEventFlags::empty())
-}
-
 pub fn send_unicode_text(text: &str, interval: Duration) -> MacResult<()> {
     // 逐字用 CGEventKeyboardSetUnicodeString 注入，直接追加进输入框。
     //

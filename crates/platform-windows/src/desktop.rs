@@ -521,9 +521,4 @@ fn scroll(
         // 后半段会敲到别处。这一道保证"结束时的状态是已知的"。
         self.verify_guard(expected_window).map(|_| ())
     }
-
-    fn send_message_shortcut(&self, expected_window: Rect) -> Result<(), AutomationError> {
-        self.verify_guard(expected_window)?;
-        winapi::send_enter().map_err(AutomationError::Platform)
-    }
 }

@@ -310,29 +310,42 @@ fn navigation_defaults_come_from_the_core_constants_and_are_off() {
     assert!(!runner.navigate_before_search);
 }
 
+/// 造一条标定记录。窗口取一个固定值——这些用例不关心它，只要求"标过"。
+///
+/// 从闭包提成自由函数，是因为现在有三处基线（`base_config` /
+/// `search_base_config` / 单个用例）都要用它；写成闭包就会在每个函数里各来一份。
+fn mark(rect: [f32; 4]) -> calibration::AreaMark {
+    calibration::AreaMark {
+        rect,
+        calibrated_at_ms: 1_700_000_000_000,
+        window: automation_core::Rect { x: 0, y: 0, width: 960, height: 734 },
+    }
+}
+
 /// 装配用例的基线配置：**列表扫描式**，并勾好聊天历史图标。
 ///
 /// 为什么要显式选：`RuntimeConfig::default()` 现在是**搜索式**，而搜索式
 /// 要求先标好搜索框 / 下拉 / 资料页三块。列表扫描式不需要那些，但**总是**
 /// 要聊天历史导航模板——没勾的话装配会卡在「没有配置聊天历史图标」上。
 fn base_config() -> RuntimeConfig {
-    RuntimeConfig {
+    let mut config = RuntimeConfig {
         workflow: Workflow::ScrollListContact,
         chat_history_nav_templates: vec!["聊天".into()],
         ..RuntimeConfig::default()
-    }
+    };
+    // 「发送按钮」两条工作流**都**要用（要不要它的判据是 `stop_before_send`，
+    // 不是工作流，见 `runtime/requirements.rs`），所以基线里就该标上。
+    // 不标的话，一堆与发送无关的用例（比如校验导航区比例）会先被这条挡住，
+    // 报出来的错跟它们要测的东西毫无关系。
+    config.area_marks.insert("send_button".into(), mark([0.86, 0.90, 0.12, 0.07]));
+    config
 }
 
 /// 搜索式基线：三块区域都标好了，用来测 `navigate_before_search` + 联系人导航。
 fn search_base_config() -> RuntimeConfig {
-    let mark = |rect: [f32; 4]| calibration::AreaMark {
-        rect,
-        calibrated_at_ms: 1_700_000_000_000,
-        window: automation_core::Rect { x: 0, y: 0, width: 960, height: 734 },
-    };
     let mut config = RuntimeConfig {
         workflow: Workflow::SearchContact,
-        ..RuntimeConfig::default()
+        ..base_config()
     };
     config.area_marks.insert("main_search".into(), mark([0.10, 0.02, 0.60, 0.05]));
     config.area_marks.insert("search_dropdown".into(), mark([0.10, 0.07, 0.60, 0.50]));
@@ -381,7 +394,7 @@ fn the_list_workflow_refuses_without_chat_history_templates() {
     let config = RuntimeConfig {
         workflow: Workflow::ScrollListContact,
         chat_history_nav_templates: Vec::new(),
-        ..RuntimeConfig::default()
+        ..base_config()
     };
     let err = assemble_with_icons(&config, &icons)
         .err()
@@ -426,7 +439,7 @@ fn an_unusable_template_is_refused_at_assembly_time() {
     let config = RuntimeConfig {
         workflow: Workflow::ScrollListContact,
         chat_history_nav_templates: vec!["太大".into()],
-        ..RuntimeConfig::default()
+        ..base_config()
     };
     let err = assemble_with_icons(&config, &icons).err().expect("过大的模板必须被拒绝");
     assert!(err.contains("太大"), "报错要说清是尺寸问题：{err}");
@@ -438,7 +451,7 @@ fn an_unusable_template_is_refused_at_assembly_time() {
     let config = RuntimeConfig {
         workflow: Workflow::ScrollListContact,
         chat_history_nav_templates: vec!["聊天".into()],
-        ..RuntimeConfig::default()
+        ..base_config()
     };
     let err = assemble_with_icons(&config, &icons).err().expect("坏的那张必须被拒绝");
     assert!(err.contains("聊天/2.png"), "要说清是哪个图标的哪一张：{err}");
@@ -492,6 +505,10 @@ fn search_workflow_ignores_broken_chat_history_nav_list() {
 /// 为什么要按工作流分别要求：搜索式要的三块（搜索框 / 下拉 / 资料页）
 /// 列表扫描式一块都不用。一概全要等于让人去标三块永远走不到的区域；
 /// 一概不要则会让搜索式走到一半才转人工，而那时任务已经登记进列表了。
+///
+/// ★ 加上「发送按钮」就成了四块——它**不是**按工作流要求的，
+/// 而是按「这次到底发不发消息」（`stop_before_send`）。两种要求在这里合并成
+/// 同一份清单，所以缺的块数与缺哪几块都在同一条错误信息里。
 #[test]
 fn the_search_workflow_refuses_to_start_without_its_regions() {
     let icons = temp_icons_dir("search-regions");
@@ -501,16 +518,44 @@ fn the_search_workflow_refuses_to_start_without_its_regions() {
     };
     let err = assemble_with_icons(&config, &icons)
         .err()
-        .expect("搜索式缺三块区域时必须拒绝装配");
+        .expect("搜索式缺四块区域时必须拒绝装配");
 
     // 报错要说清"哪条工作流、缺哪几块"，并且用界面上的说法（label）而不是 key：
     // 只报 `main_search` 的话，人得自己把它翻译成标定页里的某一项。
     assert!(err.contains("搜索式查找联系人"), "{err}");
-    for label in ["搜索框区", "下拉列表区域", "联系人资料区域"] {
+    for label in ["搜索框区", "下拉列表区域", "联系人资料区域", "发送按钮"] {
         assert!(err.contains(label), "缺哪块要说清（{label}）：{err}");
     }
     assert!(err.contains("界面标定"), "要告诉人下一步去哪标：{err}");
-    assert!(err.contains("3"), "要说清缺了几块：{err}");
+    assert!(err.contains("4 块"), "要说清缺了几块：{err}");
+}
+
+/// 勾了「只填不发」就不该再要求「发送按钮」——**那条路根本不发**。
+///
+/// 反过来（不勾）时列表扫描式也要它：发送那一段代码两条工作流共用，
+/// 「要不要发送按钮」的判据是 `stop_before_send`，不是工作流。
+#[test]
+fn the_send_button_mark_is_required_only_when_the_task_will_really_send() {
+    let icons = temp_icons_dir("send-button-optional");
+    // 这条用例关心的是「发送按钮」，所以别的门槛都要先满足：
+    // 不写这个图标的话，装配会被"名字在图标库里不存在"挡住。
+    write_icon(&icons, "聊天", 1, 20, 18);
+
+    // 只填不发：列表扫描式缺这块也应当装配成功。
+    let mut quiet = RuntimeConfig { stop_before_send: true, ..base_config() };
+    quiet.area_marks.remove("send_button");
+    assert!(
+        assemble_with_icons(&quiet, &icons).is_ok(),
+        "勾了「只填不发」就不该拿发送按钮当门槛"
+    );
+
+    // 同样这条工作流，不勾就必须拦下——它的判据是「发不发」而不是走哪条路。
+    let mut loud = base_config();
+    loud.area_marks.remove("send_button");
+    let err = assemble_with_icons(&loud, &icons)
+        .err()
+        .expect("会走到发送，缺发送按钮就应当拒绝装配");
+    assert!(err.contains("发送按钮"), "{err}");
 }
 
 /// 反过来：三块标好了就能装配，而且它们**真的**被带进了运行器。
@@ -522,15 +567,10 @@ fn the_search_workflow_refuses_to_start_without_its_regions() {
 fn the_search_regions_reach_the_runner_after_they_are_marked() {
     let icons = temp_icons_dir("search-regions-ok");
     write_icon(&icons, "通讯录", 1, 20, 18);
-    let mark = |rect: [f32; 4]| calibration::AreaMark {
-        rect,
-        calibrated_at_ms: 1_700_000_000_000,
-        window: automation_core::Rect { x: 0, y: 0, width: 960, height: 734 },
-    };
     let mut config = RuntimeConfig {
         workflow: Workflow::SearchContact,
         nav_icon_templates: vec!["通讯录".into()],
-        ..RuntimeConfig::default()
+        ..base_config()
     };
     config.area_marks.insert("main_search".into(), mark([0.10, 0.02, 0.60, 0.05]));
     config.area_marks.insert("search_dropdown".into(), mark([0.10, 0.07, 0.60, 0.50]));
@@ -557,7 +597,7 @@ fn the_list_workflow_does_not_need_the_search_regions() {
     let config = RuntimeConfig {
         workflow: Workflow::ScrollListContact,
         chat_history_nav_templates: vec!["聊天".into()],
-        ..RuntimeConfig::default()
+        ..base_config()
     };
     let runner = assemble_with_icons(&config, &icons).expect("列表式不该要求搜索式的区域");
     assert!(runner.config().main_search.is_none());
@@ -578,9 +618,12 @@ fn the_list_workflow_does_not_need_the_search_regions() {
 #[test]
 fn the_run_choice_decides_the_workflow_not_the_config() {
     let icons = temp_icons_dir("run-choice-wins");
+    // 基线里那一块**与工作流无关**的「发送按钮」照旧标着：它由 `stop_before_send`
+    // 决定（见 `runtime/requirements.rs`）。这样配置装配不起来的原因就只剩
+    // 「搜索式那三块没标」，前提才咬得住。
     let config = RuntimeConfig {
         workflow: Workflow::SearchContact,
-        ..RuntimeConfig::default()
+        ..base_config()
     };
     // 前提：这份配置按它自己的 `workflow` 装配不起来（缺三块区域）。
     // 前提不成立的话，下面那条断言什么都证明不了。
@@ -590,8 +633,6 @@ fn the_run_choice_decides_the_workflow_not_the_config() {
     );
 
     write_icon(&icons, "聊天", 1, 20, 18);
-    let mut config = config;
-    config.chat_history_nav_templates = vec!["聊天".into()];
     let choice = RunChoice {
         mode: config.mode,
         workflow: Workflow::ScrollListContact,
@@ -655,7 +696,7 @@ fn the_run_choice_decides_the_mode_not_the_config() {
         calibrated_window: None,
         workflow: Workflow::ScrollListContact,
         chat_history_nav_templates: vec!["聊天".into()],
-        ..RuntimeConfig::default()
+        ..base_config()
     };
     // 不用 `expect_err`：`WorkflowRunner` 没有实现 `Debug`，报不出成功那个值。
     let err = match runner_of(
@@ -686,7 +727,7 @@ fn the_run_choice_decides_the_mode_not_the_config() {
         }),
         workflow: Workflow::ScrollListContact,
         chat_history_nav_templates: vec!["聊天".into()],
-        ..RuntimeConfig::default()
+        ..base_config()
     };
     let runner = runner_of(
         &live_config,
@@ -774,21 +815,13 @@ fn navigate_only_loads_every_variant_of_the_chosen_icon() {
 fn blank_target_texts_are_refused() {
     let icons = temp_icons_dir("blank-text");
     write_icon(&icons, "聊天", 1, 20, 18);
-    let mut config = RuntimeConfig {
-        workflow: Workflow::ScrollListContact,
-        chat_history_nav_templates: vec!["聊天".into()],
-        ..RuntimeConfig::default()
-    };
+    let mut config = base_config();
     config.profile_chat_entry_text = "  ".into();
     let err = assemble_with_icons(&config, &icons).err().expect("空文字必须被拒绝");
     assert!(err.contains("不能留空"), "{err}");
     assert!(err.contains("profile_chat_entry_text"), "要说清是哪一个字段：{err}");
 
-    let mut config = RuntimeConfig {
-        workflow: Workflow::ScrollListContact,
-        chat_history_nav_templates: vec!["聊天".into()],
-        ..RuntimeConfig::default()
-    };
+    let mut config = base_config();
     config.search_contact_group_label = String::new();
     let err = assemble_with_icons(&config, &icons).err().expect("空标题必须被拒绝");
     assert!(err.contains("search_contact_group_label"), "{err}");

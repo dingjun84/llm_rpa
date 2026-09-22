@@ -27,7 +27,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_A,
-    VK_CONTROL, VK_DELETE, VK_RETURN, VK_V,
+    VK_CONTROL, VK_DELETE, VK_V,
 };
 
 use super::WinResult;
@@ -213,15 +213,6 @@ pub fn send_unicode_text(text: &str, interval: Duration) -> WinResult<()> {
         if !interval.is_zero() && index + 1 < units.len() {
             std::thread::sleep(interval);
         }
-    }
-    Ok(())
-}
-
-pub fn send_enter() -> WinResult<()> {
-    let inputs = [key_input(VK_RETURN, false), key_input(VK_RETURN, true)];
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent != inputs.len() as u32 {
-        return Err("发送回车键失败".to_string());
     }
     Ok(())
 }

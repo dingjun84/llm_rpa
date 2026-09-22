@@ -79,13 +79,13 @@
 
 | 文件 | 行数 | 职责 | 关键符号 |
 | --- | --- | --- | --- |
-| `src/ports.rs` | 388 | **五个端口的 trait 定义** + `AutomationError` + `IconQuery`/`IconPrior` | `DesktopPlatform`、`LocalOcr`、`IconLocator`、`ContactMatcher`、`HumanConfirmation` |
+| `src/ports.rs` | 495 | **五个端口的 trait 定义** + `AutomationError` + `IconQuery`/`IconPrior` | `DesktopPlatform`、`LocalOcr`、`IconLocator`、`ContactMatcher`、`HumanConfirmation` |
 | `src/state.rs` | 532 | 任务状态枚举与合法迁移 | `TaskState` |
-| `src/runner/mod.rs` | 1510 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
+| `src/runner/mod.rs` | 1541 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
 | `src/runner/search.rs` | 492 | **搜索式工作流**（工作流 3）。★ 点下拉那一行之后**两种落点**：通常在资料页，已有会话时直接进聊天——由 `ProfileReview` 把"资料页上没认到"交回 `open_chat_from_dropdown` 定夺（见 `docs/todo.md` T32） | `search_contact_by_keyword`、`pick_contact_from_dropdown`、`verify_profile`、`open_chat_from_profile`、`open_chat_from_dropdown` |
 | `src/runner/list.rs` | 261 | **列表扫描式**（原有那条路） | `locate_contact`、`sweep_contact_list`、`scroll_to_top` |
 | `src/runner/navigate.rs` | 238 | 导航图标模板匹配 + 点击（工作流 1 / 2）。★ 每一步都记一条分段耗时（`timed!` 宏 + `Run::note_elapsed`）：截屏 / `icons.locate` / 诊断上报 / 守卫 / 点击各一段，`file:line` 取在宏展开处 | `navigate_to_view`、`nav_prior` |
-| `src/runner/message.rs` | 133 | 聚焦输入框 + 填正文（逐字输入或粘贴），以及**发不发**这一步：勾了「只填不发」停在 `Prepared`，否则人工确认 → 发送 → 核验送达。★ 判据只有 `stop_before_send` 一处，与工作流无关 | `prepare_message` |
+| `src/runner/message.rs` | 234 | 聚焦输入框 + 把正文**逐字**敲进输入框，以及**发不发**这一步：勾了「只填不发」停在 `Prepared`，否则人工确认 → 逐字输入 → **点发送按钮** → 核验送达。★ 判据只有 `stop_before_send` 一处，与工作流无关。★ 发送动作 = 逐字输入 + 点按钮：**不粘贴**（不碰剪贴板）、**不按 Enter**（客户端的发送键设置因人而异，按错键表现为"多了个换行、消息没出去"） | `prepare_message`、`type_into_composer`、`click_send_button`、`verify_delivery` |
 | `src/policy.rs` | 445 | `ContactMatcher` 的实现：逐字精确匹配 + 宽松开关 | `ExactNameMatcher` |
 | `src/policy/trail.rs` | 369 | ★★ **姓名匹配的判据本体**：结论（选中谁）与轨迹（每块为什么）**同一次交出** | `strict_judge`、`contains_judge`、`name_match_decision` |
 | `src/policy/trail/verdicts.rs` | 176 | 轨迹的**措辞**层：逐块写「过 / 淘汰 + 理由」 | `verdicts_strict`、`verdicts_relaxed` |
@@ -150,7 +150,7 @@
 | --- | --- | --- |
 | `src/winapi.rs` | 796 | Win32 原语：BitBlt 截屏、窗口枚举/定位、`SetForegroundWindow`、剪贴板、进程启动、显示器指标。★ 光标轨迹与输入原语已搬出（此处只留 `pub use` 再导出，`winapi::move_cursor` / `winapi::left_click` 等路径不变） |
 | `src/winapi/cursor.rs` | 324 | ★ **光标轨迹**：`move_cursor`（smoothstep 缓动）/ `move_cursor_circle`（**走完一圈再多走 1/4 圈，终点不回起点**）/ `circle_points`（纯计算，按 `turns` 圈扫过）+ `move_cursor_absolute` / `mouse_move_input`（`SendInput` 绝对坐标）。**不用 `SetCursorPos`、不注入随机抖动** —— 理由写在文件头 |
-| `src/winapi/input.rs` | 228 | ★ **输入原语**：`key_input` / `mouse_input(_with)` / `scroll_wheel`（逐格发）/ `left_click` / `send_ctrl_*` / `send_delete` / `send_enter` / `send_unicode_text`（按 UTF-16 码元逐字发）。**一律走 `SendInput`**。`mouse_move_input` 是 `pub(super)`：只给同级的 `cursor.rs` 用 |
+| `src/winapi/input.rs` | 219 | ★ **输入原语**：`key_input` / `mouse_input(_with)` / `scroll_wheel`（逐格发）/ `left_click` / `send_ctrl_*` / `send_delete` / `send_unicode_text`（按 UTF-16 码元逐字发）。**一律走 `SendInput`**。`mouse_move_input` 是 `pub(super)`：只给同级的 `cursor.rs` 用。⚠️ 曾经还有个 `send_enter`（回车发送），2026-09-22 换成「点发送按钮」后删掉 |
 | `src/winapi/tests.rs` | 87 | 圆周点的**纯计算**用例（**不碰光标**：会劫持鼠标的用例比没有用例更糟）。⚠️ 它 `use super::cursor::{...}`，搬东西时别忘了改这里 |
 | `src/hotkey.rs` | 319 | ★ **全局热键**：`RegisterHotKey` + 独立线程消息循环 + 注销。按键解析与虚拟键码换算也在这里 |
 | `src/hotkey/tests.rs` | 165 | 按键解析、虚拟键码区间、修饰键位、失败文案（测试文件不限行数） |

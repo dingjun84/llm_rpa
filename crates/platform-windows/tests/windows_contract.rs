@@ -188,9 +188,6 @@ fn input_is_refused_when_no_window_has_been_located() {
 
     let paste = desktop.paste_text("不应被写入剪贴板", Rect { x: 0, y: 0, width: 100, height: 100 });
     assert!(matches!(paste, Err(AutomationError::ClientNotReady)));
-
-    let send = desktop.send_message_shortcut(Rect { x: 0, y: 0, width: 100, height: 100 });
-    assert!(matches!(send, Err(AutomationError::ClientNotReady)));
 }
 
 /// 滚动与点击受同一套守卫保护：没定位到窗口就不许滚。
