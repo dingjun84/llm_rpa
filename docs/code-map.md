@@ -81,8 +81,8 @@
 | --- | --- | --- | --- |
 | `src/ports.rs` | 388 | **五个端口的 trait 定义** + `AutomationError` + `IconQuery`/`IconPrior` | `DesktopPlatform`、`LocalOcr`、`IconLocator`、`ContactMatcher`、`HumanConfirmation` |
 | `src/state.rs` | 532 | 任务状态枚举与合法迁移 | `TaskState` |
-| `src/runner/mod.rs` | 1509 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
-| `src/runner/search.rs` | 440 | **搜索式工作流**（工作流 3） | `search_contact_by_keyword`、`pick_contact_from_dropdown`、`open_chat_from_profile` |
+| `src/runner/mod.rs` | 1507 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
+| `src/runner/search.rs` | 492 | **搜索式工作流**（工作流 3）。★ 点下拉那一行之后**两种落点**：通常在资料页，已有会话时直接进聊天——由 `ProfileReview` 把"资料页上没认到"交回 `open_chat_from_dropdown` 定夺（见 `docs/todo.md` T32） | `search_contact_by_keyword`、`pick_contact_from_dropdown`、`verify_profile`、`open_chat_from_profile`、`open_chat_from_dropdown` |
 | `src/runner/list.rs` | 261 | **列表扫描式**（原有那条路） | `locate_contact`、`sweep_contact_list`、`scroll_to_top` |
 | `src/runner/navigate.rs` | 238 | 导航图标模板匹配 + 点击（工作流 1 / 2）。★ 每一步都记一条分段耗时（`timed!` 宏 + `Run::note_elapsed`）：截屏 / `icons.locate` / 诊断上报 / 守卫 / 点击各一段，`file:line` 取在宏展开处 | `navigate_to_view`、`nav_prior` |
 | `src/runner/message.rs` | 131 | 聚焦输入框 + 逐字填正文 | `prepare_message` |
@@ -127,6 +127,7 @@
 | --- | --- |
 | 搜索框怎么点、联想下拉怎么挑人 | `runner/search.rs` 的 `search_contact_by_keyword` / `pick_contact_from_dropdown` |
 | 资料页怎么核验、怎么滚到底、怎么点「发消息」 | `runner/search.rs` 的 `verify_profile` / `scroll_profile_to_bottom` / `open_chat_from_profile` |
+| 点完下拉那一行**没**落在资料页怎么办（对方已有会话，客户端直接开聊天） | `runner/search.rs` 的 `open_chat_from_dropdown` + `ProfileReview`。**顺序不能反过来**：必须先核验资料页，只有它报"没认到"才拿聊天标题定论（两块区域只差 2 像素），见 `docs/todo.md` T32 |
 | 会话列表怎么滚、滚完怎么判「到底了」 | `runner/list.rs` 的 `sweep_contact_list` / `view_moves_when_scrolling` |
 | 导航图标匹配与位置先验 | `runner/navigate.rs` |
 | 正文怎么填、在哪一步停下 | `runner/message.rs` 的 `prepare_message` |
@@ -306,7 +307,7 @@ draw_cursor_circle    read_task_log        read_task_events     open_task_dir
 | **把一次现场收编成一条回归用例**（T30 的「现场 → 用例」） | ① 现场材料在原位：`data/tasks/<任务ID>/`；② 收编时**整份拷成** `data/cases/<用例名>/`，本机回归跑它；③ 要进仓库的**只有人工造的假场景**：`tools/replay/tests/fixtures/`（人名为假，由 `tools/replay/src/tests.rs` 里那个 `#[ignore]` 生成器重跑重写）。★★ **现场与用例都只在 `data/` 下，永不入库**（`.gitignore` 的 `/data/`、`**/cases/`、`**/fixtures/**/*.png`）；代价是 CI 只能跑假场景，"OCR 级"的验证只有本机能做（见 `docs/todo.md` T30） |
 | 改**事件流的格式**（加一种事件 / 加一个字段） | `src-tauri/src/task_diagnostics/events.rs`（**格式只有这一处定义**）+ `types.ts` 的 `ReplayEvent` + **`tools/replay`（读盘那侧要跟着改，否则离线重放读不懂）**。★ 加字段不算"含义变过"（`SCHEMA_VERSION` 不动），但要**同时**改 `tools/replay/src/tests.rs` 里造事件流的那两个助手，否则回归用的假场景会缺字段 |
 | 改「过程重放」页显示哪一步 / 怎么配对 | `apps/desktop/src/replayView.ts`（配对规则，只此一处）+ `components/TaskReplay.tsx`（展示）。★ 同一张盘 `tools/replay/src/lib.rs::run` 也要一起看——两个消费者必须用同一条配对规则 |
-| **改搜索式工作流**（工作流 3：点搜索框 → 下拉挑人 → 资料页 → 发消息） | `runner/search.rs`。资料页那一套（核验 / 滚到底 / 找入口）也在这里 |
+| **改搜索式工作流**（工作流 3：点搜索框 → 下拉挑人 → 资料页 → 发消息） | `runner/search.rs`。资料页那一套（核验 / 滚到底 / 找入口）也在这里。★ 点下拉之后的**两种落点**都在 `open_chat_from_dropdown`：资料页没认到目标时**跳过**资料页两步、直接核验聊天标题（`docs/todo.md` T32） |
 | **改列表扫描式**（原有那条：滚会话列表认名字） | `runner/list.rs` |
 | **改「只做导航」**（工作流 1 / 2） | `runner/navigate.rs`（判据与点击）+ `vision/src/template.rs`（匹配算法） |
 | **改「在哪一步停下 / 要不要发」** | `runner/message.rs` 的 `prepare_message`。搜索式与「只填不发」都停在 `Prepared` |

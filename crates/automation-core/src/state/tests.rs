@@ -254,6 +254,32 @@ fn the_search_flow_goes_through_the_profile_page() {
     assert_eq!(task.state(), TaskState::Prepared);
 }
 
+/// 点下拉那一行**直接进了已有的会话**那条支路：资料页 → 核验标题，中间那一步没有。
+///
+/// **为什么必须钉住**：这是界面的两种落点，不是流程的两个版本。缺这条边时，
+/// 任务会在真实客户端"直接打开历史对话"的那一次点击之后报"非法转换"，
+/// 而现象是"任务莫名其妙失败了"——看不出是状态机少了一条边，
+/// 也看不出是"这个联系人本来就有会话"。
+#[test]
+fn the_search_flow_can_skip_the_profile_entry_when_the_chat_is_already_open() {
+    let mut task = TaskMachine::default();
+    for state in [
+        TaskState::LaunchingClient,
+        TaskState::WaitingForClient,
+        TaskState::NavigatingToView,
+        TaskState::SearchingContact,
+        TaskState::VerifyingCandidate,
+        TaskState::VerifyingProfile,
+        // 这里没有 `OpeningChatFromProfile`：客户端直接打开了那份聊天记录。
+        TaskState::VerifyingChatHeader,
+        TaskState::PreparingMessage,
+    ] {
+        task.transition(state).unwrap();
+    }
+    task.transition(TaskState::Prepared).unwrap();
+    assert_eq!(task.state(), TaskState::Prepared);
+}
+
 /// 资料页那两步**不能**从半路插进来：它们只接在"已选中候选人"之后。
 #[test]
 fn the_profile_step_requires_a_verified_candidate() {

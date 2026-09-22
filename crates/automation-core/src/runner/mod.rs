@@ -1415,21 +1415,19 @@ impl<'a> Run<'a> {
 
         // ── 打开与他的聊天 ──────────────────────────────────────────
         //
-        // 两条路的落点不同，所以这一步必须分开：
-        //   - 搜索式：点下拉里那一行之后落在**资料页**，还要从那儿点「发消息」；
-        //   - 列表扫描式：点一下候选人就直接进了聊天页。
+        // 两条路的落点不同：搜索式通常落在资料页、还要点「发消息」进去，
+        // 有时却直接打开已有会话；列表式点一下就是聊天页。搜索式两种落点
+        // 的收尾是同一件事（核验标题），所以连标题核验一起交给
+        // `open_chat_from_dropdown`，判据与顺序写在那边。
         match workflow {
-            Workflow::SearchContact => {
-                self.click_dropdown_row(&matched)?;
-                self.verify_profile()?;
-                self.open_chat_from_profile()?;
+            Workflow::SearchContact => self.open_chat_from_dropdown(&matched)?,
+            _ => {
+                self.open_chat_from_list(&matched)?;
+                // ── 核验聊天页标题 ──────────────────────────────────
+                self.advance(TaskState::VerifyingChatHeader, None)?;
+                self.verify_chat_header()?;
             }
-            _ => self.open_chat_from_list(&matched)?,
         }
-
-        // ── 核验聊天页标题 ──────────────────────────────────────────
-        self.advance(TaskState::VerifyingChatHeader, None)?;
-        self.verify_chat_header()?;
 
         // ── 准备消息 ────────────────────────────────────────────────
         self.advance(TaskState::PreparingMessage, None)?;

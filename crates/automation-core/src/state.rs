@@ -241,6 +241,12 @@ impl TaskMachine {
                 | (TaskState::VerifyingCandidate, TaskState::VerifyingChatHeader)
                 | (TaskState::VerifyingCandidate, TaskState::VerifyingProfile)
                 | (TaskState::VerifyingProfile, TaskState::OpeningChatFromProfile)
+                // 搜索式那一次点击**未必**落在资料页：目标已经有会话时，
+                // 客户端会直接打开那份聊天记录（见 `runner/search.rs` 的
+                // `open_chat_from_dropdown`），于是从核验资料页直接跳到核验标题。
+                // 少这条边，这种落点会在半路报"非法转换"，而现象看起来
+                // 像是流程坏了，看不出是"界面本来就长这样"。
+                | (TaskState::VerifyingProfile, TaskState::VerifyingChatHeader)
                 | (TaskState::OpeningChatFromProfile, TaskState::VerifyingChatHeader)
                 | (TaskState::VerifyingChatHeader, TaskState::PreparingMessage)
                 | (TaskState::PreparingMessage, TaskState::AwaitingHumanConfirmation)

@@ -114,6 +114,10 @@ Draft
                     → OpeningChatFromProfile → VerifyingChatHeader
                     → PreparingMessage → Prepared
 
+   ★ 点完下拉那一行**不一定**落在资料页：对方已有会话时客户端直接打开那份聊天记录，
+     于是 `VerifyingProfile` 直接跳到 `VerifyingChatHeader`（少走 `OpeningChatFromProfile`）。
+     这条边是刻意允许的，判据顺序见 `docs/todo.md` T32。
+
 ③ ScrollListContact（列表扫描式，原有那条）
    WaitingForClient → SearchingContact → VerifyingCandidate
                     → VerifyingChatHeader

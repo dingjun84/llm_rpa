@@ -17,6 +17,20 @@ use super::*;
 
 use crate::dropdown::{judge_dropdown, normalize_text};
 
+/// [`Run::verify_profile`] 的结论。
+///
+/// 为什么"没看到目标"要单独成为一种结论：点完下拉那一行**不保证**落在资料页
+/// （见 [`Run::open_chat_from_dropdown`]）。资料页上确实是别人 ⇒ 点错了人，转人工；
+/// 这一步压根没发生 ⇒ 该换另一条路继续。两者的**判据是同一份**，
+/// 所以把结论交回调用方定夺，而不是在这里猜哪种算失败。
+pub(super) enum ProfileReview {
+    /// 资料页上就是他，可以点「发消息」了。
+    Verified,
+    /// 资料页上没看到目标。带着原因：万一后面那条路也走不通，
+    /// 它才是"为什么停下来"的答案（见 [`Run::open_chat_from_dropdown`]）。
+    NotFound(AutomationError),
+}
+
 impl Run<'_> {
     /// 取一个**新增区域**（标定页里那些还没有出厂默认值的项）并换算成屏幕坐标。
     ///
@@ -244,12 +258,76 @@ impl Run<'_> {
     }
 }
 impl Run<'_> {
+    /// 搜索式：点下拉里那一行，**把聊天打开**，并核验聊天页上的人就是目标。
+    ///
+    /// ## 为什么要分叉
+    ///
+    /// 这一点击的落点**不唯一**（实测）：常态落在**资料页**，还要再点一次
+    /// 「发消息」；但目标**已经有会话**时，客户端直接打开那份聊天记录
+    /// （历史对话），资料页那两步根本不会发生。只按第一条路走，第二种情况
+    /// 会在核验资料页处失败，而文案（"资料页上没有这个人"）看起来像是
+    /// "点错了人"——方向完全错了。
+    ///
+    /// ## 判据的顺序不能颠倒
+    ///
+    /// 先按**资料页**核验（它是常态，也是唯一能挡住重名的那一关），只有
+    /// "资料页上没有他"时才去问**聊天页标题区**。反过来先看标题区不行：
+    /// 资料页上那个名字也在右侧面板顶部，与本机标定的标题区只差 2 像素，
+    /// 照它判断会把"还在资料页"认成"已经在聊天里"，接着那次输入就落在
+    /// 没有输入框的界面上。
+    ///
+    /// 两条路最后都过同一道标题核验（[`Self::verify_chat_header`]）：
+    /// "点对了人"只有它能定论，这里不另立一套"看起来像聊天页"的猜测。
+    pub(super) fn open_chat_from_dropdown(
+        &mut self,
+        matched: &TextBox,
+    ) -> Result<(), AutomationError> {
+        self.click_dropdown_row(matched)?;
+        let profile_reason = match self.verify_profile()? {
+            ProfileReview::Verified => {
+                self.open_chat_from_profile()?;
+                self.advance(TaskState::VerifyingChatHeader, None)?;
+                return self.verify_chat_header();
+            }
+            ProfileReview::NotFound(reason) => reason,
+        };
+
+        // 资料页上没有他 ⇒ 多半是客户端直接打开了已有的会话。是不是，
+        // 交给人就在聊天页上的那份判据去说——不再多截一帧、不再多一套判断。
+        self.advance(TaskState::VerifyingChatHeader, None)?;
+        match self.verify_chat_header() {
+            Ok(()) => {
+                self.evidence.push(format!(
+                    "资料页上没认到目标（{profile_reason}），但聊天页标题就是目标 ⇒ \
+                     判定客户端直接打开了已有的会话，已跳过「资料页 / 点发消息」两步。"
+                ));
+                Ok(())
+            }
+            Err(header_reason) => {
+                // 两条路都没认下来。报**资料页**那条原因：它回答的是"那一次点击
+                // 把界面带到哪儿去了"，比标题核验的结果更贴近起点。
+                // 标题核验的结果也不能丢——它是"不在资料页"这个判断的另一半依据。
+                self.evidence.push(format!(
+                    "（跳过资料页之后，聊天页标题也没认下来：{header_reason}）"
+                ));
+                Err(profile_reason)
+            }
+        }
+    }
+}
+impl Run<'_> {
     /// 核验资料页：右侧面板上显示的人是不是目标。
     ///
     /// 这一步真正的价值在于**重名**。下拉里点的那一行只是"文字包含了关键词"，
     /// 而资料页上是这个人自己的名字——两处对上了，才说明点对了人。
     /// 判据仍然只问匹配器（[`ContactMatcher::accepts`]）。
-    pub(super) fn verify_profile(&mut self) -> Result<(), AutomationError> {
+    ///
+    /// 返回 [`ProfileReview::NotFound`] 而不是直接报错，同样是因为这里
+    /// 分不清"资料页上是别人"和"这一步压根没发生"——两种成因的**判据相同**，
+    /// 而处置相反，所以交给 [`Self::open_chat_from_dropdown`] 定夺。
+    /// 但"点击根本没生效"仍然是硬失败：那时画面一个像素都没动，
+    /// 继续往下走等于在一个可能卡死的界面上打字。
+    pub(super) fn verify_profile(&mut self) -> Result<ProfileReview, AutomationError> {
         self.advance(TaskState::VerifyingProfile, None)?;
         let profile = self.resolve_extra(self.cfg().contact_profile, "联系人资料区域")?;
         let (shot, boxes) = self.capture_and_recognize(profile, "资料页识别")?;
@@ -272,7 +350,7 @@ impl Run<'_> {
             .map(|b| self.runner.ports.matcher.accepts(&self.task.external_contact_name, b))
             .unwrap_or(false);
         if accepted {
-            return Ok(());
+            return Ok(ProfileReview::Verified);
         }
 
         // 上一步点完下拉那一行之后，资料区一个像素都没变 ⇒ 那次点击很可能
@@ -288,16 +366,16 @@ impl Run<'_> {
             )));
         }
 
-        match found {
-            Ok(b) => Err(AutomationError::AmbiguousVision(format!(
+        Ok(ProfileReview::NotFound(match found {
+            Ok(b) => AutomationError::AmbiguousVision(format!(
                 "资料页上读到的是「{}」，与目标「{}」不一致——可能点错了人",
                 b.text.trim(),
                 self.task.external_contact_name.trim()
-            ))),
+            )),
             // 匹配器自己报的错（找不到 / 多个候选）原样透传：
             // 它比这里能编出来的任何一句话都更清楚。
-            Err(err) => Err(err),
-        }
+            Err(err) => err,
+        }))
     }
 }
 impl Run<'_> {

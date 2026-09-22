@@ -2392,6 +2392,65 @@ fn a_click_that_changes_nothing_is_reported_as_such() {
     assert_eq!(fixture.desktop.send_count(), 0);
 }
 
+/// 「点下拉那一行直接进了已有的会话」那条支路：**跳过资料页**，照样走到 `Prepared`。
+///
+/// ## 为什么要有这条用例
+///
+/// 真实客户端上，目标**已经有会话**时点搜索结果会直接打开那份聊天记录
+/// （历史对话），资料页那两步根本不会发生。原来只有一条路，于是这种情况
+/// 会在「核验资料页」处停下来，而失败文案（资料页上没有这个人）看起来像
+/// "点错了人"——方向完全错了，真正发生的是**界面本来就长这样**。
+///
+/// 这里钉住三件事：
+/// - 资料页上读不到目标时**不报错**，改由聊天页标题那条判据定论；
+/// - `OpeningChatFromProfile` 这一步真的没走（少一次滚动、少一次点击）；
+/// - 该走完的照样走完：正文仍填进输入框，终态仍是 `Prepared`。
+#[test]
+fn a_click_that_lands_in_an_existing_chat_skips_the_profile_page() {
+    let fixture = search_fixture(vec![
+        // 1. 联想下拉：先一行「联系人」分组标题，标题**下面**才是人。
+        ScriptedCall::Ok(vec![tb("联系人", 10, 0.99), tb(CONTACT, 40, 0.99)]),
+        // 2. 资料页区域上读到的是**上一次打开的会话内容**——
+        //    客户端压根没落在资料页上，这块区域里当然没有目标的名字。
+        ScriptedCall::Ok(vec![tb("上一条历史消息", 40, 0.99)]),
+        // 3. 聊天页标题：就是他 ⇒ 判定"已经进了已有的会话"。
+        ScriptedCall::Ok(vec![tb(CONTACT, 16, 0.99)]),
+        // 4. 发送前的聊天正文（聚焦输入框之后截的那一帧）。
+        ScriptedCall::Ok(vec![tb("上一条历史消息", 40, 0.99)]),
+    ]);
+    let outcome = fixture.run(&fixture.task());
+
+    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+
+    let states = fixture.progress.states();
+    assert!(states.contains(&TaskState::VerifyingProfile), "{states:?}");
+    assert!(
+        !states.contains(&TaskState::OpeningChatFromProfile),
+        "已经进了聊天，就不该再走「从资料页进聊天」：{states:?}"
+    );
+
+    // 四次点击：导航图标 / 搜索框 / 下拉行 / 输入框。
+    // 少了资料页那一次「发消息」——那正是"跳过资料页"看得见的那一半。
+    assert_eq!(
+        fixture.desktop.clicks.lock().unwrap().len(),
+        4,
+        "跳过资料页之后不该再有那次「发消息」的点击"
+    );
+    assert_eq!(
+        fixture.desktop.typed_texts(),
+        vec![CONTACT.to_string(), MESSAGE.to_string()],
+        "跳过资料页不影响那两次输入"
+    );
+
+    // 判定过程要留在证据里：事后看日志的人得能分清"走了另一条路"和
+    // "资料页上认到了人"——两者的后续动作不同，光看终态分不出来。
+    assert!(
+        outcome.evidence.iter().any(|line| line.contains("已跳过")),
+        "证据里要写明跳过了资料页那两步：{:?}",
+        outcome.evidence
+    );
+}
+
 // ── 「只做导航」（工作流 1 / 2 的最小验证单元）──────────────────────────
 /// 只做导航：找到图标、点它、停在 `Navigated`，**不找任何人**。
 ///
