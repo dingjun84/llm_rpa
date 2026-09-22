@@ -138,6 +138,20 @@ impl Run<'_> {
             target.y
         ));
 
+        // 把命中框也交给诊断记录器：图标上没有文字，这一步唯一的可读结果就是
+        // "它把哪个图标认成了目标"。复用**刚匹配过的那一帧**，不重截——
+        // 重截一张会让画上的框与画面对不上。
+        self.report_icon_hit(
+            "导航图标命中",
+            strip,
+            &frame,
+            &IconHit {
+                bounds: found.bounds,
+                score: found.score,
+                template: found.template_label.clone(),
+            },
+        );
+
         self.ensure_not_frozen("已取消切换视图")?;
         // 先滑到命中点（不点）：任务若在标定校验处失败，操作者仍能看见认到的位置。
         self.runner.ports.platform.move_pointer(target)?;

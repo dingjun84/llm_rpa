@@ -35,7 +35,11 @@ pub(super) fn render_page(
         stamp,
         region: observation.region,
         frame: observation.frame,
+        // 整窗底图与图标命中直接透传：诊断图的画法由 `vision::render` 决定，
+        // 这里只负责把端口上的两样东西原样递过去。
+        window: observation.window.as_ref().map(|w| (w.frame, w.rect)),
         text_boxes: observation.text_boxes,
+        icon: observation.icon.as_ref(),
     };
     vision::render::annotate_step(&step, font)
         .ok()

@@ -90,7 +90,7 @@
 | `src/policy/trail.rs` | 369 | ★★ **姓名匹配的判据本体**：结论（选中谁）与轨迹（每块为什么）**同一次交出** | `strict_judge`、`contains_judge`、`name_match_decision` |
 | `src/policy/trail/verdicts.rs` | 176 | 轨迹的**措辞**层：逐块写「过 / 淘汰 + 理由」 | `verdicts_strict`、`verdicts_relaxed` |
 | `src/dropdown.rs` | 469 | ★★ **搜索下拉挑人**这条判据（多分组 + 多命中取最上面），同样一次交出结论与轨迹 | `judge_dropdown`、`parse_search_contact_group_labels` |
-| `src/diagnostics.rs` | 174 | ★★ **诊断契约**：一条轨迹长什么样（这块文字过没过 + 理由）、一次判定怎么记（判据名 / 阈值 / 候选 / 重跑参数） | `Verdict`、`MatchTrail`、`Decision`、`ReplayInput`、`DiagnosticRecorder` |
+| `src/diagnostics.rs` | 236 | ★★ **诊断契约**：一条轨迹长什么样（这块文字过没过 + 理由）、一次判定怎么记（判据名 / 阈值 / 候选 / 重跑参数）、一步「看到了什么」（区域 + 那一帧 + **整窗底图** + **图标命中**）。★ `WindowShot` 是"区域落在窗口哪儿"的唯一依据（只给裁图时区域框恒等于图像边界），取不到就退回裁图——诊断**永远不该**让任务失败 | `Observation`、`WindowShot`、`IconHit`、`Verdict`、`MatchTrail`、`Decision`、`ReplayInput`、`DiagnosticRecorder` |
 | `src/regions.rs` | 174 | 比例区域 → 像素矩形换算 | `RelativeRegion` |
 | `src/audit.rs` | 185 | 审计契约（只存长度/哈希/时间） | `AuditSink`、`SendLedger` |
 | `src/lib.rs` | 18 | 模块声明与 re-export | — |
@@ -140,6 +140,7 @@
 | `src/template.rs` | 793 | 纯 Rust NCC 模板匹配（等价 `TM_CCOEFF_NORMED`），逐通道平均。★ **分数不够时**再报"每个模板的前 3 个候选"（`top_candidates` / `candidate_report`）—— 只报最高分分不出「模板对不上画面」和「搜索区里根本没有它」这两件事 | 匹配函数、失败诊断 |
 | `src/pixels.rs` | 274 | **BGRA / 自上而下**的像素约定、裁切、放大 | — |
 | `src/evidence.rs` | 116 | 证据脱敏（每个文字框涂成中灰） | — |
+| `src/render.rs` | 375 | ★★ **过程诊断图的渲染**：`annotate_step` 一页（底图 + 三类框 + 右侧栏）+ `compose_overview` 总图。★ 底图优先**整窗**（拿不到才退回裁图）；橙框 = 要识别的区域、绿框 = 文字块、蓝框 = 图标命中。★ 坐标换算只在这一处：**屏幕坐标 / 帧图像坐标 → 页面坐标**（Retina 上帧是物理像素，先除回逻辑点、再乘底图比例）。用例在 `render/tests.rs`（主体已贴行数上限） | `annotate_step`、`compose_overview`、`Step` |
 | `src/lib.rs` | 74 | 铁律：只处理内存中的局部截图、禁止网络 | — |
 
 ### 3.3 `crates/platform-windows` —— 真实平台
@@ -174,7 +175,7 @@
 | `src/task_log.rs` | 159 | ★ **任务日志的两件事**：`append_task_log`（纯追加、带毫秒时间戳、写完 flush）+ `write_start_header`（开跑前那份**配置快照**——"当时到底按哪份配置跑的"）。★ 快照里的**运行参数**（模式 / 工作流 / 导航目标）全部取自 `RunChoice`，与界面上选的必须一致。T27 从 `lib.rs` 整段搬出来（那一百来行是"写日志"的活，与"装配 / 登记 / 起线程"不是一回事） |
 | `src/task_diagnostics.rs` | 287 | ★★ **过程诊断的落盘侧**（T29）：每个任务一个目录 `data/tasks/<ID>/`，逐步存标注图 + 总图 + `events.jsonl` + 人读的 `task.log` + **`raw/`（未标注的 OCR 输入图 + 引擎 stdout 原文）**。★★ **判据执行到哪就记到哪**：记的是判据**自己**交出来的轨迹，不是在编排层再复述一遍（否则迟早和判据不一致） |
 | `src/task_diagnostics/events.rs` | 198 | ★★ **`events.jsonl` 的格式（唯一一处定义）**：`read`（这一步看到了什么：图 + 区域 + 每块文字与坐标与置信度 + **可重跑的原料 `ocr_input`/`ocr_raw`**）+ `decision`（这一步怎么判的：判据 / 阈值 / 每个候选过没过 + 理由 / 重跑要的参数）。`tools/replay` 只**读**这个格式 |
-| `src/task_diagnostics/page.rs` | 67 | 把这一步的图 + 识别框 + 区域渲染成一张**标注图**（排查时先看它） |
+| `src/task_diagnostics/page.rs` | 79 | 把这一步的图 + 识别框 + 区域渲染成一张**标注图**（排查时先看它）。★ 底图优先用**整窗**（`observation.window`），拿不到才退回裁图；图标命中画成**蓝框**（与文字框的绿框区分），搜索区域画成橙框 | `render_page` |
 | `src/task_replay.rs` | 171 | ★★ **「过程重放」的读盘侧**（T29）：读出事件流给界面，并把图补成**绝对路径**（asset 协议按目录前缀匹配，路径里的分隔符不能让前端猜）。★ `task_dir_for` 是**任务目录在哪的唯一判据**（界面「打开任务目录」按钮也走它）。⚠️ 旧布局的任务只有日志、没有目录 ⇒ 如实报"没有重放材料"，不拿空面板冒充 |
 | `src/cursor_trace.rs` | 141 | ★ **「画圆」自检**（`draw_cursor_circle` + `CircleTraceView`）。★ 回报里带 **`end` / `end_distance_px`**（走完之后**实测**的光标位置与它到圆心的距离）—— "命令返回了"不等于"光标真的动了"，这是唯一能分辨的判据。单独成模块是为了让 `lib.rs` 不破基线；命令**仍注册在 `lib.rs`**。⚠️ 跨模块的命令必须是 `pub`（私有 ⇒ `E0603: macro import ... is private`）。见 `docs/todo.md` T24 |
 | `src/startup_log.rs` | 165 | ★★ **启动期落文件日志**（`data/startup.log`）。GUI 没有控制台，而"窗口还没出现就退出"这类故障的现场**全在窗口出现之前**——这是唯一的现场。第一行截断、之后追加；**写失败一律静默**（观测手段不该成为新的失败点）；数据目录建不出来时**退回工作目录**记。另装了一个 panic 钩子（**包一层原钩子，不替换**）。见 `docs/todo.md` T25 |

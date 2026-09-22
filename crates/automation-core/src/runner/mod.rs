@@ -30,7 +30,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::audit::{AuditEntry, AuditSink, MemorySendLedger, MessageDigest, NoopAudit, SendLedger};
 use crate::candidates::describe_candidates;
-use crate::diagnostics::{Decision, DiagnosticRecorder, MatchTrail, Observation, ReplayInput};
+use crate::diagnostics::{
+    Decision, DiagnosticRecorder, IconHit, MatchTrail, Observation, ReplayInput, WindowShot,
+};
 use crate::ports::{
     AutomationError, ContactMatcher, DesktopPlatform, EvidenceRecorder, HumanConfirmation,
     IconLocator, IconPrior, IconQuery, IconTemplate, LocalOcr, Point, Rect, ScreenMetrics,
@@ -988,7 +990,7 @@ impl<'a> Run<'a> {
     fn capture_frame(&self, region: Rect, label: &str) -> Result<Screenshot, AutomationError> {
         let shot = self.with_retry(label, || self.runner.ports.platform.capture(region))?;
         // `None` = 这一步没做 OCR：没有"OCR 输入图"可留，诊断那边也不该凭空造一张。
-        self.report(label, region, &shot, &[], None);
+        self.report(label, region, &shot, &[], None, None);
         Ok(shot)
     }
 
@@ -997,6 +999,9 @@ impl<'a> Run<'a> {
     /// `ocr_raw` 是这一步 OCR 引擎的原始输出（没做 OCR 就是 `None`，见
     /// [`Observation::ocr_raw`]）——它与画面、文字框**同源交出**，
     /// 免得"哪次原始输出属于哪一步"要靠时序去猜。
+    ///
+    /// `icon` 是这一步图标匹配的命中（不做图标匹配就是 `None`）——
+    /// 匹配要等画面到手之后才做，所以走 [`Self::report_icon_hit`] 补报。
     ///
     /// 未注入记录器时是一次空转——**判据只有这一个调用点**，
     /// 免得将来某条分支漏报，复盘时看不出"少了哪一步"。
@@ -1007,14 +1012,45 @@ impl<'a> Run<'a> {
         frame: &Screenshot,
         boxes: &[TextBox],
         ocr_raw: Option<&str>,
+        icon: Option<&IconHit>,
     ) {
         let Some(recorder) = self.runner.diagnostics.as_ref() else {
             return;
         };
+        // 整窗底图**尽力而为**：它在标注图上只影响"区域框落在窗口哪儿"这一条，
+        // 而截屏可能失败（窗口没了、权限掉了）。诊断是观测手段，
+        // 不让它的一次失败变成任务的一次失败——拿不到就退回只画裁图。
+        let window = self.capture_window();
+        let window = window.as_ref().map(|(rect, shot)| WindowShot { rect: *rect, frame: shot });
         recorder.observe(
             self.task.id,
-            &Observation { label, region, frame, text_boxes: boxes, ocr_raw },
+            &Observation { label, region, frame, window, text_boxes: boxes, icon: icon.cloned(), ocr_raw },
         );
+    }
+
+    /// 尽力截一张**整窗**图，返回它对应的屏幕矩形与画面；拿不到时为 `None`。
+    ///
+    /// ## 为什么不用 [`Self::ensure_calibrated`] 拿窗口矩形
+    ///
+    /// 那个方法会顺手把客户端拉到前台（它要保证"接下来点的就是它"），
+    /// 而这里是**观测**：为了画一张诊断图去抢一次前台焦点，会改变被测对象的
+    /// 状态——观测不该有副作用。所以只读用 `enter_client` 时定下的那个矩形。
+    fn capture_window(&self) -> Option<(Rect, Screenshot)> {
+        let rect = self.window?;
+        self.runner.ports.platform.capture(rect).ok().map(|shot| (rect, shot))
+    }
+
+    /// 补报一次**图标匹配的命中**（框 + 模板名 + 分数）。
+    ///
+    /// ## 为什么要与 [`Self::report`] 分开
+    ///
+    /// 图标匹配的输入是**已经截好的那一帧**：同一步先截画面（那时已经报过一条），
+    /// 再去匹配，命中结果只能等匹配之后才存在。所以它是同一步的第二条上报。
+    ///
+    /// 复用调用方手里的 `frame`（就是当时喂给匹配器的那张图），**不重新截屏**：
+    /// 重截一张会让画上的命中框与画面对不上。
+    fn report_icon_hit(&self, label: &str, region: Rect, frame: &Screenshot, hit: &IconHit) {
+        self.report(label, region, frame, &[], None, Some(hit));
     }
 
     /// 把一次判定的**结论 + 轨迹**交给诊断记录器。
@@ -1082,7 +1118,7 @@ impl<'a> Run<'a> {
         // 放在源头，避免每个调用点各写一遍。
         let (shot, boxes) = scale_boxes_to_logical(value.0, value.1, region);
         self.last_frame = Some((shot.clone(), boxes.clone()));
-        self.report(step, region, &shot, &boxes, Some(&value.2));
+        self.report(step, region, &shot, &boxes, Some(&value.2), None);
         Ok((shot, boxes))
     }
 

@@ -31,7 +31,9 @@ fn observe(diagnostics: &TaskDiagnostics, label: &str, fingerprint: &str) {
             label,
             region: Rect { x: 10, y: 20, width: 60, height: 40 },
             frame: &shot,
+            window: None,
             text_boxes: &boxes,
+            icon: None,
             ocr_raw: None,
         },
     );
@@ -115,7 +117,9 @@ fn the_event_stream_records_the_frame_and_the_decision() {
             label: "搜索下拉识别",
             region: Rect { x: 10, y: 20, width: 60, height: 40 },
             frame: &shot,
+            window: None,
             text_boxes: &boxes,
+            icon: None,
             ocr_raw: Some(OCR_RAW),
         },
     );
@@ -188,7 +192,9 @@ fn an_ocr_step_keeps_the_clean_input_and_the_raw_engine_output() {
             label: "搜索下拉识别",
             region: Rect { x: 10, y: 20, width: 60, height: 40 },
             frame: &shot,
+            window: None,
             text_boxes: &boxes,
+            icon: None,
             ocr_raw: Some(OCR_RAW),
         },
     );
@@ -233,7 +239,9 @@ fn a_step_without_raw_text_keeps_the_input_but_no_empty_file() {
             label: "标题核验",
             region: Rect { x: 10, y: 20, width: 60, height: 40 },
             frame: &shot,
+            window: None,
             text_boxes: &boxes,
+            icon: None,
             ocr_raw: Some(""),
         },
     );
