@@ -17,14 +17,21 @@
 #    2) 独立启动必须带 custom-protocol，并把前端 dist 嵌进二进制；
 #       否则白窗口。tauri dev 不走这条路（靠 Vite）。
 #    3) macosocr 是独立进程，漏编要到第一次 OCR 才炸——这里一并检查/编译。
-#       它**固定**在 target/debug/：配置里的 `ocr_command` 指着那份路径，
-#       与 desktop 用哪个 profile 无关。
+#       它跟 desktop **同一个 profile**（都在 target/<profile>/ 下），
+#       ⚠️ 但它是**按配置里的绝对路径**被拉起来的（`ocr_command`，
+#       见 runtime.rs 的 live_ports），所以换了 profile 要同步改那一项，
+#       否则任务里跑的还是旧的那份。本脚本启动时会核对并提示。
 #    4) 默认 release：模板匹配这类纯计算循环在 debug 下慢 10~30 倍
 #       （见 docs/todo.md T31）。⚠️ 换 profile 就是换了另一个二进制，
 #       macOS 的屏幕录制 / 辅助功能授权要**各自**给一次，否则画面全黑、点击不生效。
 # ============================================================
 
 set -euo pipefail
+
+# 中文提示里的变量一律写 ${VAR}：macOS 自带 bash 3.2，在 C locale 下会把
+# 紧跟其后的**全角**字符（`（` `）` `，`）算进变量名，于是 "$PROFILE（"
+# 变成去找一个名叫 "PROFILE（" 的变量 —— `set -u` 下直接
+# unbound variable 退出（2026-09-22 踩过，报错行还指向 echo 那一行）。
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
@@ -35,25 +42,17 @@ cd "$ROOT"
 DATA_ROOT="${RPA_DATA_ROOT:-$HOME}"
 
 # desktop 的构建配置。release 是默认：这一步的开销几乎全是纯计算。
-# macosocr 不跟着 profile 走（见上面第 3 条）。
 PROFILE="release"
-EXE="${ROOT}/target/${PROFILE}/desktop"
-OCR="${ROOT}/target/debug/macosocr"
 DIST_INDEX="${ROOT}/apps/desktop/dist/index.html"
 LOG="${DATA_ROOT}/data/startup.log"
+CONFIG="${DATA_ROOT}/data/config.json"
 
 FORCE_REBUILD=0
 BUILD_ONLY=0
 for arg in "$@"; do
   case "$arg" in
-    --release|-r)
-      PROFILE="release"
-      EXE="${ROOT}/target/release/desktop"
-      ;;
-    --debug|-d)
-      PROFILE="debug"
-      EXE="${ROOT}/target/debug/desktop"
-      ;;
+    --release|-r) PROFILE="release" ;;
+    --debug|-d) PROFILE="debug" ;;
     --rebuild|-f) FORCE_REBUILD=1 ;;
     --build-only) BUILD_ONLY=1 ;;
     -h|--help)
@@ -61,11 +60,17 @@ for arg in "$@"; do
       exit 0
       ;;
     *)
-      echo "[run] 未知参数：$arg（支持 --release / --debug / --rebuild / --build-only / --help）" >&2
+      echo "[run] 未知参数：${arg}（支持 --release / --debug / --rebuild / --build-only / --help）" >&2
       exit 2
       ;;
   esac
 done
+
+# 两份产物都挂在 profile 下面、同名不同目录：desktop 与 macosocr 是
+# 「同一套构建配置」的两半，debug / release 各一份，互不覆盖。
+# 放在参数解析之后算，是因为解析阶段可能把 PROFILE 改掉。
+EXE="${ROOT}/target/${PROFILE}/desktop"
+OCR="${ROOT}/target/${PROFILE}/macosocr"
 
 export PATH="${HOME}/.cargo/bin:${HOME}/.local/node/bin:/usr/local/bin:/opt/homebrew/bin:${PATH:-}"
 
@@ -82,9 +87,14 @@ need_desktop_build() {
   [[ ! -x "$EXE" ]] && return 0
   [[ ! -f "$DIST_INDEX" ]] && return 0
   # 前端源或配置比二进制新 → 重编，避免白屏/旧界面
+  # ⚠️ `crates/` 与工作区 Cargo 文件**必须**在里面：desktop 依赖 automation-core /
+  # vision / platform-*，只改核心层而不同重编，`./run.sh` 会一边说"已就绪"
+  # 一边把**旧**二进制拉起来 —— 界面看着正常，改的东西却一点没生效。
+  # （2026-09-22 踩过：改完 runner/search.rs 后 release 二进制还是 12:17 那份。）
   local newer
   newer="$(find apps/desktop/src apps/desktop/src-tauri/tauri.conf.json apps/desktop/package.json \
     apps/desktop/vite.config.ts apps/desktop/index.html \
+    crates Cargo.toml Cargo.lock \
     -type f -newer "$EXE" 2>/dev/null | head -1 || true)"
   [[ -n "$newer" ]] && return 0
   # dist 比二进制新（只跑过 npm run build）也要链进 exe
@@ -101,12 +111,15 @@ need_ocr_build() {
 
 build_ocr() {
   need_cmd swiftc
-  echo "[run] 编译 macosocr …"
-  mkdir -p target/debug
+  echo "[run] 编译 macosocr（${PROFILE}）…"
+  mkdir -p "target/${PROFILE}"
   (
     cd tools/macosocr
+    # `-O` 一直都在：它是 Swift 自己的优化开关，与 cargo 的 profile 无关，
+    # 所以 debug/release 两份的机器码基本相同。这里分 profile 只是为了
+    # 让"两份产物"在目录上对齐，不至于一个在 debug 一个在 release。
     swiftc -O -framework Vision -framework CoreGraphics \
-      -o ../../target/debug/macosocr macosocr.swift
+      -o "../../target/${PROFILE}/macosocr" macosocr.swift
   )
   echo "[run] macosocr → $OCR"
 }
@@ -117,7 +130,7 @@ build_desktop() {
   need_cmd cargo
   echo "[run] 构建前端（apps/desktop）…"
   (cd apps/desktop && npm install --no-fund --no-audit && npm run build)
-  echo "[run] 构建 desktop（$PROFILE，features=custom-protocol，嵌前端资源）…"
+  echo "[run] 构建 desktop（${PROFILE}，features=custom-protocol，嵌前端资源）…"
   # 正在运行则先停掉，否则 macOS 可能无法覆盖二进制
   if pgrep -x desktop >/dev/null 2>&1; then
     echo "[run] 检测到 desktop 正在运行，先结束以便覆盖二进制…"
@@ -176,6 +189,19 @@ rm -f "$LOG"
 echo "[run] 界面    ： $EXE"
 echo "[run] OCR 程序： $OCR"
 echo "[run] 工作目录： $(pwd)"
+
+# 把 OCR 编出来，不代表任务会用它：真正用的是**配置里那个路径**
+# （`ocr_command`，见 runtime.rs 的 live_ports 与「目标窗口」页的
+# 「本地 OCR 程序路径」）。换了 profile 之后两边几乎一定会不一致，
+# 那时任务跑的还是旧那份——不报错，只是白换。所以在这里点出来。
+# 只提示，**不**替人改配置：那份文件是用户数据，脚本碰它风险更大。
+if [[ -f "$CONFIG" ]] && ! grep -qF -- "$OCR" "$CONFIG"; then
+  echo
+  echo "[run] ⚠️ 配置里的 ocr_command 不是上面这一份："
+  echo "[run]    $CONFIG"
+  echo "[run]    任务真正拉起的是配置里那个路径。要换成 $PROFILE 这份，"
+  echo "[run]    到界面「本地 OCR 程序路径」填：$OCR"
+fi
 echo
 
 # ⚠️ 不要用 `open -n "$EXE"` 来启动。
