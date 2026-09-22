@@ -998,8 +998,11 @@ self.runner.ports.confirmation.confirm_send(...)?;            // ② 登记确�
    验法：断开 RDP 后跑
    `cargo run -q -p platform-windows --example screen_probe -- capture Qt51514QWindowIcon`
    看落盘的那张图是不是全黑。
-3. **剪贴板重定向没在 RDP 下实测过**：发送工作流靠剪贴板粘贴正文，
-   RDP 的剪贴板同步可能引入延迟（`clipboard_read_timeout` 就是为此存在的）。
+3. ~~**剪贴板重定向没在 RDP 下实测过**~~ ✅ **2026-09-22 起不再是这条路的变量**。
+   发送动作改成「逐字输入正文 + 点发送按钮」之后，任务路径**完全不经过剪贴板**
+   （`DesktopPlatform::paste_text` 现在只剩 `screen_probe` 诊断在用），
+   所以 RDP 的剪贴板同步延迟影响不到真实任务。`clipboard_read_timeout`
+   与 `clear_clipboard_after_paste` 仍留着给诊断那条路。
 
 **怎么处置**：跑真实任务时**保持 RDP 窗口可见、不最小化、不断开**。
 

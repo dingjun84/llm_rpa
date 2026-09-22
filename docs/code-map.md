@@ -326,7 +326,7 @@ draw_cursor_circle    read_task_log        read_task_events     open_task_dir
 | 改滚动行为（次数/落点/停稳） | 列表滚动 → `runner/list.rs`；资料页滚动 → `runner/search.rs`。**两套刻意不复用**，别合并 |
 | 改导航图标匹配 | `vision/src/template.rs`（算法）+ `runner/navigate.rs`（判据与点击）+ `icon_library.rs`（模板存取） |
 | 改 OCR 调用方式或输出解析 | `vision/src/ocr.rs`（契约与解析）+ `tools/winocr/src/main.rs`（实现） |
-| 改 Win32 动作（点击/滚动/粘贴） | `platform-windows/src/desktop.rs`（契约实现）+ `winapi/input.rs`（键鼠/滚轮/文本原语）+ `winapi.rs`（窗口、截屏、剪贴板、进程） |
+| 改 Win32 动作（点击/滚动/输入） | `platform-windows/src/desktop.rs`（契约实现）+ `winapi/input.rs`（键鼠/滚轮/文本原语）+ `winapi.rs`（窗口、截屏、剪贴板、进程） |
 | **改光标怎么走 / 快慢 / 画圆** | 全在 `platform-windows/src/winapi/cursor.rs`：缓动在 `move_cursor`，圆周在 `circle_points`（按 `turns` 圈扫过）+ `move_cursor_circle`（`turns = 1 + CIRCLE_EXTRA_TURNS`，**终点不回起点**）。**纯计算部分另有用例**（`winapi/tests.rs`）—— 轨迹错了 `SendInput` 照样返回成功，只有用例拦得住。入口：命令 `draw_cursor_circle` → `api.ts::drawCursorCircle` → `CursorMotionPanel.tsx` |
 | 改**截图的触发方式**（延时秒数、热键界面） | `components/CaptureTrigger.tsx`（界面）→ `src-tauri/src/capture_hotkey.rs`（命令）→ `platform-windows/src/hotkey.rs`（注册与消息循环）。⚠️ 延时秒数**刻意写死**，理由在该组件顶部 |
 | 改**全局热键允许哪些键** | `platform-windows/src/hotkey.rs` 的 `HotkeyKey`。**判据只有这一处**：界面故意用自由文本输入而**不列候选表**，就是为了不出现第二处 |
