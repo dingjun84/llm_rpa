@@ -112,7 +112,8 @@ Draft
 ② SearchContact（工作流 3 搜索式）
    WaitingForClient → SearchingContact → VerifyingCandidate → VerifyingProfile
                     → OpeningChatFromProfile → VerifyingChatHeader
-                    → PreparingMessage → Prepared
+                    → PreparingMessage → AwaitingHumanConfirmation
+                    → Sending → VerifyingDelivery → Completed
 
    ★ 点完下拉那一行**不一定**落在资料页：对方已有会话时客户端直接打开那份聊天记录，
      于是 `VerifyingProfile` 直接跳到 `VerifyingChatHeader`（少走 `OpeningChatFromProfile`）。
@@ -124,6 +125,9 @@ Draft
                     → PreparingMessage → AwaitingHumanConfirmation
                     → Sending → VerifyingDelivery → Completed
 ```
+
+② 与 ③ 从 `PreparingMessage` 起就是**同一条路**（`runner/message.rs`）：
+「发不发」只由配置里的「只填不发」决定，与走的是哪条工作流无关。
 
 两条捷径，都是刻意的：
 
@@ -147,7 +151,7 @@ PreparingMessage → Prepared           （「只填不发」：正文已入框�
 
 ### 两条"正常结束但没发送"的路
 
-`Prepared`（「只填不发」，或搜索式工作流）与 `Navigated`（「只做导航」）
+`Prepared`（**只在**「只填不发」打开时出现）与 `Navigated`（「只做导航」）
 都和 `Completed` 一样是**正常结束**，不是失败：
 
 - 它们只能从固定的前驱到达（`PreparingMessage` / `NavigatingToView`），
@@ -155,10 +159,15 @@ PreparingMessage → Prepared           （「只填不发」：正文已入框�
 - 它们不申请发送台账、不写消息摘要、不做送达核验——审计里不该留下任何"像发过了"的痕迹；
 - 它们是终态，因此从 `Prepared` 出发再也转不到 `Sending`。这是"只填不发"的安全底线。
 
-⚠️ **搜索式工作流目前无条件停在 `Prepared`**，这是**刻意的**：
-操作者要求"发送动作先不要点，mock 上，全部测试通过了再加这个发送逻辑"。
-要接发送时，把 `prepare_message` 里那个 `|| search_workflow` 去掉即可，
-后面的发送路径与列表式共用，已被用例覆盖过（见 `docs/todo.md` T16）。
+★ **搜索式与列表扫描式现在走同一条"发还是不发"的路**（2026-09-22 改）：
+真实模式下确认之后就真的发出去，演练模式下则不会发到任何地方——
+后者靠的是**整组替身端口**（`platform-mock` 的 `send` 只在本进程里记一笔），
+不是靠提前停在 `Prepared`。所以演练模式照样能把整条流程跑完、终态 `Completed`。
+
+> 历史：搜索式一度**无条件**停在 `Prepared`（"发送动作先不要点，mock 上"那条临时取舍），
+> 见 `docs/todo.md` T16。那次取舍已经收掉，判据回到 `prepare_message` 里唯一的一处
+> `stop_before_send`——两条工作流各留一套"发不发"的判断，迟早会出现
+> 「界面上勾了什么、实际按哪条算」说不清。
 
 ### 切换视图：图标上没有文字，只能靠模板匹配
 

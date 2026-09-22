@@ -81,11 +81,11 @@
 | --- | --- | --- | --- |
 | `src/ports.rs` | 388 | **五个端口的 trait 定义** + `AutomationError` + `IconQuery`/`IconPrior` | `DesktopPlatform`、`LocalOcr`、`IconLocator`、`ContactMatcher`、`HumanConfirmation` |
 | `src/state.rs` | 532 | 任务状态枚举与合法迁移 | `TaskState` |
-| `src/runner/mod.rs` | 1507 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
+| `src/runner/mod.rs` | 1510 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
 | `src/runner/search.rs` | 492 | **搜索式工作流**（工作流 3）。★ 点下拉那一行之后**两种落点**：通常在资料页，已有会话时直接进聊天——由 `ProfileReview` 把"资料页上没认到"交回 `open_chat_from_dropdown` 定夺（见 `docs/todo.md` T32） | `search_contact_by_keyword`、`pick_contact_from_dropdown`、`verify_profile`、`open_chat_from_profile`、`open_chat_from_dropdown` |
 | `src/runner/list.rs` | 261 | **列表扫描式**（原有那条路） | `locate_contact`、`sweep_contact_list`、`scroll_to_top` |
 | `src/runner/navigate.rs` | 238 | 导航图标模板匹配 + 点击（工作流 1 / 2）。★ 每一步都记一条分段耗时（`timed!` 宏 + `Run::note_elapsed`）：截屏 / `icons.locate` / 诊断上报 / 守卫 / 点击各一段，`file:line` 取在宏展开处 | `navigate_to_view`、`nav_prior` |
-| `src/runner/message.rs` | 131 | 聚焦输入框 + 逐字填正文 | `prepare_message` |
+| `src/runner/message.rs` | 133 | 聚焦输入框 + 填正文（逐字输入或粘贴），以及**发不发**这一步：勾了「只填不发」停在 `Prepared`，否则人工确认 → 发送 → 核验送达。★ 判据只有 `stop_before_send` 一处，与工作流无关 | `prepare_message` |
 | `src/policy.rs` | 445 | `ContactMatcher` 的实现：逐字精确匹配 + 宽松开关 | `ExactNameMatcher` |
 | `src/policy/trail.rs` | 369 | ★★ **姓名匹配的判据本体**：结论（选中谁）与轨迹（每块为什么）**同一次交出** | `strict_judge`、`contains_judge`、`name_match_decision` |
 | `src/policy/trail/verdicts.rs` | 176 | 轨迹的**措辞**层：逐块写「过 / 淘汰 + 理由」 | `verdicts_strict`、`verdicts_relaxed` |
@@ -173,7 +173,7 @@
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
 | `src/lib.rs` | 2219 | **27 个 IPC 命令** + `with_commands` 注册（含**托管状态**）。★ 任务日志**不在这里**了，见 `task_log.rs`；过程事件流的读盘在 `task_replay.rs`。⚠️ **已破 `CONVENTIONS.md` §9 的存量基线（1903），见那一节的 2026-09-21 复测** |
-| `src/task_log.rs` | 490 | ★ **任务日志的三件事**：`write_task_log_line`（纯追加、带毫秒时间戳、写完 flush）+ **`log_line!` 宏**（把**调用点的文件 / 行号 / 模块**自动挂上——位置只有取在宏展开处才是真的，靠人维护"文案 → 代码位置"必然静默出错）+ `write_start_header`（开跑前那份**配置快照**——"当时到底按哪份配置跑的"）。★ 快照里的**运行参数**（模式 / 工作流 / 导航目标）全部取自 `RunChoice`，与界面上选的必须一致。T27 从 `lib.rs` 整段搬出来（那一百来行是"写日志"的活，与"装配 / 登记 / 起线程"不是一回事） |
+| `src/task_log.rs` | 445 | ★ **任务日志的三件事**：`write_task_log_line`（纯追加、带毫秒时间戳、写完 flush）+ **`log_line!` 宏**（把**调用点的文件 / 行号 / 模块**自动挂上——位置只有取在宏展开处才是真的，靠人维护"文案 → 代码位置"必然静默出错）+ `write_start_header`（开跑前那份**配置快照**——"当时到底按哪份配置跑的"）。★ 快照里的**运行参数**（模式 / 工作流 / 导航目标）全部取自 `RunChoice`，与界面上选的必须一致。★ 读盘那侧：`summary_from_log` 用 `strip_line_prefixes` **循环剥行首前缀**（时间戳 + 代码出处两段都要剥，只剥一段会让每条 `strip_prefix` 落空、历史任务全变成"失败"）。T27 从 `lib.rs` 整段搬出来（那一百来行是"写日志"的活，与"装配 / 登记 / 起线程"不是一回事）；单测搬去了 `task_log/tests.rs` |
 | `src/task_diagnostics.rs` | 315 | ★★ **过程诊断的落盘侧**（T29）：每个任务一个目录 `data/tasks/<ID>/`，逐步存标注图 + 总图 + `events.jsonl` + 人读的 `task.log` + **`raw/`（未标注的 OCR 输入图 + 引擎 stdout 原文）**。★★ **判据执行到哪就记到哪**：记的是判据**自己**交出来的轨迹，不是在编排层再复述一遍（否则迟早和判据不一致）。★ `observe` / `finish` 各自报一条 ⏱ 耗时（渲染+编码 / 写盘 / 总图拼装）：这段跑在**任务线程**上，每一毫秒都吃单步预算 |
 | `src/task_diagnostics/events.rs` | 198 | ★★ **`events.jsonl` 的格式（唯一一处定义）**：`read`（这一步看到了什么：图 + 区域 + 每块文字与坐标与置信度 + **可重跑的原料 `ocr_input`/`ocr_raw`**）+ `decision`（这一步怎么判的：判据 / 阈值 / 每个候选过没过 + 理由 / 重跑要的参数）。`tools/replay` 只**读**这个格式 |
 | `src/task_diagnostics/page.rs` | 79 | 把这一步的图 + 识别框 + 区域渲染成一张**标注图**（排查时先看它）。★ 底图优先用**整窗**（`observation.window`），拿不到才退回裁图；图标命中画成**蓝框**（与文字框的绿框区分），搜索区域画成橙框 | `render_page` |
@@ -310,7 +310,7 @@ draw_cursor_circle    read_task_log        read_task_events     open_task_dir
 | **改搜索式工作流**（工作流 3：点搜索框 → 下拉挑人 → 资料页 → 发消息） | `runner/search.rs`。资料页那一套（核验 / 滚到底 / 找入口）也在这里。★ 点下拉之后的**两种落点**都在 `open_chat_from_dropdown`：资料页没认到目标时**跳过**资料页两步、直接核验聊天标题（`docs/todo.md` T32） |
 | **改列表扫描式**（原有那条：滚会话列表认名字） | `runner/list.rs` |
 | **改「只做导航」**（工作流 1 / 2） | `runner/navigate.rs`（判据与点击）+ `vision/src/template.rs`（匹配算法） |
-| **改「在哪一步停下 / 要不要发」** | `runner/message.rs` 的 `prepare_message`。搜索式与「只填不发」都停在 `Prepared` |
+| **改「在哪一步停下 / 要不要发」** | `runner/message.rs` 的 `prepare_message`。**判据只有一处**：配置里的「只填不发」（`stop_before_send`）。勾了 ⇒ 停在 `Prepared`；没勾 ⇒ 过人工确认再发送。★ 与走哪条工作流**无关**——搜索式一度按工作流无条件停住，2026-09-22 已收掉（`docs/todo.md` T16） |
 | **改「这条工作流到底要什么」**（要标哪些区域 / 要不要填联系人·正文） | **`src-tauri/src/runtime/requirements.rs`** 的 `required_marks` 与 `workflow_inputs`。★★ **判据只有这一处**：装配期按它拒绝、界面通过 `workflow_requirements` 命令读它渲染。★ 分叉的两种后果都很难查：`required_marks` 分叉 ⇒「界面说齐了、点开始却被拒」；`workflow_inputs` 分叉 ⇒「按钮点不动、也不说为什么」（2026-09-20 实测，见 T27） |
 | **排查「某一步为什么慢 / 单步超时超在哪」** | ① 打开 `data/tasks/<任务ID>/task.log`：先搜 `超过单步上限`（文案里带**实际耗时**与**判据的代码位置**），再看它上面那一批 `⏱ …` 行——每条都带 `@文件:行`，走得最久的那条指的就是要开的地方；② 实测最常见的两段是 `导航·图标匹配 icons.locate`（`vision/src/template.rs`，逐位置扫搜索区 × 每个模板）与 `⏱ 单步图 NN`（`task_diagnostics.rs`：标注图的渲染/编码/写盘**跑在任务线程上**，直接吃单步预算）；③ 别先怀疑匹配阈值——阈值只决定"够不够格"，**不影响耗时**（见 `docs/todo.md` T31） |
 | **给任务日志加一行** / 改开头那份配置快照 | `src-tauri/src/task_log.rs` 的 `write_start_header`。★ **别加回 `lib.rs`**（它贴着基线，那一百来行是整段搬出去的）。运行参数（模式 / 工作流 / 导航目标）一律取自 `choice`，与界面上选的必须一致 |

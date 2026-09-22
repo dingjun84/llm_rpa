@@ -586,13 +586,13 @@
 
 **刻意的取舍**（不是漏做）：
 
-1. **搜索式不接发送**。操作者明确要求：「发送动作先不要点，mock 上。
-   全部测试通过了，我再加这个发送逻辑。」
-   所以 `prepare_message` 里搜索式**无条件**停在 `Prepared`：
-   不申请发送台账、不写消息摘要、不进 `Sending`，审计里不留"像发过了"的痕迹。
-   状态说明里写明了「（搜索式工作流尚未接入发送，这是刻意的）」。
-   **要接发送时**：把 `prepare_message` 里那个 `|| search_workflow` 去掉即可，
-   后面的发送路径与列表式共用，已经被用例覆盖过。
+1. ~~**搜索式不接发送**~~ ✅ **2026-09-22 已收掉**。当时的取舍是：操作者要求「发送动作先不要点，
+   mock 上。全部测试通过了，我再加这个发送逻辑」，于是 `prepare_message` 里搜索式
+   **无条件**停在 `Prepared`。现在它和列表扫描式走同一条路：
+   **真实模式下确认之后就真的发出去，演练模式下不会发到任何地方**
+   ——后者靠的是整组替身端口（`platform-mock` 的 `send` 只在本进程里记一笔），
+   不是靠提前停下。判据回到 `prepare_message` 里唯一的一处 `stop_before_send`。
+   落地清单见本节末尾「接入发送（2026-09-22）」。
 2. **下拉里挑人用的是「包含」而不是逐字相等**（`pick_contact_from_dropdown`）。
    理由与 T1 同源：下拉里的行常带备注名/微信号，逐字相等一个都匹配不上。
    命中多行时取**最上面**的那一行（2026-09-21 操作者指定；Mac 实测
@@ -634,6 +634,36 @@
 5. **资料页滚动上限复用 `max_scroll_attempts`（默认 20）**。
    资料长短随人变化，20 次够不够还没在真人身上量过——
    不够时的表现是「向下滚动 N 次仍未让资料页画面稳定下来」转人工。
+
+### 接入发送（2026-09-22 完成）
+
+操作者定下的语义：**搜索式在真实环境下要把消息发出去，演练模式不发送**。
+后者的"不发送"由**替身端口**保证，而不是靠流程提前停——所以演练模式下
+搜索式也能把整条路跑完（终态 `Completed`），不必再单独记一条"这条路只走到一半"。
+
+改了什么：
+
+1. `runner/message.rs::prepare_message`：删掉那个 `|| search_workflow`
+   （顺带把 `workflow` 参数整个去掉——判据只剩配置里的 `stop_before_send`）。
+   状态说明里那句「（搜索式工作流尚未接入发送，这是刻意的）」一并删掉。
+2. `runner/mod.rs` 的 `SearchContact` 文档：链路改成
+   「… → 聚焦输入框 → 逐字输入正文 → 人工确认 → 发送 → 核验送达」。
+3. **用例**：`platform-mock/tests/mvp_flow.rs` 的 `search_script` 补第 6 段
+   （发送后聊天正文，**必须带上正文本身**，送达核验认的就是它）；
+   原来那条 `the_search_workflow_reaches_prepared_and_stops_before_sending`
+   换成 `the_search_workflow_sends_once_after_the_human_confirms`
+   （断言只发一次、确认在 `Sending` **之前**、审计里有 `Sending`）。
+   另外六条走到主路径的搜索式用例（点击数 / 分组上下界 / 取最上面 / 最常使用 /
+   跳过资料页 / 清空搜索框）终态一并从 `Prepared` 改成 `Completed`。
+4. **界面文案**：`RuntimePanel.tsx` 里「只填不发」那句"搜索式不受这个开关控制"
+   已经不对了，改成"关掉它时三条工作流同路：先人工确认，确认后才真发出去"。
+5. **文档**：`docs/architecture.md` 的状态流转（② 与 ③ 从 `PreparingMessage`
+   起是同一条路）、`docs/code-map.md` 的「改『在哪一步停下 / 要不要发』」行、
+   `docs/handoff-macos-2026-09-21.md` 的产品约定第 1 条。
+
+⚠️ **实机验收仍缺**：这次只跑通了替身端口那条（`platform-mock`），
+**真实微信上的"搜索式 → 确认 → 发出去了"还没人跑过一次**。
+真机上第一次跑务必先开「只填不发」把定位链路验一遍，再关掉它发一条真人能收到的消息。
 
 ---
 
@@ -1918,11 +1948,13 @@ T29 补齐了「看到了什么」（标注图）与「为什么这么判」（�
    同时把标题核验的结果一并记进证据。
 2. **`runner/mod.rs`**：搜索式把「核验标题」一起交给 `open_chat_from_dropdown`（两种落点收尾相同）；
    列表式保持原样。`mod.rs` 1483 → 1509 → **1507**（净减 2，见 §9「只减不增」）。
+   ⚠️ 2026-09-22 搜索式接入发送时又动了同一个文件，现为 **1510**（见 T16 末尾那节）。
 3. **`state.rs`**：补一条边 `VerifyingProfile → VerifyingChatHeader`。
    少这条边，真实场景会在半路报"非法转换"，现象看起来像流程坏了，看不出是"界面本来就长这样"。
 4. **用例**：`state/tests.rs::the_search_flow_can_skip_the_profile_entry_when_the_chat_is_already_open`、
    `platform-mock/tests/mvp_flow.rs::a_click_that_lands_in_an_existing_chat_skips_the_profile_page`
-   （断言终态 `Prepared`、`states` 含 `VerifyingProfile` 但不含 `OpeningChatFromProfile`、点击数/输入数与证据文案）。
+   （断言终态 `Completed`、`states` 含 `VerifyingProfile` 但不含 `OpeningChatFromProfile`、点击数/输入数与证据文案）。
+   ⚠️ 终态那一条 2026-09-22 随"搜索式接入发送"从 `Prepared` 改成了 `Completed`。
 
 ### 还没做
 

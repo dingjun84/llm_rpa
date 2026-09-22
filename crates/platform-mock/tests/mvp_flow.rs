@@ -1843,7 +1843,7 @@ fn search_workflow_always_navigates_to_contacts_first() {
 
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
     assert_eq!(icons.call_count(), 1);
     assert!(fixture.progress.states().contains(&TaskState::NavigatingToView));
 }
@@ -1879,12 +1879,12 @@ fn the_navigation_defaults_are_off_and_the_strip_clears_the_avatar_column() {
 // 列表式用不到的标定区域（`main_search` / `search_dropdown` / `contact_profile`）。
 //
 // 编排器对 OCR 的调用顺序（与下面的脚本一一对应）：
-//   搜索下拉 → 资料页 → 资料页入口 → 聊天标题 → 发送前聊天正文
+//   搜索下拉 → 资料页 → 资料页入口 → 聊天标题 → 发送前聊天正文 → 送达核验
 
 /// 搜索式要用的 OCR 脚本。
 ///
-/// 段数比预置场景多一段（资料页与它的入口要分别识别一次），
-/// 所以不能复用 `MockScenario::script()`，得自己排。
+/// 段数比预置场景多两段（资料页与它的入口要分别识别一次；发送之后还要再核验
+/// 一次聊天区），所以不能复用 `MockScenario::script()`，得自己排。
 fn search_script(contact: &str) -> Vec<ScriptedCall> {
     vec![
         // 1. 联想下拉：先一行「联系人」分组标题，标题**下面**才是人。
@@ -1897,6 +1897,11 @@ fn search_script(contact: &str) -> Vec<ScriptedCall> {
         ScriptedCall::Ok(vec![tb(contact, 16, 0.99)]),
         // 5. 发送前的聊天正文（聚焦输入框之后截的那一帧）。
         ScriptedCall::Ok(vec![tb("上一条历史消息", 40, 0.99)]),
+        // 6. 发送之后的聊天正文：**必须带上正文本身**——送达核验认的就是
+        //    "聊天区里出现了这条消息"，读不到就转人工。
+        //    替身的 `send` 会让画面版本号 +1，所以指纹也一定变了，
+        //    这里只需要把该出现的那行字摆出来。
+        ScriptedCall::Ok(vec![tb(MESSAGE, 60, 0.99)]),
     ]
 }
 
@@ -1932,62 +1937,69 @@ fn search_fixture(script: Vec<ScriptedCall>) -> Fixture {
     )
 }
 
-/// 搜索式主路径：一路走到 `Prepared`，而且**绝不发送**。
+/// 搜索式主路径：找到人 → 填好正文 → **人工确认之后真的发出去** → 核验送达。
 ///
-/// 这是操作者明确要求的那条验收线：
-/// 「发送动作先不要点，mock 上。全部测试通过了，我再加这个发送逻辑。」
-/// 所以这里不仅断言终态，还要断言**没有**任何发送痕迹——
-/// 发送次数为 0、没有申请过人工确认、审计里没有 Sending。
+/// ## 为什么这条用例很重要
+///
+/// 搜索式曾经无条件停在 `Prepared`（`docs/todo.md` T16 记的那条临时取舍：
+/// 「发送动作先不要点，mock 上」）。现在它与列表扫描式走同一条路：
+/// **真实模式要把消息发出去，演练模式不发出去**——后者靠的是整组替身端口
+/// （`platform-mock`），不是靠在这里提前停下。
+///
+/// 所以这里同时钉住两件事：该发生的发送**真的发生了**（且只发生一次），
+/// 以及发送前**必须**过人工确认。
 #[test]
-fn the_search_workflow_reaches_prepared_and_stops_before_sending() {
+fn the_search_workflow_sends_once_after_the_human_confirms() {
     let fixture = search_fixture(search_script(CONTACT));
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
-    assert!(outcome.stopped_before_send(), "Prepared 就是这条路的正常终态");
-    assert!(!outcome.succeeded(), "Prepared 是「填好了但没发」，不是完成");
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
+    assert!(outcome.succeeded(), "发出去了、也核验到了，才算走完");
+    assert!(!outcome.stopped_before_send(), "没勾「只填不发」，就不该停在 Prepared");
 
-    // ── 没有发送痕迹 ────────────────────────────────────────────
-    assert_eq!(fixture.desktop.send_count(), 0, "搜索式工作流不该发送");
+    // ── 发出去，且只发一次，而且过了人工确认 ────────────────────
+    assert_eq!(fixture.desktop.send_count(), 1, "搜索式工作流也要把消息发出去");
     assert_eq!(
         fixture.confirmation.call_count(),
-        0,
-        "没打算发送，就不该去打扰操作者做人工确认"
+        1,
+        "发送前必须申请一次人工确认——这是产品底线，不是可选项"
     );
+    let states = fixture.progress.states();
+    let at = |state: TaskState| states.iter().position(|s| *s == state);
     assert!(
-        !fixture.progress.states().contains(&TaskState::Sending),
-        "状态轨迹里不该出现 Sending：{:?}",
-        fixture.progress.states()
+        at(TaskState::AwaitingHumanConfirmation) < at(TaskState::Sending),
+        "必须**先**问人、**再**发；顺序反了就成了先发后问：{states:?}"
     );
+    assert!(at(TaskState::Sending) < at(TaskState::VerifyingDelivery), "{states:?}");
+    assert_eq!(*states.last().unwrap(), TaskState::Completed, "{states:?}");
     assert!(
-        fixture.entries().iter().all(|entry| entry.to != TaskState::Sending),
-        "审计里也不该出现 Sending"
+        fixture.entries().iter().any(|entry| entry.to == TaskState::Sending),
+        "审计里要留下 Sending 这条记录"
     );
 
-    // ── 两次输入都走的是**逐字输入**，不是粘贴 ──────────────────
+    // ── 两条输入各走各的路 ──────────────────────────────────────
     //
-    // 搜索框必须逐字敲才会触发联想；用粘贴的话下拉根本不弹，
-    // 而现象看起来像"搜不到人"。
+    // 搜索框必须**逐字敲**才会触发联想（粘贴的话下拉根本不弹，
+    // 现象看起来像"搜不到人"）；正文则是粘贴进输入框。
     assert_eq!(
-        fixture.desktop.typed_texts(),
-        vec![CONTACT.to_string(), MESSAGE.to_string()],
-        "先逐字输入搜索词，再逐字输入正文"
+        fixture.desktop.typed_texts().first().map(String::as_str),
+        Some(CONTACT),
+        "搜索框里是逐字敲进去的关键词"
     );
-    assert!(
-        fixture.desktop.pasted_texts().is_empty(),
-        "搜索式全程不该用粘贴：{:?}",
-        fixture.desktop.pasted_texts()
+    assert_eq!(
+        fixture.desktop.pasted_texts(),
+        vec![MESSAGE.to_string()],
+        "正文用粘贴写入输入框"
     );
 
     // ── 状态轨迹必须经过资料页那两步 ────────────────────────────
-    let states = fixture.progress.states();
     for expected in [
         TaskState::SearchingContact,
         TaskState::VerifyingCandidate,
         TaskState::VerifyingProfile,
         TaskState::OpeningChatFromProfile,
         TaskState::VerifyingChatHeader,
-        TaskState::Prepared,
+        TaskState::PreparingMessage,
     ] {
         assert!(states.contains(&expected), "状态轨迹里缺 {expected:?}：{states:?}");
     }
@@ -2002,7 +2014,7 @@ fn the_search_workflow_reaches_prepared_and_stops_before_sending() {
 fn the_search_workflow_clicks_every_control_it_needs() {
     let fixture = search_fixture(search_script(CONTACT));
     let outcome = fixture.run(&fixture.task());
-    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
 
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
     assert_eq!(
@@ -2010,6 +2022,10 @@ fn the_search_workflow_clicks_every_control_it_needs() {
         5,
         "点击序列：联系人导航 / 搜索框 / 下拉行 / 资料页入口 / 输入框"
     );
+    // 粘贴正文与按发送都不是"点击"，所以这里仍然是五次——换成 Completed 之后
+    // 也不许多出来。多了就说明有人把发送改成了"点发送按钮"，那是另一个动作，
+    // 判据与快捷键完全不同。
+    assert_eq!(fixture.desktop.send_count(), 1);
 
     let window = fixture.desktop.window();
     let inside = |point: automation_core::Point, region: automation_core::RelativeRegion| {
@@ -2054,7 +2070,7 @@ fn a_row_above_the_contact_group_is_not_a_candidate() {
 
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
     // 第二次点击的 y 必须在标题**下方**（标题底边 = 200 + 28）。
     let dropdown = search_config().search_dropdown.unwrap();
@@ -2081,7 +2097,7 @@ fn a_tie_between_equally_long_rows_follows_the_topmost_one_instead_of_stopping()
 
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
     let dropdown = search_config().search_dropdown.unwrap();
     let rect = dropdown.resolve_within(fixture.desktop.window()).unwrap();
@@ -2090,7 +2106,7 @@ fn a_tie_between_equally_long_rows_follows_the_topmost_one_instead_of_stopping()
         (40..70).contains(&clicked_y),
         "应当点最上面的那一行（相对 y={clicked_y}），不是下面那行"
     );
-    assert_eq!(fixture.desktop.send_count(), 0);
+    assert_eq!(fixture.desktop.send_count(), 1);
 }
 
 /// 同 `search_fixture`，但装配**放宽层**（`ContainsNameMatcher`）。
@@ -2144,7 +2160,7 @@ fn a_contact_only_under_frequently_used_is_picked() {
 
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
     let dropdown = search_config().search_dropdown.unwrap();
     let rect = dropdown.resolve_within(fixture.desktop.window()).unwrap();
@@ -2179,7 +2195,7 @@ fn the_topmost_matching_row_wins_when_several_rows_contain_the_name() {
 
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
     let clicks = fixture.desktop.clicks.lock().unwrap().clone();
     let dropdown = search_config().search_dropdown.unwrap();
     let rect = dropdown.resolve_within(fixture.desktop.window()).unwrap();
@@ -2229,7 +2245,7 @@ fn a_chat_history_row_is_not_picked_when_contact_sections_exist() {
 fn the_search_workflow_clears_the_box_before_typing() {
     let fixture = search_fixture(search_script(CONTACT));
     let outcome = fixture.run(&fixture.task());
-    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
 
     let operations = fixture.desktop.operations();
     // 只看**输入动作**：编排层每次动作前都会重新确认前台窗口（序列里的 `focus`），
@@ -2247,7 +2263,11 @@ fn the_search_workflow_clears_the_box_before_typing() {
         ["click", "click", "clear", "type"],
         "导航之后：点搜索框 → 清空 → 输入。完整操作序列：{operations:?}"
     );
-    // 第一次逐字输入必须是关键词（后面还有一次是消息正文——搜索式也走逐字输入）。
+    // 第一次逐字输入必须是关键词。
+    //
+    // ⚠️ 正文那一次**不在** `typed_texts` 里：消息正文走的是粘贴
+    // （只有搜索框必须逐字敲才会触发联想）。所以这里的 `.first()` 就是全部，
+    // 不必替它留位置。
     assert_eq!(
         fixture.desktop.typed_texts().first().map(String::as_str),
         Some(CONTACT),
@@ -2392,7 +2412,7 @@ fn a_click_that_changes_nothing_is_reported_as_such() {
     assert_eq!(fixture.desktop.send_count(), 0);
 }
 
-/// 「点下拉那一行直接进了已有的会话」那条支路：**跳过资料页**，照样走到 `Prepared`。
+/// 「点下拉那一行直接进了已有的会话」那条支路：**跳过资料页**，照样走完整条路。
 ///
 /// ## 为什么要有这条用例
 ///
@@ -2404,7 +2424,7 @@ fn a_click_that_changes_nothing_is_reported_as_such() {
 /// 这里钉住三件事：
 /// - 资料页上读不到目标时**不报错**，改由聊天页标题那条判据定论；
 /// - `OpeningChatFromProfile` 这一步真的没走（少一次滚动、少一次点击）；
-/// - 该走完的照样走完：正文仍填进输入框，终态仍是 `Prepared`。
+/// - 该走完的照样走完：正文仍填进输入框，确认之后仍会发出去。
 #[test]
 fn a_click_that_lands_in_an_existing_chat_skips_the_profile_page() {
     let fixture = search_fixture(vec![
@@ -2417,10 +2437,12 @@ fn a_click_that_lands_in_an_existing_chat_skips_the_profile_page() {
         ScriptedCall::Ok(vec![tb(CONTACT, 16, 0.99)]),
         // 4. 发送前的聊天正文（聚焦输入框之后截的那一帧）。
         ScriptedCall::Ok(vec![tb("上一条历史消息", 40, 0.99)]),
+        // 5. 发送之后的聊天正文：送达核验要在这里读到刚发出去的那条消息。
+        ScriptedCall::Ok(vec![tb(MESSAGE, 60, 0.99)]),
     ]);
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::Prepared, "失败原因：{:?}", outcome.failure);
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
 
     let states = fixture.progress.states();
     assert!(states.contains(&TaskState::VerifyingProfile), "{states:?}");
@@ -2438,9 +2460,15 @@ fn a_click_that_lands_in_an_existing_chat_skips_the_profile_page() {
     );
     assert_eq!(
         fixture.desktop.typed_texts(),
-        vec![CONTACT.to_string(), MESSAGE.to_string()],
-        "跳过资料页不影响那两次输入"
+        vec![CONTACT.to_string()],
+        "跳过资料页不影响搜索框那一次逐字输入（正文走粘贴）"
     );
+    assert_eq!(
+        fixture.desktop.pasted_texts(),
+        vec![MESSAGE.to_string()],
+        "正文照样填进输入框"
+    );
+    assert_eq!(fixture.desktop.send_count(), 1);
 
     // 判定过程要留在证据里：事后看日志的人得能分清"走了另一条路"和
     // "资料页上认到了人"——两者的后续动作不同，光看终态分不出来。

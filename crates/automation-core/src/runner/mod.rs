@@ -256,12 +256,15 @@ pub const DEFAULT_PROFILE_SCROLL_ANCHOR: RelativePoint = RelativePoint::new(0.5,
 pub enum Workflow {
     /// 只做「找到导航图标并点击」：点完停在 [`TaskState::Navigated`]。
     NavigateOnly,
-    /// 用顶部搜索框查找联系人，打开与他的聊天，把正文填进输入框后停下。
+    /// 用顶部搜索框查找联系人，打开与他的聊天，填正文，然后（确认后）发送。
     ///
     /// 完整链路：点「联系人」导航（已在该页可点一下但画面不变）→
     /// 点顶部搜索框 → 逐字输入姓名 → 在下拉「联系人」分组里点他 →
     /// 核验资料页 → 能看见「发消息」就不滚，否则滚到底 → 点「发消息」→
-    /// 核验聊天标题 → 聚焦输入框 → 逐字输入正文 → 停在 [`TaskState::Prepared`]。
+    /// 核验聊天标题 → 聚焦输入框 → 逐字输入正文 → 人工确认 → 发送 → 核验送达。
+    ///
+    /// ⚠️ 「发不发」与这条路无关：勾了「只填不发」才停在
+    /// [`TaskState::Prepared`]，见 `prepare_message`。
     SearchContact,
     /// 在**会话列表**里滚动扫描查找联系人，然后打开聊天、准备消息。
     ///
@@ -1431,7 +1434,7 @@ impl<'a> Run<'a> {
 
         // ── 准备消息 ────────────────────────────────────────────────
         self.advance(TaskState::PreparingMessage, None)?;
-        self.prepare_message(workflow)
+        self.prepare_message()
     }
 
 

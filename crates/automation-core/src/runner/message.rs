@@ -1,19 +1,32 @@
 //! **准备消息**：聚焦输入框 → 记下发送前基线 → 把正文逐字填进去。
 //!
-//! 这里也是"发还是不发"的分岔点：搜索式工作流与「只填不发」都停在
-//! `Prepared`，只有两条都关着才会走到人工确认与发送。
+//! 这里也是"发还是不发"的分岔点，而它**只有一条判据**：配置里的「只填不发」
+//! （`stop_before_send`）。勾了就停在 `Prepared`，没勾就往下走人工确认与发送——
+//! 与走的是哪条工作流无关。
+//!
+//! ⚠️ 不要把这条判据再摊开成"某条工作流特殊"：曾经搜索式无条件停在这里
+//! （`docs/todo.md` T16 的临时取舍），现在它和列表扫描式同路。
+//! 两条路**各写一套**"发不发"的判断，迟早会出现「界面上勾了什么、实际按哪条算」
+//! 说不清，而这恰好是最不能说不清的一件事。
 
 use super::*;
 
 impl Run<'_> {
     /// 聚焦输入框、记下发送前基线，然后把正文填进去。
     ///
-    /// ## 为什么搜索式工作流无条件停在 [`TaskState::Prepared`]
+    /// ## 「发还是不发」由谁保证
     ///
-    /// 它**还没有接发送那一段**——操作者要求先把"定位 + 输入"这条链路验证通过，
-    /// 再谈发送。所以这条路既不申请发送台账、也不写消息摘要，
-    /// 审计里不该留下任何"像发过了"的痕迹。理由与待办见 `docs/todo.md`。
-    pub(super) fn prepare_message(&mut self, workflow: Workflow) -> Result<(), AutomationError> {
+    /// - **勾了「只填不发」**：正文入框后停在 [`TaskState::Prepared`] 就地结束。
+    ///   这条分支必须在人工确认**之前**，而且不能复用下面的发送路径——
+    ///   它存在的全部意义就是"绝不发送"，所以既不申请发送台账，
+    ///   也不写消息摘要，审计里不该留下任何"像发过了"的痕迹。
+    /// - **演练模式**：端口整组都是替身（`platform-mock`），`send` 只在本进程里
+    ///   记一笔，碰不到任何真实窗口。所以"不会真的发出去"**由替身端口保证**，
+    ///   不靠在这里提前停——否则演练模式下流程会缺掉后半截，
+    ///   而人拿它当"流程验证"的时候并不知道少了什么。
+    /// - **真实模式**：必然先过人工确认（`confirm_send` 会阻塞等操作者），
+    ///   确认之后才 claim 发送台账、写消息摘要、进入 [`TaskState::Sending`]。
+    pub(super) fn prepare_message(&mut self) -> Result<(), AutomationError> {
         // 选中联系人之后，焦点仍在会话列表（甚至搜索框）上，**不在消息输入框**里。
         // 不先点进输入框的话，后面那次输入会落到错误的位置——最坏情况是打进
         // 搜索框，把搜索结果本身改掉。所以这里必须先做一次受守卫的点击。
@@ -39,13 +52,7 @@ impl Run<'_> {
         self.evidence.push(format!("chat_before#{}", before_shot.fingerprint));
 
         // ── 「只填不发」：正文入框后就地结束 ────────────────────────
-        //
-        // 这条分支必须在人工确认**之前**，而且不能复用下面的发送路径：
-        // 它存在的全部意义就是"绝不发送"，所以这里既不申请发送台账，
-        // 也不写消息摘要——审计里不该留下任何"像发过了"的痕迹。
-        let stop_before_send = self.cfg().stop_before_send;
-        let search_workflow = workflow == Workflow::SearchContact;
-        if stop_before_send || search_workflow {
+        if self.cfg().stop_before_send {
             let expected_window = self.ensure_calibrated()?;
             self.ensure_not_frozen("已取消填入消息正文")?;
             // 逐字输入而不是粘贴：搜索框必须逐字敲才能触发联想，
@@ -53,15 +60,10 @@ impl Run<'_> {
             // 就不存在"某一条输入路径从没被验证过"。
             self.runner.ports.platform.type_text(&self.task.text, expected_window)?;
             self.check_deadline("填入消息正文")?;
-            let note = if search_workflow && !stop_before_send {
-                "（搜索式工作流尚未接入发送，这是刻意的）"
-            } else {
-                ""
-            };
             self.advance(
                 TaskState::Prepared,
                 Some(format!(
-                    "已把 {} 个字符逐字填入输入框，未发送{note}",
+                    "已把 {} 个字符逐字填入输入框，未发送",
                     self.task.text.chars().count()
                 )),
             )?;
