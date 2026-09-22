@@ -165,7 +165,8 @@ if [[ "$BUILD_ONLY" -eq 1 ]]; then
 fi
 
 # 数据目录 = 启动时的 cwd + /data，所以启动前必须把 cwd 换成 $DATA_ROOT。
-# `open -n` 会**继承**调用者的 cwd（实测过），所以这一行对 open 与直接跑都有效。
+# 下面直接跑二进制，它**就**继承这里的 cwd（`open` 虽然也继承，但会多弹一个
+# 终端窗口，见启动那一段的说明）。
 # 构建阶段不能提前 cd：上面的 find 用的是相对路径，要在仓库根执行。
 cd "$DATA_ROOT"
 
@@ -177,9 +178,17 @@ echo "[run] OCR 程序： $OCR"
 echo "[run] 工作目录： $(pwd)"
 echo
 
-if ! open -n "$EXE" 2>/dev/null; then
-  "$EXE" >/dev/null 2>&1 &
-fi
+# ⚠️ 不要用 `open -n "$EXE"` 来启动。
+#
+# 这个二进制是**裸可执行文件**，没有 .app 包；`open` 遇到这种文件会把
+# 它交给 LaunchServices 兜底，而兜底的关联程序就是 Terminal.app——
+# 于是每次启动都多弹一个终端窗口（还带一个 `-zsh` 中间层），
+# 里面跑着同一份程序。2026-09-22 实测确认：desktop 的父进程是 `-zsh`，
+# 再上面是 `open -n` 拉起的**新 Terminal.app 实例**（`-n` 连实例都不复用）。
+#
+# 直接跑就行：cwd 上面已经 cd 到 $DATA_ROOT，与 `open` 继承 cwd 的效果一致。
+# nohup + 重定向：关掉本终端后它继续活着，也不会占着这个 tty 往外写。
+nohup "$EXE" >/dev/null 2>&1 &
 
 # 启动期失败常发生在窗口出现前；等几秒确认进程还在。
 sleep 4
