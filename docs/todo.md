@@ -637,6 +637,11 @@
 
 ### 接入发送（2026-09-22 完成）
 
+> ⚠️ **本节里的"人工确认"环节已于同日稍后被移除**，见下面「移除人工确认（2026-09-22）」。
+> 于是下文提到的"人工确认"（第 2 条的状态说明、第 4 条的界面文案）、第 3 条里那个
+> 用例名 `…_after_the_human_confirms`、以及本节末尾"搜索式 → 确认 → 发出去了"这句，
+> **都已不是现状**——现在没勾「只填不发」就直接发出去。原文保留，只作历史记录。
+
 操作者定下的语义：**搜索式在真实环境下要把消息发出去，演练模式不发送**。
 后者的"不发送"由**替身端口**保证，而不是靠流程提前停——所以演练模式下
 搜索式也能把整条路跑完（终态 `Completed`），不必再单独记一条"这条路只走到一半"。
@@ -705,6 +710,51 @@
 
 ⚠️ **实机验收仍缺**：`send_button` 这块区域、以及按钮上到底是不是「发送」两个字，
 **都没在真实客户端上核对过**。真机上第一次跑先开「只填不发」把定位链路验一遍。
+
+### 移除人工确认（2026-09-22，稍晚于上面两条）
+
+**触发**：操作者实测报「没勾『只填不发』，消息没发出去」。查日志
+（`data/tasks/da89a816-a1a5-4e94-8023-4fd9ce84a709/task.log`）不是"没点发送"，
+而是任务跑到 `PreparingMessage` 之后**卡在 `AwaitingHumanConfirmation` 等确认**：
+
+```text
+PreparingMessage -> AwaitingHumanConfirmation
+（60 秒，没人点）
+AwaitingHumanConfirmation -> NeedsHumanReview | 需要人工处理：人工确认已过期，未获得有效确认
+```
+
+**拍板**：发送前**不再有**"等人工确认"这一步。发不发只由配置里的「只填不发」一处决定——
+勾了停在 `Prepared`，没勾就逐字输入正文、点发送按钮发出去。理由两条（写在
+`runner/message.rs` 的模块文档里）：它挡不住真正会出错的环节（"发错人"要看的
+是下拉里选中哪一行、聊天标题是不是那个人，确认框里都没有）；而且它把一次卡顿
+变成一次失败。
+
+落地清单（八层，逐层对齐）：
+
+1. **核心状态机**：删 `TaskState::AwaitingHumanConfirmation`（`ALL` 19 → 18 项），
+   迁移边改为 `PreparingMessage → Prepared | Sending`。
+   ★ `from_str_name("AwaitingHumanConfirmation")` **保留读取**并映射回 `PreparingMessage`
+   ——老审计记录里还有这个字符串，直接删会读成 `UnknownState`。
+   用例 `a_retired_state_identifier_is_still_readable` 钉住。
+2. **端口**：删 `HumanConfirmation` trait（五个端口 → 四个）。
+3. **审计字段**：`AuditEntry` 删 `confirmation_at`。
+4. **数据库**：schema 删 `confirmation_at_unix_ms` 列。★ 删列**不会动到老库**——
+   `CREATE TABLE IF NOT EXISTS` 跳过已存在的表，那列留在库里（值恒 NULL），
+   读写都按列名逐个写、不用 `SELECT *`。用例
+   `a_database_written_before_the_retired_column_and_state_still_reads_back` 钉住。
+5. **替身与桌面实现**：`crates/platform-mock/src/confirmation.rs`、`apps/desktop/src-tauri/src/confirmation.rs`
+   **整文件删除**（都是空实现，留着只会让人以为还有这条路）。
+6. **桌面命令层**：删 `confirm_task`（命令数 27 → 26）；`AppState<R>` 不再含
+   `UiConfirmation<R>`，泛型参数去掉（`R` 仍由各命令的 `AppHandle<R>` 钉住）。
+7. **前端**：删 `ConfirmationDialog.tsx`、`onConfirmationRequested`、
+   `task://confirmation-requested`、`confirmation_ttl_secs`，以及那 73 行弹窗样式。
+8. **文档**：README / architecture / code-map / windows-mvp-interface / macos / handoff 一并改。
+
+⚠️ **代价（写在这里免得将来意外）**：「找错人」现在**没有自动闸门**了。误发的防线只剩
+两道——运行前先用「只填不发」试跑一遍，以及日志里那条"放宽匹配 + 允许真实发送"的警告。
+这也是 `Prepared` 这个终态仍然保留的原因。
+
+⚠️ **实机验收仍缺**：真机上「不勾只填不发 → 逐字输入 → 点发送按钮」还没跑通过一次。
 
 ---
 
@@ -857,6 +907,12 @@
 ⚠️ 这一条**不是**本项目的硬件内存问题引起的，别往那上面查。
 
 ### 同类：`ipc_flow` 有一条判据竞态（2026-09-19 已修，别再改回去）
+
+> ⚠️ **2026-09-22 追加：这条竞态连同"人工确认"整条路一起没了**——`awaiting_confirmation`
+> 字段、`AwaitingHumanConfirmation` 状态、`confirmation.rs` 与 `task://confirmation-requested`
+> 事件都已删除（见 T16 的「移除人工确认」）。本节**保留原文**，因为下面那条
+> **通用教训仍然成立**（`wait_until` 的判据必须包含后面要断言的每一个字段）。
+> 只是现在没有一个 `awaiting_confirmation` 可以拿来举例了。
 
 **现象**：`a_dry_run_task_travels_the_full_happy_path_through_ipc` 在
 `ipc_flow.rs` 里断言 `pending.awaiting_confirmation` 偶发失败。

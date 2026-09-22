@@ -25,7 +25,7 @@
 2. **平台隔离**：业务流程不依赖 Windows/macOS 的具体输入或截图实现。
 3. **先验证、后操作**：每次可能影响收件人的操作前都需要可观测证据。
 4. **默认安全失败**：不确定即失败；绝不根据模糊 OCR 结果向候选联系人发送。
-5. **全程可审计**：记录任务状态、操作者确认、非敏感诊断信息与脱敏证据。
+5. **全程可审计**：记录任务状态、发起者、非敏感诊断信息与脱敏证据。
 
 ## 3. 组件与职责
 
@@ -74,7 +74,7 @@
 
 | 模块 | 责任 | 不负责 |
 | --- | --- | --- |
-| `desktop-app` | 任务编辑、人工确认、状态展示、标定 | 发送决策与系统输入 |
+| `desktop-app` | 任务编辑、状态展示、标定 | 发送决策与系统输入 |
 | `automation-core` | 状态机、证据判断、失败收敛 | 操作系统 API、OCR 实现、匹配实现 |
 | `vision` | 图像预处理、OCR、模板匹配、文字位置与置信度 | 鼠标点击、业务规则 |
 | `platform-windows` | 屏幕捕获、焦点、鼠标、键盘、剪贴板 | 姓名匹配、OCR 或模板匹配 |
@@ -82,14 +82,19 @@
 
 macOS 将以 `platform-macos` 实现同一组平台端口；自动化核心与视觉层不因平台改变。
 
-**业务流只依赖 trait，不直接调实现**。目前五个端口：`DesktopPlatform`、`LocalOcr`、
-`ContactMatcher`、`IconLocator`、`HumanConfirmation`。`IconLocator` 是最后一个加进来的，
+**业务流只依赖 trait，不直接调实现**。目前四个端口：`DesktopPlatform`、`LocalOcr`、
+`ContactMatcher`、`IconLocator`。`IconLocator` 是最后一个加进来的，
 它的存在让"图标定位"这件事可以整体替换（换成 OpenCV、换成模板库）而不动调用方——
 见 `docs/todo.md` T9。
 
+这里曾经有第五个端口 `HumanConfirmation`（发送前阻塞等操作者在界面上点一次确认）。
+2026-09-22 取消，理由见 `crates/automation-core/src/runner/message.rs` 的模块文档：
+它挡不住真正会出错的环节（选错候选行、聊天标题不是那个人），
+却会把"操作者正好不在电脑前"变成一次 `NeedsHumanReview` 失败。
+
 ## 5. Windows MVP 状态机
 
-**19 个状态**，但**不是一条直线**：同一个状态机要承载三条工作流
+**18 个状态**，但**不是一条直线**：同一个状态机要承载三条工作流
 （`RunnerConfig.workflow` 决定走哪条），三条在 `WaitingForClient` 之后分岔。
 
 ```text
@@ -112,8 +117,7 @@ Draft
 ② SearchContact（工作流 3 搜索式）
    WaitingForClient → SearchingContact → VerifyingCandidate → VerifyingProfile
                     → OpeningChatFromProfile → VerifyingChatHeader
-                    → PreparingMessage → AwaitingHumanConfirmation
-                    → Sending → VerifyingDelivery → Completed
+                    → PreparingMessage → Sending → VerifyingDelivery → Completed
 
    ★ 点完下拉那一行**不一定**落在资料页：对方已有会话时客户端直接打开那份聊天记录，
      于是 `VerifyingProfile` 直接跳到 `VerifyingChatHeader`（少走 `OpeningChatFromProfile`）。
@@ -122,8 +126,7 @@ Draft
 ③ ScrollListContact（列表扫描式，原有那条）
    WaitingForClient → SearchingContact → VerifyingCandidate
                     → VerifyingChatHeader
-                    → PreparingMessage → AwaitingHumanConfirmation
-                    → Sending → VerifyingDelivery → Completed
+                    → PreparingMessage → Sending → VerifyingDelivery → Completed
 ```
 
 ② 与 ③ 从 `PreparingMessage` 起就是**同一条路**（`runner/message.rs`）：
@@ -145,7 +148,9 @@ PreparingMessage → Prepared           （「只填不发」：正文已入框�
 关键约束：
 
 - 进入 `Sending` 前，联系人搜索结果与聊天页标题均须与目标名称精确匹配；
-- `AwaitingHumanConfirmation` 仅接受当前操作者在界面中的一次明确确认，确认有短时有效期；
+- `Sending` 只能从 `PreparingMessage` 到达（**不能**凭空跳进去）：发送必须建立在
+  "已经定位到人、正文已就绪"之上。发送动作本身是「逐字输入正文 + 点发送按钮」，
+  唯一决定发不发的是配置里的「只填不发」；
 - `VerifyingDelivery` 只验证“本次消息内容出现在当前已核验聊天区”，不把网络送达当作可保证的结果；
 - 超时、失焦、窗口被替换、OCR 结果冲突、风控或登录界面出现时，转 `NeedsHumanReview`。
 
@@ -160,7 +165,7 @@ PreparingMessage → Prepared           （「只填不发」：正文已入框�
 - 它们是终态，因此从 `Prepared` 出发再也转不到 `Sending`。这是"只填不发"的安全底线。
 
 ★ **搜索式与列表扫描式现在走同一条"发还是不发"的路**（2026-09-22 改）：
-真实模式下确认之后就真的发出去，演练模式下则不会发到任何地方——
+真实模式下没勾「只填不发」就真的发出去，演练模式下则不会发到任何地方——
 后者靠的是**整组替身端口**（`platform-mock` 的 `send` 只在本进程里记一笔），
 不是靠提前停在 `Prepared`。所以演练模式照样能把整条流程跑完、终态 `Completed`。
 
@@ -207,7 +212,7 @@ OCR 完全无能为力——**导航图标上没有任何文字**——所以它
 `LaunchingClient` 这个名字保留（审计记录已按该字符串落库），但它的**语义是接管而非启动**：
 
 - 客户端（微信 / 企业微信）由操作者**自己启动并登录**。扫码、验证码、风控提示
-  这些环节一律不进自动化流程——这正是"人工确认不可绕过"在启动阶段的表现；
+  这些环节一律不进自动化流程——登录必须由人完成，程序不代劳、也无法代劳；
 - `RunnerConfig.launch_wecom` **不属于任务流程**。界面上仍有一个显式的「启动客户端」按钮
   供操作者一键拉起，但它只是便利功能，不在 `execute()` 的路径上；
 - 接管 = `focus_wecom()` 找到可见的目标窗口并带到前台。找不到就报 `NeedsHumanReview`，
@@ -418,7 +423,8 @@ Windows 测试设备上，以专用测试账号和测试外部联系人验证：
 
 1. 可定位已打开且前台的企业微信；
 2. 能以 OCR 找到唯一的测试联系人并完成双重姓名核验；
-3. 操作者确认后才能把一条纯文本消息填入输入框并发送出去（**逐字输入 + 点发送按钮**，
-   不走剪贴板粘贴、不按 Enter 快捷键——客户端的发送键设置因人而异）；
+3. 未勾「只填不发」时，能把一条纯文本消息**逐字填入输入框并点发送按钮发出去**，
+   中途不需要任何人再确认一次（不走剪贴板粘贴、不按 Enter 快捷键——客户端的发送键
+   设置因人而异）；
 4. 能在聊天区识别到本条消息作为界面完成证据；
 5. 出现同名、识别失败、失焦或登录/限制提示时不会发送，并会留下可读失败原因。

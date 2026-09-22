@@ -19,9 +19,9 @@
 | `crates/automation-core` | 编排核心：状态机、trait、匹配策略、比例换算、审计契约 | 改流程、改判据、加状态 |
 | `crates/vision` | 视觉层：OCR 适配器、像素/裁切、模板匹配、证据脱敏 | 改识别、改匹配算法 |
 | `crates/platform-windows` | 真实平台：Win32 截屏/焦点/鼠标/键盘/剪贴板 + **全局热键** + 只读探针 | 改系统动作、排查「鼠标不动」 |
-| `crates/platform-mock` | 演练替身：五个端口的假实现 + 场景注入 | 加演练场景、改故障注入 |
+| `crates/platform-mock` | 演练替身：四个端口的假实现 + 场景注入 | 加演练场景、改故障注入 |
 | `crates/storage` | SQLite：审计、发送台账、证据落盘 | 改落库结构、改清理策略 |
-| `apps/desktop/src-tauri` | **IPC 命令层 + 装配**：27 个命令、配置草稿/持久化、`build_runner`、**启动日志** | 加界面按钮、加配置项（改这里最多） |
+| `apps/desktop/src-tauri` | **IPC 命令层 + 装配**：26 个命令、配置草稿/持久化、`build_runner`、**启动日志** | 加界面按钮、加配置项（改这里最多） |
 | `apps/desktop/src` | React 界面：配置面板、任务、图标库、**过程重放** | 改界面 |
 | `tools/winocr` | 独立 OCR 子进程（`Windows.Media.Ocr`） | 改 OCR 输出格式或放大倍数 |
 | `tools/macosocr` | 同一契约的 macOS 实现（`Vision` 框架，`--upscale`） | 在 Mac 上跑 OCR / 改放大倍数 |
@@ -79,20 +79,20 @@
 
 | 文件 | 行数 | 职责 | 关键符号 |
 | --- | --- | --- | --- |
-| `src/ports.rs` | 495 | **五个端口的 trait 定义** + `AutomationError` + `IconQuery`/`IconPrior` | `DesktopPlatform`、`LocalOcr`、`IconLocator`、`ContactMatcher`、`HumanConfirmation` |
-| `src/state.rs` | 532 | 任务状态枚举与合法迁移 | `TaskState` |
-| `src/runner/mod.rs` | 1541 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
+| `src/ports.rs` | 497 | **四个端口的 trait 定义** + `AutomationError` + `IconQuery`/`IconPrior` | `DesktopPlatform`、`LocalOcr`、`IconLocator`、`ContactMatcher` |
+| `src/state.rs` | 277 | 任务状态枚举与合法迁移 | `TaskState` |
+| `src/runner/mod.rs` | 1533 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
 | `src/runner/search.rs` | 492 | **搜索式工作流**（工作流 3）。★ 点下拉那一行之后**两种落点**：通常在资料页，已有会话时直接进聊天——由 `ProfileReview` 把"资料页上没认到"交回 `open_chat_from_dropdown` 定夺（见 `docs/todo.md` T32） | `search_contact_by_keyword`、`pick_contact_from_dropdown`、`verify_profile`、`open_chat_from_profile`、`open_chat_from_dropdown` |
 | `src/runner/list.rs` | 261 | **列表扫描式**（原有那条路） | `locate_contact`、`sweep_contact_list`、`scroll_to_top` |
 | `src/runner/navigate.rs` | 238 | 导航图标模板匹配 + 点击（工作流 1 / 2）。★ 每一步都记一条分段耗时（`timed!` 宏 + `Run::note_elapsed`）：截屏 / `icons.locate` / 诊断上报 / 守卫 / 点击各一段，`file:line` 取在宏展开处 | `navigate_to_view`、`nav_prior` |
-| `src/runner/message.rs` | 234 | 聚焦输入框 + 把正文**逐字**敲进输入框，以及**发不发**这一步：勾了「只填不发」停在 `Prepared`，否则人工确认 → 逐字输入 → **点发送按钮** → 核验送达。★ 判据只有 `stop_before_send` 一处，与工作流无关。★ 发送动作 = 逐字输入 + 点按钮：**不粘贴**（不碰剪贴板）、**不按 Enter**（客户端的发送键设置因人而异，按错键表现为"多了个换行、消息没出去"） | `prepare_message`、`type_into_composer`、`click_send_button`、`verify_delivery` |
+| `src/runner/message.rs` | 246 | 聚焦输入框 + 把正文**逐字**敲进输入框，以及**发不发**这一步：勾了「只填不发」停在 `Prepared`，没勾就直接**点发送按钮** → 核验送达，**中间不插任何等人工的环节**。★ 判据只有 `stop_before_send` 一处，与工作流无关。★ 发送动作 = 逐字输入 + 点按钮：**不粘贴**（不碰剪贴板）、**不按 Enter**（客户端的发送键设置因人而异，按错键表现为"多了个换行、消息没出去"） | `prepare_message`、`type_into_composer`、`click_send_button`、`verify_delivery` |
 | `src/policy.rs` | 445 | `ContactMatcher` 的实现：逐字精确匹配 + 宽松开关 | `ExactNameMatcher` |
 | `src/policy/trail.rs` | 369 | ★★ **姓名匹配的判据本体**：结论（选中谁）与轨迹（每块为什么）**同一次交出** | `strict_judge`、`contains_judge`、`name_match_decision` |
 | `src/policy/trail/verdicts.rs` | 176 | 轨迹的**措辞**层：逐块写「过 / 淘汰 + 理由」 | `verdicts_strict`、`verdicts_relaxed` |
 | `src/dropdown.rs` | 469 | ★★ **搜索下拉挑人**这条判据（多分组 + 多命中取最上面），同样一次交出结论与轨迹 | `judge_dropdown`、`parse_search_contact_group_labels` |
 | `src/diagnostics.rs` | 236 | ★★ **诊断契约**：一条轨迹长什么样（这块文字过没过 + 理由）、一次判定怎么记（判据名 / 阈值 / 候选 / 重跑参数）、一步「看到了什么」（区域 + 那一帧 + **整窗底图** + **图标命中**）。★ `WindowShot` 是"区域落在窗口哪儿"的唯一依据（只给裁图时区域框恒等于图像边界），取不到就退回裁图——诊断**永远不该**让任务失败 | `Observation`、`WindowShot`、`IconHit`、`Verdict`、`MatchTrail`、`Decision`、`ReplayInput`、`DiagnosticRecorder` |
 | `src/regions.rs` | 174 | 比例区域 → 像素矩形换算 | `RelativeRegion` |
-| `src/audit.rs` | 185 | 审计契约（只存长度/哈希/时间） | `AuditSink`、`SendLedger` |
+| `src/audit.rs` | 189 | 审计契约（只存长度/哈希/时间） | `AuditSink`、`SendLedger` |
 | `src/lib.rs` | 18 | 模块声明与 re-export | — |
 
 ⚠️ **`runner` 是个目录**（`runner/mod.rs` + 四个子模块）。四个子模块里各有一批
@@ -107,7 +107,7 @@
 | --- | --- | --- |
 | `RunnerConfig` | 313 | 全部可调参数。**加配置项的终点站** |
 | `Workflow` | 244 | 三条工作流（**导航目标不再是枚举**：见 `RunnerConfig::nav_target_label`） |
-| `RunnerPorts` | 583 | 五个端口打包在一起传给 runner |
+| `RunnerPorts` | 591 | 四个端口打包在一起传给 runner |
 | `WorkflowRunner::run` | 665 | 对外入口 |
 | `execute()` | 1143 | **状态机主干**，一路串到 `Completed`。改流程基本都在这里 |
 | `advance()` | 743 | 唯一的状态迁移出口（含审计 + 进度通知） |
@@ -161,7 +161,8 @@
 ### 3.4 `crates/platform-mock` —— 演练替身
 
 `desktop.rs`(315) 截屏与输入、`vision.rs`(122) 假 OCR、`icons.rs`(172) 假模板匹配、
-`scenario.rs`(121) **场景定义（加演练场景来这里）**、`fault.rs`(62) 故障注入、`confirmation.rs`(66) 自动确认。
+`scenario.rs`(121) **场景定义（加演练场景来这里）**、`fault.rs`(62) 故障注入。
+（原来还有 `confirmation.rs`「自动确认」——2026-09-22 随人工确认一起删了，见 `docs/architecture.md` §5 端口一节。）
 
 ### 3.5 `crates/storage`
 
@@ -194,19 +195,18 @@
 | `src/icon_library.rs` | 195 | 图标库对外接口 + 名字校验（实现在 `icon_library/`） |
 | `src/icon_library/{layout,read,write}.rs` | 79 / 188 / 145 | 目录定位 / 目录 → 列表 / 存与删 |
 | `src/icon_library/tests.rs` | 470 | 图标库测试（名字校验、定位、读写、坏文件） |
-| `src/confirmation.rs` | 127 | `HumanConfirmation` 实现（oneshot 等待界面确认） |
 
-**27 个 IPC 命令清单**（`lib.rs` 里搜 `#[tauri::command]`；
+**26 个 IPC 命令清单**（`lib.rs` 里搜 `#[tauri::command]`；
 前端调用点见 `apps/desktop/src/api.ts`，**两边名字一一对应**）：
 
 ```text
-start_task            list_tasks           get_task             confirm_task
+start_task            list_tasks           get_task             list_calibration_plan
 cancel_task           runtime_info         set_runtime_config   preview_target_window
 pick_target_window    launch_client        record_window_geometry  probe_nav_icon
 list_icons            delete_icon          delete_icon_variant  save_icon_from_crop
-click_icon            list_calibration_plan  validate_area_mark  prune_stale_marks
-workflow_requirements register_capture_hotkey  unregister_capture_hotkey
-draw_cursor_circle    read_task_log        read_task_events     open_task_dir
+click_icon            validate_area_mark   prune_stale_marks    workflow_requirements
+register_capture_hotkey  unregister_capture_hotkey  draw_cursor_circle
+read_task_log         read_task_events     open_task_dir
 ```
 
 `read_task_log` 与 `read_task_events` 是一对（T29）：前一个给的是**给人读**的叙述，
@@ -263,7 +263,7 @@ draw_cursor_circle    read_task_log        read_task_events     open_task_dir
 | `taskDisplay.ts` | 18 | `contactLabel`：任务列表与「当前任务」两处都显示收件人，空名字**不是"漏填了"**（「只做导航」根本不找人），所以给它一句话。**只写一处**，否则改文案必漏一处 |
 | `countdown.ts` | 92 | ★ **「先倒数、到点再动手」的唯一实现**（`useCountdown` / `COUNTDOWN_TICK_MS` / `remainingSeconds`）。**到点判据是「现在 ≥ 截止时刻」**，别在任何调用点改成"把间隔累加起来"。秒数留在各调用点（截图 8 秒 / 画圆 3 秒） |
 | `calibration.css` | 470 | 「界面标定」页与区域画布的样式（自成一套） |
-| `components/RuntimePanel.tsx` | 304 | 「任务」页配置面板的**骨架**：页头三条提示（模式说明 / 未保存警告 / 搬迁结果）+ 四个开关 + 确认有效期与置信度 + 保存按钮 + 数据目录说明。★ **表单按"归属"拆给了四个同级组件**，见下面四行；加东西前先问"它属于哪一组"。★ `requirement` 只是**透传**（`App` → 这里 → `RunChoiceFields`），别在这里自己取 |
+| `components/RuntimePanel.tsx` | 291 | 「任务」页配置面板的**骨架**：页头三条提示（模式说明 / 未保存警告 / 搬迁结果）+ 四个开关 + 置信度 + 保存按钮 + 数据目录说明。★ **表单按"归属"拆给了四个同级组件**，见下面四行；加东西前先问"它属于哪一组"。★ `requirement` 只是**透传**（`App` → 这里 → `RunChoiceFields`），别在这里自己取 |
 | `components/RunChoiceFields.tsx` | 341 | ★★ **运行参数那一组**：模式 / 演练场景 / 工作流 / 要点哪个图标 / 还缺哪块标定。**绑 `runChoice` 而不是 `draft`**（选完直接点开始就生效，不用保存）。它拿 `draft` 只剩**一个**用途：演练场景（唯一一个配置字段）。★ 「要点哪一个图标」的下拉**读图标库**（`listIcons()`，切页签会重新挂载所以自动刷新），列的是 `data/icons/` 的一级目录——**不要改回一份写死的清单**（见 T26）。★ `requirement` 由 `App` 传下来，**不要在这里自己问后端**（T27：两个消费者各问一次会有两份答案）。⚠️ 判据一句话：**要"保存配置"的留在 `RuntimePanel`，只管"这一次怎么跑"的搬这里** |
 | `components/TargetWindowSection.tsx` | 202 | **目标窗口**那一组：指认窗口 / 可执行文件路径与哈希 / 启动客户端 / 窗口类名 / 记录窗口尺寸 / OCR 程序路径。自带「启动中」「读取中」两份局部状态。★ 全是**配置**，要保存 |
 | `components/AdvancedParamsSection.tsx` | 192 | **超时 + 滚动查找**两组旋钮（含 `ratioFromInput`：清空输入框时**保留原值**，别退回 0）。平时不动，机器慢/列表长才来调 |
@@ -280,7 +280,7 @@ draw_cursor_circle    read_task_log        read_task_events     open_task_dir
 | `components/RegionCanvas.tsx` | 323 | 可拖拽画布：移动 / 八向缩放 / 空白处拉新框 |
 | `components/RegionCalibration.tsx` | 83 | ★ **不再是组件**：只剩 `DEFAULT_REGIONS`（四块区域的默认比例，后端是单一来源、这里只能手抄）与 `regionsAreValid`（保存前校验）。四个区域**只在「界面标定」页标**，旧的手填数字面板已删 |
 | `components/WindowPicker.tsx` | 172 | 倒计时悬停取窗口。⚠️ **它不用 `countdown.ts`**：那个定时器每跳一次还要顺便采一次"光标下是哪个窗口"，数与采必须同一拍 |
-| `components/TaskForm.tsx` / `TaskHistory.tsx` / `StateTimeline.tsx` / `ConfirmationDialog.tsx` | 121 / 95 / 86 / 59 | 任务发起、历史、状态轨迹、人工确认。`TaskForm` **不碰「走哪条路」**，那是 `App.handleStart` 补进请求的。★★ `TaskForm` 按 `needsContact` / `needsMessage`（**后端下发**，T27）决定那两个框显不显示、按钮能不能点；⚠️ 这两个值是 `boolean \| null`，**`null`（还没问到）一律放行**——拒绝是看得见的，点不动是看不见的。★ `TaskHistory` 每一条底下有「过程重放」入口（T29，`onReplay` → `App.openReplay`）；它是 `div` 套按钮，**不是按钮套按钮**（HTML 会被浏览器拆开） |
+| `components/TaskForm.tsx` / `TaskHistory.tsx` / `StateTimeline.tsx` | 121 / 95 / 86 | 任务发起、任务历史、状态轨迹。`TaskForm` **不碰「走哪条路」**，那是 `App.handleStart` 补进请求的。★★ `TaskForm` 按 `needsContact` / `needsMessage`（**后端下发**，T27）决定那两个框显不显示、按钮能不能点；⚠️ 这两个值是 `boolean \| null`，**`null`（还没问到）一律放行**——拒绝是看得见的，点不动是看不见的。★ `TaskHistory` 每一条底下有「过程重放」入口（T29，`onReplay` → `App.openReplay`）；它是 `div` 套按钮，**不是按钮套按钮**（HTML 会被浏览器拆开）。★ 界面里**没有**确认弹窗（2026-09-22 移除）：发不发只看「只填不发」 |
 
 ### 3.8 `tools/` —— 仓库外挂的小工具（不在 workspace 依赖链上）
 
@@ -310,7 +310,7 @@ draw_cursor_circle    read_task_log        read_task_events     open_task_dir
 | **改搜索式工作流**（工作流 3：点搜索框 → 下拉挑人 → 资料页 → 发消息） | `runner/search.rs`。资料页那一套（核验 / 滚到底 / 找入口）也在这里。★ 点下拉之后的**两种落点**都在 `open_chat_from_dropdown`：资料页没认到目标时**跳过**资料页两步、直接核验聊天标题（`docs/todo.md` T32） |
 | **改列表扫描式**（原有那条：滚会话列表认名字） | `runner/list.rs` |
 | **改「只做导航」**（工作流 1 / 2） | `runner/navigate.rs`（判据与点击）+ `vision/src/template.rs`（匹配算法） |
-| **改「在哪一步停下 / 要不要发」** | `runner/message.rs` 的 `prepare_message`。**判据只有一处**：配置里的「只填不发」（`stop_before_send`）。勾了 ⇒ 停在 `Prepared`；没勾 ⇒ 过人工确认再发送。★ 与走哪条工作流**无关**——搜索式一度按工作流无条件停住，2026-09-22 已收掉（`docs/todo.md` T16） |
+| **改「在哪一步停下 / 要不要发」** | `runner/message.rs` 的 `prepare_message`。**判据只有一处**：配置里的「只填不发」（`stop_before_send`）。勾了 ⇒ 停在 `Prepared`；没勾 ⇒ 逐字输入正文后**直接点发送按钮**（中间不插任何等人工的环节，2026-09-22 移除）。★ 与走哪条工作流**无关**——搜索式一度按工作流无条件停住，2026-09-22 已收掉（`docs/todo.md` T16） |
 | **改「这条工作流到底要什么」**（要标哪些区域 / 要不要填联系人·正文） | **`src-tauri/src/runtime/requirements.rs`** 的 `required_marks` 与 `workflow_inputs`。★★ **判据只有这一处**：装配期按它拒绝、界面通过 `workflow_requirements` 命令读它渲染。★ 分叉的两种后果都很难查：`required_marks` 分叉 ⇒「界面说齐了、点开始却被拒」；`workflow_inputs` 分叉 ⇒「按钮点不动、也不说为什么」（2026-09-20 实测，见 T27） |
 | **排查「某一步为什么慢 / 单步超时超在哪」** | ① 打开 `data/tasks/<任务ID>/task.log`：先搜 `超过单步上限`（文案里带**实际耗时**与**判据的代码位置**），再看它上面那一批 `⏱ …` 行——每条都带 `@文件:行`，走得最久的那条指的就是要开的地方；② 实测最常见的两段是 `导航·图标匹配 icons.locate`（`vision/src/template.rs`，逐位置扫搜索区 × 每个模板）与 `⏱ 单步图 NN`（`task_diagnostics.rs`：标注图的渲染/编码/写盘**跑在任务线程上**，直接吃单步预算）；③ 别先怀疑匹配阈值——阈值只决定"够不够格"，**不影响耗时**（见 `docs/todo.md` T31） |
 | **给任务日志加一行** / 改开头那份配置快照 | `src-tauri/src/task_log.rs` 的 `write_start_header`。★ **别加回 `lib.rs`**（它贴着基线，那一百来行是整段搬出去的）。运行参数（模式 / 工作流 / 导航目标）一律取自 `choice`，与界面上选的必须一致 |

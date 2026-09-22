@@ -200,7 +200,7 @@ pub struct IconPrior {
 }
 ```
 
-## 工作流输入与确认端口
+## 工作流输入端口
 
 ```rust
 pub struct SendTask {
@@ -209,13 +209,13 @@ pub struct SendTask {
     pub text: String,
     pub created_by: String,
 }
-
-pub trait HumanConfirmation: Send + Sync {
-    /// 确认界面必须同时显示目标名称与消息预览，并给确认设置过期时间。
-    fn confirm_send(&self, task: &SendTask, expires_in: std::time::Duration)
-        -> Result<(), AutomationError>;
-}
 ```
+
+> ⚠️ 这里原来还有一个 `HumanConfirmation` trait（`fn confirm_send`，发送前阻塞等
+> 操作者在界面上点一次确认）。**2026-09-22 已整体删除**：发不发只由配置里的
+> 「只填不发」决定，没勾就直接逐字输入正文、点发送按钮发出去，中间不再问一遍。
+> 详见 `docs/architecture.md` §5（端口）与 `crates/automation-core/src/runner/message.rs`
+> 的模块文档。
 
 ## 实现禁止项
 
