@@ -478,10 +478,12 @@ pub struct SendTask {
     pub created_by: String,
 }
 
-pub trait HumanConfirmation: Send + Sync {
-    fn confirm_send(&self, task: &SendTask, expires_in: std::time::Duration)
-        -> Result<(), AutomationError>;
-}
+// 这里曾经有一个 `HumanConfirmation` 端口（`confirm_send`）：发送前阻塞等操作者
+// 在界面上点一次"确认"。2026-09-22 操作者要求去掉——**没勾「只填不发」就是同意发**，
+// 中间不再插一道等人工的闸门（理由与替代的安全边界见 `runner/message.rs`）。
+//
+// 端口、替身、界面命令、配置项（`confirmation_ttl`）与审计里的 `confirmation_at`
+// 是**同一件事的五个落点**，一起去掉；留任何一个都是"看起来还能确认"的假痕迹。
 
 /// 失败证据记录端口。
 ///

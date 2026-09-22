@@ -11,15 +11,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use automation_core::{
-    AuditSink, CalibratedWindow, ContainsNameMatcher, HumanConfirmation, IconTemplate, LocalOcr,
-    RelativePoint, RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask,
-    StrictContactMatcher, Workflow, WorkflowRunner, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
-    DEFAULT_MIN_CONFIDENCE, DEFAULT_NAV_ICON_MIN_SCORE, DEFAULT_NAV_STRIP,
-    DEFAULT_PROFILE_CHAT_ENTRY_TEXT, DEFAULT_PROFILE_SCROLL_ANCHOR, DEFAULT_REGIONS,
-    DEFAULT_SCROLL_ANCHOR, DEFAULT_SEND_BUTTON_TEXT, DEFAULT_SEARCH_CONTACT_GROUP_LABEL,
+    AuditSink, CalibratedWindow, ContainsNameMatcher, IconTemplate, LocalOcr, RelativePoint,
+    RelativeRegion, RunnerConfig, RunnerPorts, SendLedger, SendTask, StrictContactMatcher, Workflow,
+    WorkflowRunner, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE, DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_NAV_ICON_MIN_SCORE, DEFAULT_NAV_STRIP, DEFAULT_PROFILE_CHAT_ENTRY_TEXT,
+    DEFAULT_PROFILE_SCROLL_ANCHOR, DEFAULT_REGIONS, DEFAULT_SCROLL_ANCHOR, DEFAULT_SEND_BUTTON_TEXT,
+    DEFAULT_SEARCH_CONTACT_GROUP_LABEL,
 };
 use platform_mock::{
-    MockContactMatcher, MockDesktop, MockHumanConfirmation, MockIconLocator, MockOcr, MockScenario,
+    MockContactMatcher, MockDesktop, MockIconLocator, MockOcr, MockScenario,
 };
 use serde::{Deserialize, Serialize};
 
@@ -152,12 +152,12 @@ pub struct RuntimeConfig {
     /// 实际生效值还会与「OCR 超时 + 5 秒余量」取较大者——见
     /// [`RuntimeConfig::effective_step_timeout`]。这样两个超时不可能互相矛盾。
     pub step_timeout_secs: u64,
-    pub confirmation_ttl_secs: u64,
     pub min_confidence: f32,
     pub regions: RegionConfig,
     /// 「只填不发」：把正文填进输入框后就结束，绝不发送。
     ///
     /// 用来验证"定位联系人 + 输入"这条链路是否准确，而不产生任何对外影响。
+    /// **这是"发还是不发"的唯一开关**：不勾就是同意发出去，中间没有等人工的环节。
     pub stop_before_send: bool,
     /// 查找联系人时最多向下滚动多少次。
     pub max_scroll_attempts: u32,
@@ -373,11 +373,10 @@ impl Default for RuntimeConfig {
             // 比 OCR 超时（10 秒）宽 2 倍，给慢机器留余量；
             // 真正的下限由 effective_step_timeout 推导，不靠这个值兜底。
             step_timeout_secs: 20,
-            confirmation_ttl_secs: 60,
             min_confidence: DEFAULT_MIN_CONFIDENCE,
             regions: RegionConfig::default(),
-            // 默认**不开**只填不发：默认行为应当是完整流程，且发送本身还有人工确认兜底。
-            // 这个开关是给"验证定位与输入"用的，需要操作者显式打开。
+            // 默认**不开**只填不发：不勾这个开关就意味着"同意发出去"，
+            // 所以默认行为是完整跑完并真的发送。要只看不发，操作者得显式打开它。
             stop_before_send: false,
             max_scroll_attempts: 20,
             scroll_notches_per_step: 3,
@@ -451,7 +450,6 @@ impl RuntimeConfig {
         RunnerConfig {
             platform_label: self.mode.platform_label(),
             min_confidence: self.min_confidence.clamp(0.0, 1.0),
-            confirmation_ttl: Duration::from_secs(self.confirmation_ttl_secs.max(5)),
             step_timeout: self.effective_step_timeout(),
             max_attempts: 3,
             retry_backoff: Duration::from_millis(150),
@@ -573,7 +571,6 @@ fn dry_run_ports(
         matcher: Arc::new(MockContactMatcher::new()),
         // 演练模式的图标定位：正中命中。真去读模板反而会让演示依赖一张真图片。
         icons: Arc::new(MockIconLocator::new()),
-        confirmation: Arc::new(MockHumanConfirmation::default()),
     }
 }
 
@@ -649,7 +646,6 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
             // 纯 Rust 的模板匹配。为什么不挂 OpenCV 见 `vision::template` 的模块文档
             // 与 `docs/todo.md` T9——端口在这里，换实现不用动调用方。
             icons: Arc::new(vision::TemplateLocator),
-            confirmation: Arc::new(MockHumanConfirmation::default()),
         })
     }
 }
@@ -837,9 +833,6 @@ impl Default for RunChoice {
 /// `choice` 是**本次任务**要跑的那条路（运行参数，来自任务请求，见 [`RunChoice`]）。
 /// 它决定跑演练还是真实、用哪几块标定区域、要不要点导航图标；**不写回配置**。
 /// 注意它带来的模式**会覆盖** `config.mode`——配置里那个只是"这台机器的默认值"。
-///
-/// `confirmation` 由调用方注入：真实界面走 [`crate::confirmation::UiConfirmation`]，
-/// 因此"人工确认"不是被跳过的环节，而是真的会阻塞等待操作者。
 pub fn build_runner(
     config: &RuntimeConfig,
     choice: &RunChoice,
@@ -847,7 +840,6 @@ pub fn build_runner(
     icons_dir: &std::path::Path,
     audit: Arc<dyn AuditSink>,
     ledger: Arc<dyn SendLedger>,
-    confirmation: Arc<dyn HumanConfirmation>,
 ) -> Result<WorkflowRunner, String> {
     // ★★ 第一件事：把**本次请求带来的模式**并进配置副本。
     //
@@ -940,12 +932,10 @@ pub fn build_runner(
         }
     }
 
-    let mut ports = match config.mode {
+    let ports = match config.mode {
         RuntimeMode::DryRun => dry_run_ports(&config, task),
         RuntimeMode::Live => live_ports(&config)?,
     };
-    // 确认端口始终来自界面，保证真实模式下也必须人工确认。
-    ports.confirmation = confirmation;
 
     // 真实模式：按**当前**显示器缩放挑一份标定，覆盖工作副本后再交给核心层。
     // 演练模式没有真窗口，继续用配置里正在编辑的那一份（或默认值）。

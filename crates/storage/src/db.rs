@@ -2,6 +2,11 @@
 //!
 //! 注意：`audit_entries` 表中**没有**任何可以存放消息正文、剪贴板原文
 //! 或聊天记录的列。这不是靠调用方自觉，而是结构上就无法写入。
+//!
+//! 建表一律用 `CREATE TABLE IF NOT EXISTS`，所以**从 schema 里删掉一列不会动到老库**：
+//! 老库里那一列留在原处、值恒为 NULL。读写都按列名逐个写（不用 `SELECT *`），
+//! 老库照常可用。已这样退役的一列是 `confirmation_at_unix_ms`（人工确认时间）——
+//! 随 2026-09-22 取消人工确认一起删掉，理由见 `automation_core::audit` 的模块文档。
 
 use std::path::Path;
 
@@ -16,7 +21,6 @@ CREATE TABLE IF NOT EXISTS audit_entries (
     from_state               TEXT    NOT NULL,
     to_state                 TEXT    NOT NULL,
     at_unix_ms               INTEGER NOT NULL,
-    confirmation_at_unix_ms  INTEGER,
     failure_code             TEXT,
     failure_reason           TEXT,
     evidence_json            TEXT    NOT NULL DEFAULT '[]',

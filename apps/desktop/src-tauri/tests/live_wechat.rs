@@ -87,9 +87,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use automation_core::{
-    AuditSink, AutomationError, CancelToken, DesktopPlatform, HumanConfirmation, LocalOcr,
-    ProgressSink, Rect, RelativeRegion, SendLedger, SendTask, StateChange, TaskState, TextBox,
-    Workflow,
+    AuditSink, CancelToken, DesktopPlatform, LocalOcr, ProgressSink, Rect,
+    RelativeRegion, SendLedger, SendTask, StateChange, TaskState, TextBox, Workflow,
 };
 use desktop_lib::runtime::{RunChoice, RuntimeConfig, RuntimeMode, WindowGeometry};
 use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
@@ -112,19 +111,6 @@ fn run_choice_from(config: &RuntimeConfig) -> RunChoice {
 }
 
 const DEFAULT_CONTACT: &str = "文件传输助手";
-
-/// 确认端口：**一旦被调用就 panic**。
-///
-/// 本用例配置了「只填不发」，工作流必须在人工确认**之前**结束。
-/// 如果它走到了这里，说明"只填不发"分支失效了——这是缺陷，不是可以放行的噪声，
-/// 所以这里不放行、直接炸。
-struct NeverReached;
-
-impl HumanConfirmation for NeverReached {
-    fn confirm_send(&self, _task: &SendTask, _expires_in: Duration) -> Result<(), AutomationError> {
-        panic!("配置了「只填不发」，绝不该走到人工确认——「只填不发」分支失效了");
-    }
-}
 
 /// 把状态迁移打到标准输出，便于人工核对每一步是否按预期推进。
 struct PrintProgress;
@@ -392,7 +378,6 @@ fn live_wechat_finds_contact_by_scrolling_and_types_without_sending() {
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
         ledger.clone() as Arc<dyn SendLedger>,
-        Arc::new(NeverReached),
     )
     .expect("装配真实模式运行器失败");
 
@@ -505,7 +490,6 @@ fn live_wechat_refuses_when_the_contact_cannot_be_found() {
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
         ledger.clone() as Arc<dyn SendLedger>,
-        Arc::new(NeverReached),
     )
     .expect("装配真实模式运行器失败");
 
@@ -671,7 +655,6 @@ fn live_wechat_navigates_to_a_view() {
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
         ledger.clone() as Arc<dyn SendLedger>,
-        Arc::new(NeverReached),
     )
     .expect("装配真实模式运行器失败");
 

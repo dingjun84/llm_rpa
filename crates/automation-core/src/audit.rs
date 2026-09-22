@@ -3,6 +3,12 @@
 //! 依据 `docs/architecture.md` §7：审计记录只保存执行任务必需的数据，
 //! 消息正文默认不长期保存，只存摘要（长度、哈希、时间）；
 //! 不得记录剪贴板原文、账号令牌或完整聊天历史。
+//!
+//! 这里曾经有一个 `confirmation_at`（操作者确认时间），随 2026-09-22 取消人工确认
+//! 一起去掉。**不保留"总是空"的字段**：它的文档含义是"这一步有人批准过"，
+//! 而批准这个环节已经不存在——留着它，读审计的人会去追究"为什么这批记录
+//! 全都没有确认时间"，而答案只是"这个字段早就没人填了"。库里的旧列留在原处
+//! （`CREATE TABLE IF NOT EXISTS` 不会删列），不再读写。
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -53,8 +59,6 @@ pub struct AuditEntry {
     pub from: TaskState,
     pub to: TaskState,
     pub at: SystemTime,
-    /// 操作者确认时间；仅在经过人工确认的任务上出现。
-    pub confirmation_at: Option<SystemTime>,
     pub failure_code: Option<String>,
     pub failure_reason: Option<String>,
     /// 证据引用（例如截图指纹）。不得包含图像数据或消息正文。

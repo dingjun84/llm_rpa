@@ -34,9 +34,9 @@ use crate::diagnostics::{
     Decision, DiagnosticRecorder, IconHit, MatchTrail, Observation, ReplayInput, WindowShot,
 };
 use crate::ports::{
-    AutomationError, ContactMatcher, DesktopPlatform, EvidenceRecorder, HumanConfirmation,
-    IconLocator, IconPrior, IconQuery, IconTemplate, LocalOcr, Point, Rect, ScreenMetrics,
-    Screenshot, SendTask, TaskId, TextBox,
+    AutomationError, ContactMatcher, DesktopPlatform, EvidenceRecorder, IconLocator, IconPrior,
+    IconQuery, IconTemplate, LocalOcr, Point, Rect, ScreenMetrics, Screenshot, SendTask, TaskId,
+    TextBox,
 };
 use crate::regions::{RelativePoint, RelativeRegion};
 use crate::state::{TaskMachine, TaskState};
@@ -267,12 +267,15 @@ pub const DEFAULT_PROFILE_SCROLL_ANCHOR: RelativePoint = RelativePoint::new(0.5,
 pub enum Workflow {
     /// 只做「找到导航图标并点击」：点完停在 [`TaskState::Navigated`]。
     NavigateOnly,
-    /// 用顶部搜索框查找联系人，打开与他的聊天，填正文，然后（确认后）发送。
+    /// 用顶部搜索框查找联系人，打开与他的聊天，填正文，然后发送
+    /// （勾了「只填不发」则填完即停）。
     ///
     /// 完整链路：点「联系人」导航（已在该页可点一下但画面不变）→
     /// 点顶部搜索框 → 逐字输入姓名 → 在下拉「联系人」分组里点他 →
     /// 核验资料页 → 能看见「发消息」就不滚，否则滚到底 → 点「发消息」→
-    /// 核验聊天标题 → 聚焦输入框 → 逐字输入正文 → 人工确认 → 发送 → 核验送达。
+    /// 核验聊天标题 → 聚焦输入框 → 逐字输入正文 → 点发送按钮 → 核验送达。
+    /// **中间没有等待人工的环节**（人工确认已于 2026-09-22 移除，
+    /// 见 `runner/message.rs` 的模块文档）。
     ///
     /// ⚠️ 「发不发」与这条路无关：勾了「只填不发」才停在
     /// [`TaskState::Prepared`]，见 `prepare_message`。
@@ -316,8 +319,6 @@ pub struct RunnerConfig {
     /// 审计记录里标注的平台名称。
     pub platform_label: String,
     pub min_confidence: f32,
-    /// 人工确认的有效期，过期后任务转入人工处理。
-    pub confirmation_ttl: Duration,
     /// 单步超时（协作式，见模块文档）。
     pub step_timeout: Duration,
     /// 单个可重试步骤的最大尝试次数（含首次）。
@@ -519,7 +520,6 @@ impl Default for RunnerConfig {
         Self {
             platform_label: std::env::consts::OS.to_string(),
             min_confidence: DEFAULT_MIN_CONFIDENCE,
-            confirmation_ttl: Duration::from_secs(60),
             step_timeout: Duration::from_secs(10),
             max_attempts: 3,
             retry_backoff: Duration::from_millis(200),
@@ -599,7 +599,6 @@ pub struct RunnerPorts {
     /// 但**端口本身必须始终在场**：让它变成 `Option` 的话，"忘了装配"就会
     /// 在运行期变成一个 `unwrap` 或一次静默跳过，而不是装配期的报错。
     pub icons: Arc<dyn IconLocator>,
-    pub confirmation: Arc<dyn HumanConfirmation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -708,7 +707,6 @@ struct Run<'a> {
     window: Option<Rect>,
     metrics: Option<ScreenMetrics>,
     baseline_fingerprint: Option<String>,
-    confirmation_at: Option<SystemTime>,
     message_digest: Option<MessageDigest>,
     /// 最近一次成功捕获的画面与其识别结果，仅在失败时用于生成脱敏证据。
     last_frame: Option<(Screenshot, Vec<TextBox>)>,
@@ -779,7 +777,6 @@ impl<'a> Run<'a> {
             window: None,
             metrics: None,
             baseline_fingerprint: None,
-            confirmation_at: None,
             message_digest: None,
             last_frame: None,
             last_click_reacted: None,
@@ -828,7 +825,6 @@ impl<'a> Run<'a> {
             from,
             to,
             at,
-            confirmation_at: self.confirmation_at,
             failure_code: None,
             failure_reason: detail,
             evidence: self.evidence.clone(),
@@ -921,7 +917,6 @@ impl<'a> Run<'a> {
             from,
             to: target,
             at,
-            confirmation_at: self.confirmation_at,
             failure_code: Some(code),
             failure_reason: Some(reason),
             evidence: self.evidence.clone(),

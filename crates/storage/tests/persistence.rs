@@ -7,6 +7,7 @@ use automation_core::{
     AuditEntry, AuditSink, MessageDigest, SendLedger, TaskId, TaskState,
 };
 use rusqlite::Connection;
+use rusqlite::params;
 use rusqlite::types::ValueRef;
 use storage::{EvidenceStore, RedactedImage, SqliteAuditStore, SqliteSendLedger};
 
@@ -26,7 +27,6 @@ fn entry(task_id: TaskId, from: TaskState, to: TaskState, at: SystemTime) -> Aud
         from,
         to,
         at,
-        confirmation_at: Some(at),
         failure_code: None,
         failure_reason: None,
         evidence: vec!["contact_panel#mock-0".into()],
@@ -51,7 +51,6 @@ fn audit_entries_round_trip_through_sqlite() {
     assert_eq!(first.from, TaskState::Sending);
     assert_eq!(first.to, TaskState::Completed);
     assert_eq!(first.evidence, vec!["contact_panel#mock-0".to_string()]);
-    assert!(first.confirmation_at.is_some());
     assert_eq!(first.message.as_ref().unwrap().char_count, BODY.chars().count());
     assert_eq!(first.message.as_ref().unwrap().sha256.len(), 64);
 }
@@ -91,6 +90,75 @@ fn the_message_body_is_never_written_to_the_database() {
         !raw.windows(needle.len()).any(|w| w == needle),
         "数据库文件中出现了消息正文"
     );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 取消人工确认之前建的**老库**必须照常读得回来，并且还能继续往里写。
+///
+/// 两件事一起钉：
+///
+/// 1. 建表用 `CREATE TABLE IF NOT EXISTS`，所以从 schema 里删列**不会动到已有文件**——
+///    老库里 `confirmation_at_unix_ms` 那一列还在。写入与读取都按列名逐个写
+///    （不用 `SELECT *`），多出来的一列不影响任何一边。
+/// 2. 老记录里还有 `AwaitingHumanConfirmation` 这个**已退场状态**的标识。
+///    它在 `TaskState::from_str_name` 里被映射到 `PreparingMessage`；少了这个映射，
+///    读这些记录会报 `UnknownState`，**整个任务的历史都打不开**。
+///    这条用例就是那个映射存在的理由。
+#[test]
+fn a_database_written_before_the_retired_column_and_state_still_reads_back() {
+    let path = temp_path("legacy");
+    let task_id = uuid::Uuid::new_v4();
+
+    {
+        // 手写一份"老 schema + 老数据"，模拟 2026-09-22 之前落的库。
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audit_entries (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id TEXT NOT NULL,
+                 actor TEXT NOT NULL,
+                 platform TEXT NOT NULL,
+                 from_state TEXT NOT NULL,
+                 to_state TEXT NOT NULL,
+                 at_unix_ms INTEGER NOT NULL,
+                 confirmation_at_unix_ms INTEGER,
+                 failure_code TEXT,
+                 failure_reason TEXT,
+                 evidence_json TEXT NOT NULL DEFAULT '[]',
+                 message_char_count INTEGER,
+                 message_sha256 TEXT,
+                 message_recorded_at_ms INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO audit_entries (
+                 task_id, actor, platform, from_state, to_state, at_unix_ms,
+                 confirmation_at_unix_ms, evidence_json
+             ) VALUES (?1, '老操作者', 'windows', 'PreparingMessage',
+                       'AwaitingHumanConfirmation', 1700000000000, 1700000000000, '[]')",
+            params![task_id.to_string()],
+        )
+        .unwrap();
+    }
+
+    let store = SqliteAuditStore::open(&path).unwrap();
+
+    let entries = store.entries_for(task_id).unwrap();
+    assert_eq!(entries.len(), 1, "老记录必须读得回来，而不是报 UnknownState");
+    assert_eq!(entries[0].actor, "老操作者");
+    assert_eq!(
+        entries[0].to,
+        TaskState::PreparingMessage,
+        "已退场状态的标识要映射到它的前驱，不能变成 UnknownState"
+    );
+
+    // 老库还要能继续接新记录（新 INSERT 不含那一列）。
+    store
+        .record(&entry(task_id, TaskState::Sending, TaskState::Completed, SystemTime::now()))
+        .unwrap();
+    assert_eq!(store.entries_for(task_id).unwrap().len(), 2);
 
     let _ = std::fs::remove_file(&path);
 }

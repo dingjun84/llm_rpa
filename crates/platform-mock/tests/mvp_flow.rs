@@ -13,7 +13,7 @@ use automation_core::{
     WorkflowRunner, DEFAULT_NAV_STRIP,
 };
 use platform_mock::{
-    tb, ConfirmationOutcome, Fault, MockDesktop, MockHumanConfirmation, MockIconLocator, MockOcr,
+    tb, Fault, MockDesktop, MockIconLocator, MockOcr,
     MockScenario, ScriptedCall, DEFAULT_WINDOW,
 };
 
@@ -107,7 +107,6 @@ struct Fixture {
     runner: WorkflowRunner,
     desktop: Arc<MockDesktop>,
     ocr: Arc<MockOcr>,
-    confirmation: Arc<MockHumanConfirmation>,
     audit: Arc<MemoryAudit>,
     diagnostics: Arc<RecordingDiagnostics>,
     progress: RecordingProgress,
@@ -147,7 +146,6 @@ impl Fixture {
         Self::build(
             scenario,
             MockDesktop::new(),
-            MockHumanConfirmation::default(),
             RunnerConfig {
                 platform_label: "test".into(),
                 retry_backoff: Duration::ZERO,
@@ -159,10 +157,9 @@ impl Fixture {
     fn build(
         scenario: &MockScenario,
         desktop: MockDesktop,
-        confirmation: MockHumanConfirmation,
         config: RunnerConfig,
     ) -> Self {
-        Self::build_with_script(desktop, confirmation, config, scenario.script())
+        Self::build_with_script(desktop, config, scenario.script())
     }
 
     /// 用自定义 OCR 脚本装配。
@@ -171,13 +168,11 @@ impl Fixture {
     /// 但「滚动查找联系人」会对候选区识别**多次**，段数不固定，必须自己排。
     fn build_with_script(
         desktop: MockDesktop,
-        confirmation: MockHumanConfirmation,
         config: RunnerConfig,
         script: Vec<ScriptedCall>,
     ) -> Self {
         Self::build_with_matcher(
             desktop,
-            confirmation,
             config,
             script,
             Arc::new(platform_mock::MockContactMatcher::new()),
@@ -190,12 +185,11 @@ impl Fixture {
     /// （`ContainsNameMatcher`），不换匹配器就测不到它。
     fn build_with_matcher(
         desktop: MockDesktop,
-        confirmation: MockHumanConfirmation,
         config: RunnerConfig,
         script: Vec<ScriptedCall>,
         matcher: Arc<dyn automation_core::ContactMatcher>,
     ) -> Self {
-        Self::build_full(desktop, confirmation, config, script, matcher, Arc::new(MockIconLocator::new()))
+        Self::build_full(desktop, config, script, matcher, Arc::new(MockIconLocator::new()))
     }
 
     /// 最完整的一层：端口逐个指定。
@@ -204,7 +198,6 @@ impl Fixture {
     /// 需要测"图标找不到"这类路径时才换掉它。
     fn build_full(
         desktop: MockDesktop,
-        confirmation: MockHumanConfirmation,
         config: RunnerConfig,
         script: Vec<ScriptedCall>,
         matcher: Arc<dyn automation_core::ContactMatcher>,
@@ -213,7 +206,6 @@ impl Fixture {
         arm_send_button(&desktop, &config);
         let desktop = Arc::new(desktop);
         let ocr = Arc::new(MockOcr::new(script));
-        let confirmation = Arc::new(confirmation);
         let audit = Arc::new(MemoryAudit::new());
         let ledger = Arc::new(MemorySendLedger::new());
         let diagnostics = Arc::new(RecordingDiagnostics::default());
@@ -224,7 +216,6 @@ impl Fixture {
                 ocr: ocr.clone(),
                 matcher,
                 icons,
-                confirmation: confirmation.clone(),
             },
             config,
         )
@@ -236,7 +227,6 @@ impl Fixture {
             runner,
             desktop,
             ocr,
-            confirmation,
             audit,
             diagnostics,
             progress: RecordingProgress::default(),
@@ -286,7 +276,6 @@ fn happy_path_reaches_completed() {
         fixture.desktop.pasted_texts()
     );
     assert_eq!(fixture.desktop.typed_texts(), vec![MESSAGE.to_string()]);
-    assert_eq!(fixture.confirmation.call_count(), 1);
 }
 
 #[test]
@@ -307,7 +296,6 @@ fn happy_path_visits_every_documented_state_in_order() {
             TaskState::VerifyingCandidate,
             TaskState::VerifyingChatHeader,
             TaskState::PreparingMessage,
-            TaskState::AwaitingHumanConfirmation,
             TaskState::Sending,
             TaskState::VerifyingDelivery,
             TaskState::Completed,
@@ -467,7 +455,6 @@ fn the_relaxed_matcher_accepts_a_near_name_and_that_is_the_known_cost() {
     let scenario = MockScenario::near_name_only(CONTACT, MESSAGE);
     let fixture = Fixture::build_with_matcher(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         scenario.script(),
         Arc::new(automation_core::ContainsNameMatcher::default()),
@@ -508,7 +495,11 @@ fn chat_header_mismatch_blocks_the_send() {
 
     assert_eq!(outcome.state, TaskState::NeedsHumanReview);
     assert_eq!(fixture.desktop.send_count(), 0);
-    assert!(fixture.confirmation.calls.lock().unwrap().is_empty(), "未通过核验不得请求确认");
+    assert!(
+        !fixture.progress.states().contains(&TaskState::Sending),
+        "没通过核验就不得进入发送，实际路径：{:?}",
+        fixture.progress.states()
+    );
 }
 
 #[test]
@@ -522,57 +513,39 @@ fn login_prompt_stops_the_task() {
     assert_eq!(fixture.desktop.send_count(), 0);
 }
 
-// ── 人工确认 ────────────────────────────────────────────────────────────
+// ── 发送前不再有人工确认 ────────────────────────────────────────────────
 
+/// 取消人工确认之后，**发送前没有任何等待点**：`PreparingMessage` 的下一步就是
+/// `Sending`。
+///
+/// 这里从前有三条用例——「拒绝发送」「确认过期」「按配置的 TTL 请求确认」。
+/// 它们钉的是一个已经不存在的行为，所以随实现一起删掉；补上这条**反向**的：
+/// 哪天有人把确认框加回来，它会立刻亮。
+///
+/// 现场（`data/tasks/da89a816-…`）：任务一路走到 `PreparingMessage`，然后卡了
+/// 整整 60 秒直到确认过期，以 `NeedsHumanReview` 结束——消息始终没发出去。
+/// 这正是"多一个等待点"的代价：操作者不在电脑前，任务就变成一次失败。
 #[test]
-fn rejected_confirmation_blocks_the_send() {
+fn nothing_waits_for_a_human_between_preparing_and_sending() {
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
-    let fixture = Fixture::build(
-        &scenario,
-        MockDesktop::new(),
-        MockHumanConfirmation::new(ConfirmationOutcome::Reject("内容不对".into())),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
-    );
+    let fixture = Fixture::new(&scenario);
 
     let outcome = fixture.run(&fixture.task());
 
-    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
-    assert_eq!(fixture.desktop.send_count(), 0);
-}
+    assert_eq!(outcome.state, TaskState::Completed, "失败原因：{:?}", outcome.failure);
+    assert_eq!(fixture.desktop.send_count(), 1, "不勾「只填不发」就是要把它发出去");
 
-#[test]
-fn expired_confirmation_blocks_the_send() {
-    let scenario = MockScenario::happy(CONTACT, MESSAGE);
-    let fixture = Fixture::build(
-        &scenario,
-        MockDesktop::new(),
-        MockHumanConfirmation::new(ConfirmationOutcome::Expired),
-        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
+    let states = fixture.progress.states();
+    let after_preparing = states
+        .iter()
+        .position(|state| *state == TaskState::PreparingMessage)
+        .expect("应当经过 PreparingMessage")
+        + 1;
+    assert_eq!(
+        states.get(after_preparing),
+        Some(&TaskState::Sending),
+        "准备消息之后必须直接发送，中间不该再插一个等人工的环节：{states:?}"
     );
-
-    let outcome = fixture.run(&fixture.task());
-
-    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
-    assert_eq!(fixture.desktop.send_count(), 0);
-}
-
-#[test]
-fn confirmation_is_requested_with_the_configured_ttl() {
-    let scenario = MockScenario::happy(CONTACT, MESSAGE);
-    let fixture = Fixture::build(
-        &scenario,
-        MockDesktop::new(),
-        MockHumanConfirmation::default(),
-        RunnerConfig {
-            confirmation_ttl: Duration::from_secs(45),
-            retry_backoff: Duration::ZERO,
-            ..list_config()
-        },
-    );
-
-    fixture.run(&fixture.task());
-
-    assert_eq!(fixture.confirmation.last_ttl(), Some(Duration::from_secs(45)));
 }
 
 // ── 窗口与标定守卫 ──────────────────────────────────────────────────────
@@ -589,7 +562,6 @@ fn window_replaced_before_the_click_is_detected() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
@@ -611,7 +583,6 @@ fn display_scale_change_is_detected_before_input() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
@@ -643,7 +614,6 @@ fn unchanged_screen_after_send_is_not_reported_as_delivered() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
@@ -672,7 +642,6 @@ fn the_same_task_cannot_be_sent_twice() {
             ocr: Arc::new(MockOcr::new(script)),
             matcher: Arc::new(platform_mock::MockContactMatcher::new()),
             icons: Arc::new(MockIconLocator::new()),
-            confirmation: Arc::new(MockHumanConfirmation::default()),
         },
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     )
@@ -717,7 +686,6 @@ fn transient_capture_failure_is_retried_and_recovers() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig {
             max_attempts: 3,
             retry_backoff: Duration::ZERO,
@@ -750,7 +718,6 @@ fn persistent_capture_failure_gives_up_after_max_attempts() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig {
             max_attempts: 3,
             retry_backoff: Duration::ZERO,
@@ -786,7 +753,6 @@ fn audit_records_every_transition_and_never_stores_the_message_body() {
     let digest = sending.message.as_ref().expect("Sending 应带消息摘要");
     assert_eq!(digest.char_count, MESSAGE.chars().count());
     assert_eq!(digest.sha256.len(), 64);
-    assert!(sending.confirmation_at.is_some(), "Sending 应记录确认时间");
     assert_eq!(sending.actor, "测试操作者");
     assert_eq!(sending.platform, "test");
 }
@@ -816,7 +782,6 @@ fn audit_never_contains_the_message_body_after_a_failed_send() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
@@ -854,7 +819,6 @@ fn scrolling_finds_a_contact_that_is_not_on_the_first_screen() {
     ];
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         script,
     );
@@ -895,7 +859,6 @@ fn scrolling_happens_at_the_configured_anchor_not_the_panel_center() {
 
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         config,
         script,
     );
@@ -946,7 +909,6 @@ fn every_sweep_step_records_what_the_ocr_actually_read() {
     ];
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         script,
     );
@@ -1012,7 +974,6 @@ fn recording_what_was_read_can_be_switched_off() {
     ];
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             log_ocr_candidates: false,
@@ -1059,7 +1020,6 @@ fn the_log_records_where_the_cursor_will_go() {
 
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         config,
         script,
     );
@@ -1122,7 +1082,6 @@ fn a_dirty_name_still_finds_the_contact_under_relaxed_matching() {
 
     let relaxed = Fixture::build_with_matcher(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         config.clone(),
         script.clone(),
         Arc::new(automation_core::ContainsNameMatcher::default()),
@@ -1148,7 +1107,6 @@ fn a_dirty_name_still_finds_the_contact_under_relaxed_matching() {
     // 对照组：同一条脚本换成严格匹配 —— 必须转人工，证明上面那条真的是放宽层的功劳。
     let strict = Fixture::build_with_matcher(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         config,
         script,
         Arc::new(automation_core::StrictContactMatcher::default()),
@@ -1168,7 +1126,6 @@ fn scrolling_gives_up_at_the_attempt_limit_and_asks_for_a_human() {
     // 脚本里永远只有别人，目标从不出现；脚本耗尽后 MockOcr 返回空列表。
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             max_scroll_attempts: 3,
@@ -1214,7 +1171,6 @@ fn a_list_that_cannot_scroll_stops_early_instead_of_burning_the_limit() {
     desktop.script_scroll_bottom(0);
     let fixture = Fixture::build_with_script(
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             max_scroll_attempts: 50,
@@ -1247,7 +1203,6 @@ fn a_frozen_client_is_reported_as_frozen_instead_of_scrolled_to_the_bottom() {
     desktop.set_responsive(false);
     let fixture = Fixture::build_with_script(
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         vec![ScriptedCall::boxes(vec![tb("别的联系人", 20, 0.99)])],
     );
@@ -1288,7 +1243,6 @@ fn a_contact_pushed_to_the_top_by_a_new_message_is_found_on_the_second_sweep() {
     ];
     let fixture = Fixture::build_with_script(
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         script,
     );
@@ -1331,7 +1285,6 @@ fn a_single_sweep_misses_a_contact_that_jumped_to_the_top() {
     ];
     let fixture = Fixture::build_with_script(
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             max_search_sweeps: 1,
@@ -1375,7 +1328,6 @@ fn every_scroll_is_followed_by_a_fresh_recognition() {
     ];
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
         script,
     );
@@ -1399,7 +1351,6 @@ fn a_frozen_client_stops_the_task_before_any_input() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
@@ -1425,7 +1376,6 @@ fn a_click_that_changes_nothing_is_reported_as_ineffective_not_as_a_wrong_title(
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     );
 
@@ -1446,7 +1396,6 @@ fn the_liveness_check_can_be_turned_off() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             liveness_check: false,
@@ -1474,7 +1423,6 @@ fn a_window_that_is_not_the_calibrated_size_is_resized_back_before_any_input() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             calibrated_window: Some(CalibratedWindow {
@@ -1513,7 +1461,6 @@ fn a_window_matching_the_calibrated_size_is_accepted_untouched() {
     let fixture = Fixture::build(
         &scenario,
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             calibrated_window: Some(CalibratedWindow {
@@ -1546,7 +1493,6 @@ fn a_client_that_refuses_to_be_resized_is_refused_before_any_input() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             calibrated_window: Some(CalibratedWindow {
@@ -1580,7 +1526,6 @@ fn a_scale_factor_mismatch_is_not_papered_over_by_resizing() {
     let fixture = Fixture::build(
         &scenario,
         desktop,
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             calibrated_window: Some(CalibratedWindow {
@@ -1629,7 +1574,6 @@ fn stop_before_send_fills_the_box_and_never_sends() {
     let fixture = Fixture::build(
         &scenario,
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             stop_before_send: true,
@@ -1655,11 +1599,6 @@ fn stop_before_send_fills_the_box_and_never_sends() {
         fixture.desktop.pasted_texts()
     );
     assert_eq!(fixture.desktop.send_count(), 0, "绝不能按发送");
-    assert_eq!(
-        fixture.confirmation.call_count(),
-        0,
-        "既然不会发送，就不该再走人工确认"
-    );
 }
 
 /// 「只填不发」不能只是「跳过发送键」——它必须压根不进入 Sending 状态，
@@ -1670,7 +1609,6 @@ fn stop_before_send_never_reaches_the_sending_state() {
     let fixture = Fixture::build(
         &scenario,
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             stop_before_send: true,
@@ -1683,10 +1621,6 @@ fn stop_before_send_never_reaches_the_sending_state() {
 
     let states = fixture.progress.states();
     assert!(!states.contains(&TaskState::Sending), "不该经过 Sending，实际路径：{states:?}");
-    assert!(
-        !states.contains(&TaskState::AwaitingHumanConfirmation),
-        "不该要求确认，实际路径：{states:?}"
-    );
     assert_eq!(states.last(), Some(&TaskState::Prepared));
     assert!(
         fixture.entries().iter().all(|entry| entry.message.is_none()),
@@ -1701,7 +1635,6 @@ fn sending_still_happens_when_stop_before_send_is_off() {
     let fixture = Fixture::build(
         &scenario,
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             stop_before_send: false,
@@ -1727,7 +1660,6 @@ fn stop_before_send_works_together_with_scrolling() {
     ];
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         RunnerConfig {
             retry_backoff: Duration::ZERO,
             stop_before_send: true,
@@ -1758,7 +1690,6 @@ fn navigation_fixture(desktop: MockDesktop, icons: Arc<dyn IconLocator>) -> Fixt
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
     Fixture::build_full(
         desktop,
-        MockHumanConfirmation::default(),
         navigation_config(),
         scenario.script(),
         Arc::new(platform_mock::MockContactMatcher::new()),
@@ -1887,7 +1818,6 @@ fn a_view_that_never_switched_is_caught_when_the_contact_is_not_found() {
     let scenario = MockScenario::login_prompt(CONTACT, MESSAGE);
     let fixture = Fixture::build_full(
         desktop,
-        MockHumanConfirmation::default(),
         navigation_config(),
         scenario.script(),
         Arc::new(platform_mock::MockContactMatcher::new()),
@@ -1913,7 +1843,6 @@ fn the_list_workflow_always_navigates_to_chat_history() {
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
     let fixture = Fixture::build_full(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         list_config(),
         scenario.script(),
         Arc::new(platform_mock::MockContactMatcher::new()),
@@ -1938,7 +1867,6 @@ fn search_workflow_always_navigates_to_contacts_first() {
     desktop.script_scroll_bottom(6);
     let fixture = Fixture::build_full(
         desktop,
-        MockHumanConfirmation::default(),
         cfg,
         search_script(CONTACT),
         Arc::new(platform_mock::MockContactMatcher::new()),
@@ -2039,13 +1967,12 @@ fn search_fixture(script: Vec<ScriptedCall>) -> Fixture {
     desktop.script_scroll_bottom(6);
     Fixture::build_with_script(
         desktop,
-        MockHumanConfirmation::default(),
         search_config(),
         script,
     )
 }
 
-/// 搜索式主路径：找到人 → 填好正文 → **人工确认之后真的发出去** → 核验送达。
+/// 搜索式主路径：找到人 → 填好正文 → **真的发出去** → 核验送达。
 ///
 /// ## 为什么这条用例很重要
 ///
@@ -2055,9 +1982,9 @@ fn search_fixture(script: Vec<ScriptedCall>) -> Fixture {
 /// （`platform-mock`），不是靠在这里提前停下。
 ///
 /// 所以这里同时钉住两件事：该发生的发送**真的发生了**（且只发生一次），
-/// 以及发送前**必须**过人工确认。
+/// 以及发送前**不再有任何等待点**（人工确认已于 2026-09-22 取消）。
 #[test]
-fn the_search_workflow_sends_once_after_the_human_confirms() {
+fn the_search_workflow_sends_once() {
     let fixture = search_fixture(search_script(CONTACT));
     let outcome = fixture.run(&fixture.task());
 
@@ -2065,19 +1992,10 @@ fn the_search_workflow_sends_once_after_the_human_confirms() {
     assert!(outcome.succeeded(), "发出去了、也核验到了，才算走完");
     assert!(!outcome.stopped_before_send(), "没勾「只填不发」，就不该停在 Prepared");
 
-    // ── 发出去，且只发一次，而且过了人工确认 ────────────────────
+    // ── 发出去，且只发一次 ──────────────────────────────────────
     assert_eq!(fixture.desktop.send_count(), 1, "搜索式工作流也要把消息发出去");
-    assert_eq!(
-        fixture.confirmation.call_count(),
-        1,
-        "发送前必须申请一次人工确认——这是产品底线，不是可选项"
-    );
     let states = fixture.progress.states();
     let at = |state: TaskState| states.iter().position(|s| *s == state);
-    assert!(
-        at(TaskState::AwaitingHumanConfirmation) < at(TaskState::Sending),
-        "必须**先**问人、**再**发；顺序反了就成了先发后问：{states:?}"
-    );
     assert!(at(TaskState::Sending) < at(TaskState::VerifyingDelivery), "{states:?}");
     assert_eq!(*states.last().unwrap(), TaskState::Completed, "{states:?}");
     assert!(
@@ -2240,7 +2158,6 @@ fn search_fixture_relaxed(script: Vec<ScriptedCall>) -> Fixture {
     desktop.script_scroll_bottom(6);
     Fixture::build_with_matcher(
         desktop,
-        MockHumanConfirmation::default(),
         search_config(),
         script,
         Arc::new(automation_core::ContainsNameMatcher::default()),
@@ -2479,7 +2396,6 @@ fn a_search_workflow_without_its_regions_stops_before_clicking() {
     let config = RunnerConfig { search_dropdown: None, ..search_config() };
     let fixture = Fixture::build_with_script(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         config,
         search_script(CONTACT),
     );
@@ -2514,7 +2430,6 @@ fn a_click_that_changes_nothing_is_reported_as_such() {
     script[1] = ScriptedCall::Ok(vec![tb("另一个联系人", 20, 0.99)]);
     let fixture = Fixture::build_with_script(
         desktop,
-        MockHumanConfirmation::default(),
         search_config(),
         script,
     );
@@ -2618,7 +2533,6 @@ fn navigate_only_finds_the_icon_and_stops_at_navigated() {
     let scenario = MockScenario::happy(CONTACT, MESSAGE);
     let fixture = Fixture::build_full(
         MockDesktop::new(),
-        MockHumanConfirmation::default(),
         config,
         scenario.script(),
         Arc::new(platform_mock::MockContactMatcher::new()),
@@ -2667,7 +2581,6 @@ fn navigate_only_still_requires_a_calibrated_window_in_live_mode() {
     desktop.set_window(automation_core::Rect { x: 0, y: 0, width: 800, height: 600 });
     let fixture = Fixture::build_full(
         desktop,
-        MockHumanConfirmation::default(),
         config,
         scenario.script(),
         Arc::new(platform_mock::MockContactMatcher::new()),

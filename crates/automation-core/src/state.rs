@@ -38,7 +38,6 @@ pub enum TaskState {
     OpeningChatFromProfile,
     VerifyingChatHeader,
     PreparingMessage,
-    AwaitingHumanConfirmation,
     Sending,
     VerifyingDelivery,
     Completed,
@@ -77,7 +76,7 @@ impl TaskState {
     /// **新增状态时必须同时加进这张表。** 这一点编译器不会替我们盯着
     /// （数组长度是字面量），所以下面 `all_variants_round_trip` 那条用例
     /// 是唯一的兜底——表里没有的状态，它就测不到。
-    pub const ALL: [TaskState; 19] = [
+    pub const ALL: [TaskState; 18] = [
         Self::Draft,
         Self::LaunchingClient,
         Self::WaitingForClient,
@@ -88,7 +87,6 @@ impl TaskState {
         Self::OpeningChatFromProfile,
         Self::VerifyingChatHeader,
         Self::PreparingMessage,
-        Self::AwaitingHumanConfirmation,
         Self::Sending,
         Self::VerifyingDelivery,
         Self::Completed,
@@ -124,7 +122,6 @@ impl TaskState {
             Self::OpeningChatFromProfile => "OpeningChatFromProfile",
             Self::VerifyingChatHeader => "VerifyingChatHeader",
             Self::PreparingMessage => "PreparingMessage",
-            Self::AwaitingHumanConfirmation => "AwaitingHumanConfirmation",
             Self::Sending => "Sending",
             Self::VerifyingDelivery => "VerifyingDelivery",
             Self::Completed => "Completed",
@@ -137,6 +134,18 @@ impl TaskState {
     }
 
     /// 从 [`TaskState::as_str`] 产出的标识还原状态。
+    ///
+    /// ## 为什么要认一个已经没有的状态
+    ///
+    /// `"AwaitingHumanConfirmation"` 在 2026-09-22 取消人工确认后**不再产生**，
+    /// 但审计库里已经有按它落库的记录（那些任务确实走到过那一步）。
+    /// 直接返回 `None` 的后果不是"少显示一个状态"，而是 `storage` 侧读这些记录时
+    /// 报 `UnknownState` —— 整条记录连同一个任务的历史一起读不回来。
+    /// 所以这里保留**读取**，映射到它当时的业务含义最接近的前驱：
+    /// 那一刻任务正停在"正文已就绪、还没发出去"的地方。
+    ///
+    /// 与 `LaunchingClient` 那条注释同一条约定：**已经落库的标识不许读不回来**。
+    /// 区别是那个状态今天还在产生（只是名字不准），这个已经彻底退场。
     pub fn from_str_name(name: &str) -> Option<Self> {
         Some(match name {
             "Draft" => Self::Draft,
@@ -149,7 +158,8 @@ impl TaskState {
             "OpeningChatFromProfile" => Self::OpeningChatFromProfile,
             "VerifyingChatHeader" => Self::VerifyingChatHeader,
             "PreparingMessage" => Self::PreparingMessage,
-            "AwaitingHumanConfirmation" => Self::AwaitingHumanConfirmation,
+            // 历史遗留标识，见上。
+            "AwaitingHumanConfirmation" => Self::PreparingMessage,
             "Sending" => Self::Sending,
             "VerifyingDelivery" => Self::VerifyingDelivery,
             "Completed" => Self::Completed,
@@ -175,7 +185,6 @@ impl TaskState {
             Self::OpeningChatFromProfile => "正在从资料页打开聊天",
             Self::VerifyingChatHeader => "正在核验聊天页标题",
             Self::PreparingMessage => "正在准备消息",
-            Self::AwaitingHumanConfirmation => "等待人工确认",
             Self::Sending => "正在发送",
             Self::VerifyingDelivery => "正在核验送达",
             Self::Completed => "已完成",
@@ -249,9 +258,10 @@ impl TaskMachine {
                 | (TaskState::VerifyingProfile, TaskState::VerifyingChatHeader)
                 | (TaskState::OpeningChatFromProfile, TaskState::VerifyingChatHeader)
                 | (TaskState::VerifyingChatHeader, TaskState::PreparingMessage)
-                | (TaskState::PreparingMessage, TaskState::AwaitingHumanConfirmation)
+                // 「只填不发」在这里就地结束；没勾就直接进发送——中间**没有**任何
+                // 等待人工的环节（2026-09-22 移除，理由见 `runner/message.rs`）。
                 | (TaskState::PreparingMessage, TaskState::Prepared)
-                | (TaskState::AwaitingHumanConfirmation, TaskState::Sending)
+                | (TaskState::PreparingMessage, TaskState::Sending)
                 | (TaskState::Sending, TaskState::VerifyingDelivery)
                 | (TaskState::VerifyingDelivery, TaskState::Completed)
         );

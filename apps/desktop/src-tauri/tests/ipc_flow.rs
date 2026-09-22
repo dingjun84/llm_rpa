@@ -9,11 +9,12 @@
 //!
 //! 覆盖的验收点：
 //!
-//! 1. 演练模式下一条任务能走完 11 步主路径并到达 `Completed`；
+//! 1. 演练模式下一条任务能走完 10 步主路径并到达 `Completed`；
 //! 2. `task://updated` 事件按状态顺序推送；
-//! 3. 人工拒绝与"无法确认送达"都收敛到 `NeedsHumanReview`，绝不误判成功；
+//! 3. 「无法确认送达」收敛到 `NeedsHumanReview`，绝不误判成功；
 //! 4. 消息正文不进审计库，只留长度与哈希；
-//! 5. 入参校验与不存在的任务 ID 会返回明确错误。
+//! 5. 入参校验与不存在的任务 ID 会返回明确错误；
+//! 6. 发送前**没有任何等待点**：不调任何命令，任务自己走到 `Completed`。
 
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -32,8 +33,11 @@ use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, Moc
 use tauri::webview::InvokeRequest;
 use tauri::{Listener, Manager, WebviewWindow, WebviewWindowBuilder};
 
-/// 主路径的 11 个状态，顺序即文档 §5 的约定。
-const HAPPY_PATH: [TaskState; 11] = [
+/// 主路径的 10 个状态，顺序即文档 §5 的约定。
+///
+/// 这里曾经有 11 个：`PreparingMessage` 与 `Sending` 之间夹着一个
+/// `AwaitingHumanConfirmation`（等操作者在界面上点确认）。2026-09-22 取消。
+const HAPPY_PATH: [TaskState; 10] = [
     TaskState::Draft,
     TaskState::LaunchingClient,
     TaskState::WaitingForClient,
@@ -41,7 +45,6 @@ const HAPPY_PATH: [TaskState; 11] = [
     TaskState::VerifyingCandidate,
     TaskState::VerifyingChatHeader,
     TaskState::PreparingMessage,
-    TaskState::AwaitingHumanConfirmation,
     TaskState::Sending,
     TaskState::VerifyingDelivery,
     TaskState::Completed,
@@ -121,8 +124,6 @@ impl Harness {
                 mode: RuntimeMode::DryRun,
                 demo_scenario: scenario,
                 workflow: Workflow::ScrollListContact,
-                // 确认窗口收紧到 5 秒，让"确认过期"这类用例不必真的等一分钟。
-                confirmation_ttl_secs: 5,
                 ..Default::default()
             },
         )
@@ -157,8 +158,8 @@ impl Harness {
         Self { app, webview, run_choice, _dir: dir }
     }
 
-    fn state(&self) -> tauri::State<'_, AppState<MockRuntime>> {
-        self.app.state::<AppState<MockRuntime>>()
+    fn state(&self) -> tauri::State<'_, AppState> {
+        self.app.state::<AppState>()
     }
 
     fn call<T: DeserializeOwned>(
@@ -197,13 +198,6 @@ impl Harness {
 
     fn task(&self, id: &str) -> TaskView {
         self.ok("get_task", json!({ "taskId": id }))
-    }
-
-    fn confirm(&self, id: &str, approved: bool, reason: Option<&str>) {
-        self.ok::<()>(
-            "confirm_task",
-            json!({ "taskId": id, "approved": approved, "reason": reason }),
-        );
     }
 
     /// 轮询到满足条件为止。工作流跑在后台线程，界面只能靠推送与轮询观察。
@@ -273,31 +267,15 @@ fn a_dry_run_task_travels_the_full_happy_path_through_ipc() {
     let id = harness.start("张三", BODY);
     assert!(!id.is_empty(), "start_task 应返回任务 ID");
 
-    // 刚创建时应停在 Draft，且已经进入等待确认之前的步骤。
-    //
-    // ⚠️ 判据里**必须带上 `awaiting_confirmation`**，不能只等状态。
-    // 编排层是**两步**做的：先 `advance(AwaitingHumanConfirmation)`（这一步就会推送一次
-    // 视图，而那时确认请求还没登记，`is_pending` 还是 false），再 `confirm_send()`
-    // 登记请求。只等状态的话，`wait_until` 可能正好取到那两步之间的快照，
-    // 断言就会偶发失败——只在整轮并行（`-j 2`）时才撞得上，单跑必过。
-    //
-    // 界面不受这个窗口影响：它靠 `task://confirmation-requested` 弹确认框，
-    // 而那个事件是在 `slots.insert()` **之后**才发的。所以这是测试的判据问题，
-    // 不是程序的 bug——**别去改编排层的顺序**。
-    let pending = harness.wait_until(&id, "进入等待人工确认", |view| {
-        view.state == TaskState::AwaitingHumanConfirmation && view.awaiting_confirmation
-    });
-    assert!(pending.awaiting_confirmation, "等待确认时应置位 awaiting_confirmation");
-    assert_eq!(pending.external_contact_name, "张三");
-    assert_eq!(pending.text_length, BODY.chars().count());
-    assert_eq!(pending.created_by, "本机操作者", "未指定操作者时应回落到本机操作者");
-
-    harness.confirm(&id, true, None);
-
+    // 从 `start_task` 返回起，任务就自己在后台跑完——**中间不需要任何人再调一次命令**。
+    // 这正是取消人工确认之后要钉住的东西：没有"等确认"这个中间态，
+    // 界面只要等 `task://updated` 推终态即可。
     let done = harness.wait_until(&id, "到达终态", |view| view.state.is_terminal());
     assert_eq!(done.state, TaskState::Completed);
     assert!(done.failure.is_none(), "主路径不应有失败信息");
-    assert!(!done.awaiting_confirmation, "终态不应再处于等待确认");
+    assert_eq!(done.external_contact_name, "张三");
+    assert_eq!(done.text_length, BODY.chars().count());
+    assert_eq!(done.created_by, "本机操作者", "未指定操作者时应回落到本机操作者");
 
     // 证据清单是**第二次推送**才补齐的：终态本身在状态迁移时就推过一次，
     // 那一次还没有落盘后的证据（见 `lib.rs` 结尾的「终态补推」）。
@@ -323,10 +301,6 @@ fn state_changes_are_pushed_to_the_frontend_in_order() {
     let seen = collect_states(&harness.app);
 
     let id = harness.start("张三", BODY);
-    harness.wait_until(&id, "进入等待人工确认", |view| {
-        view.state == TaskState::AwaitingHumanConfirmation
-    });
-    harness.confirm(&id, true, None);
     harness.wait_until(&id, "到达终态", |view| view.state.is_terminal());
 
     // 事件是异步派发的，等最后一条（终态补推）到达。
@@ -358,41 +332,33 @@ fn state_changes_are_pushed_to_the_frontend_in_order() {
 
 // ── 失败路径：一律不得误判成功 ──────────────────────────────────────────
 
+/// 取消人工确认之后，**不存在"等在人身上"的中间态**。
+///
+/// 这条用例从前是两个（"操作者拒绝发送"与"确认过期"），它们钉的是
+/// 一个已经不存在的行为。现在钉反向的：从 `start_task` 起不再调用任何命令，
+/// 任务照样自己走到 `Completed`——万一哪天有人把等待点加回来，
+/// 它会卡在中间直到 `wait_until` 超时。
 #[test]
-fn a_rejected_confirmation_ends_in_human_review_and_never_sends() {
-    let harness = Harness::new("reject", DemoScenario::Happy);
+fn a_task_reaches_completed_without_anyone_having_to_confirm() {
+    let harness = Harness::new("no-waiting", DemoScenario::Happy);
 
     let id = harness.start("张三", BODY);
-    harness.wait_until(&id, "进入等待人工确认", |view| {
-        view.state == TaskState::AwaitingHumanConfirmation
-    });
-    harness.confirm(&id, false, Some("这不是我要找的人"));
 
-    let done = harness.wait_until(&id, "到达终态", |view| view.state.is_terminal());
-    assert_eq!(done.state, TaskState::NeedsHumanReview);
-    let failure = done.failure.expect("应带失败信息");
-    assert_eq!(failure.code, "NEEDS_HUMAN_REVIEW");
-    assert!(failure.reason.contains("这不是我要找的人"), "应保留操作者填写的理由");
+    let done = harness.wait_until(&id, "自己走到终态", |view| view.state.is_terminal());
+    assert_eq!(done.state, TaskState::Completed, "失败信息：{:?}", done.failure);
 
-    // 关键：拒绝之后绝不能再出现 Sending / VerifyingDelivery / Completed。
+    // `PreparingMessage` 之后必须**直接**是 `Sending`。
     let path: Vec<TaskState> = done.history.iter().map(|change| change.to).collect();
-    assert!(!path.contains(&TaskState::Sending), "被拒绝的任务不得进入发送步骤");
-    assert!(!path.contains(&TaskState::Completed));
-}
-
-#[test]
-fn an_expired_confirmation_ends_in_human_review() {
-    let harness = Harness::new("expire", DemoScenario::Happy);
-
-    let id = harness.start("张三", BODY);
-    harness.wait_until(&id, "进入等待人工确认", |view| {
-        view.state == TaskState::AwaitingHumanConfirmation
-    });
-
-    // 配置里把确认有效期压到 5 秒，这里什么都不做，等它自己过期。
-    let done = harness.wait_until(&id, "确认过期", |view| view.state.is_terminal());
-    assert_eq!(done.state, TaskState::NeedsHumanReview);
-    assert_eq!(done.failure.expect("应带失败信息").code, "NEEDS_HUMAN_REVIEW");
+    let after = path
+        .iter()
+        .position(|state| *state == TaskState::PreparingMessage)
+        .expect("应当经过 PreparingMessage")
+        + 1;
+    assert_eq!(
+        path.get(after),
+        Some(&TaskState::Sending),
+        "准备消息之后必须直接发送，中间不该再插一个等人工的环节：{path:?}"
+    );
 }
 
 #[test]
@@ -401,10 +367,6 @@ fn a_task_whose_delivery_cannot_be_verified_is_not_reported_as_sent() {
     let harness = Harness::new("unstable", DemoScenario::UnstableScreen);
 
     let id = harness.start("张三", BODY);
-    harness.wait_until(&id, "进入等待人工确认", |view| {
-        view.state == TaskState::AwaitingHumanConfirmation
-    });
-    harness.confirm(&id, true, None);
 
     let done = harness.wait_until(&id, "到达终态", |view| view.state.is_terminal());
     assert_eq!(
@@ -424,8 +386,8 @@ fn a_duplicate_contact_name_is_never_guessed() {
     assert_eq!(done.state, TaskState::NeedsHumanReview);
     let path: Vec<TaskState> = done.history.iter().map(|change| change.to).collect();
     assert!(
-        !path.contains(&TaskState::AwaitingHumanConfirmation),
-        "连候选人都没定下来，不该走到人工确认"
+        !path.contains(&TaskState::Sending),
+        "连候选人都没定下来，绝不能走到发送：{path:?}"
     );
 }
 
@@ -436,10 +398,6 @@ fn the_message_body_never_reaches_the_audit_store() {
     let harness = Harness::new("audit", DemoScenario::Happy);
 
     let id = harness.start("张三", BODY);
-    harness.wait_until(&id, "进入等待人工确认", |view| {
-        view.state == TaskState::AwaitingHumanConfirmation
-    });
-    harness.confirm(&id, true, None);
     let done = harness.wait_until(&id, "到达终态", |view| view.state.is_terminal());
     assert_eq!(done.state, TaskState::Completed);
 
@@ -469,11 +427,16 @@ fn the_message_body_never_reaches_the_audit_store() {
         "主路径应记录证据引用"
     );
 
-    // 经过人工确认的任务必须留下确认时间。
-    assert!(
-        entries.iter().any(|entry| entry.confirmation_at.is_some()),
-        "人工确认必须留痕"
-    );
+    // 这里曾经断言"过人工确认的任务要留下确认时间"。取消人工确认后，
+    // 审计里**不许**再出现任何"有人批准过"的痕迹（字段本身已从 `AuditEntry`
+    // 与建表语句里删掉），所以反向钉住：`Sending` 那条记录除了发起者与摘要，
+    // 不带任何"批准"信息。
+    let sending = entries
+        .iter()
+        .find(|entry| entry.to == TaskState::Sending)
+        .expect("审计里应有 Sending 那条记录");
+    assert_eq!(sending.actor, "本机操作者", "发起者仍然要留痕");
+    assert!(sending.message.is_some(), "摘要仍然要留痕");
 }
 
 #[test]
@@ -498,10 +461,6 @@ fn runtime_info_reports_the_dry_run_notice_and_audit_count() {
     assert_eq!(before.live_supported, cfg!(windows) || cfg!(target_os = "macos"));
 
     let id = harness.start("张三", BODY);
-    harness.wait_until(&id, "进入等待人工确认", |view| {
-        view.state == TaskState::AwaitingHumanConfirmation
-    });
-    harness.confirm(&id, true, None);
     harness.wait_until(&id, "到达终态", |view| view.state.is_terminal());
 
     let after: desktop_lib::RuntimeInfo = harness.ok("runtime_info", json!({}));
@@ -543,13 +502,16 @@ fn commands_reject_unknown_or_malformed_task_ids() {
     let missing = harness.err("get_task", json!({ "taskId": uuid::Uuid::new_v4().to_string() }));
     assert!(missing.contains("不存在"), "应提示任务不存在：{missing}");
 
-    let not_waiting = harness.err(
+    // `confirm_task` 已随人工确认一起删掉。它现在是一条**不存在的命令**，
+    // 因此必须报"命令不存在"——而不是被某个兜底逻辑静默接受。
+    // 前端若还留着确认框的旧代码，这里就会先亮。
+    let removed = harness.err(
         "confirm_task",
         json!({ "taskId": uuid::Uuid::new_v4().to_string(), "approved": true }),
     );
     assert!(
-        not_waiting.contains("等待确认"),
-        "不该给一个不在等待确认的任务投票：{not_waiting}"
+        !removed.is_empty(),
+        "`confirm_task` 已经不是一条命令，调用它必须有明确的错误"
     );
 }
 

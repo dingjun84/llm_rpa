@@ -233,6 +233,18 @@ pub fn write_start_header(
             config.stop_before_send, config.liveness_check, config.log_ocr_candidates
         ),
     );
+    // 「只填不发」是"发还是不发"的**唯一**开关，所以除了打印它的值，
+    // 再单独说一句这次到底会不会发出去。2026-09-22 取消人工确认之后这一句更要紧：
+    // 从前"没发出去"还能指望确认框拦一下，现在不勾就是直接发——
+    // 复盘时第一句要问的正是"当时那个开关是什么状态"。
+    if config.stop_before_send {
+        log_line!(log_path, "发送动作   : 不发（已勾「只填不发」）");
+    } else {
+        log_line!(
+            log_path,
+            "发送动作   : 会发（未勾「只填不发」）—— 填完正文即点「发送按钮」，中途不再询问",
+        );
+    }
     // 「先点导航图标切视图」会改变"在哪一屏找联系人"，
     // 出问题时第一件要确认的就是"当时到底开没开、用的哪个图标"。
     if config.navigate_before_search {
@@ -265,7 +277,8 @@ pub fn write_start_header(
         if !config.stop_before_send {
             log_line!(
                 log_path,
-                "⚠️ 注意     : 放宽匹配 + 允许真实发送同时打开 —— 存在「找错人」的风险",
+                "⚠️ 注意     : 放宽匹配 + 允许真实发送同时打开 —— 存在「找错人」的风险。\
+                 发送前已无人工确认闸门，想先只看不发请勾上「只填不发」再跑一次",
             );
         }
     }
@@ -434,7 +447,6 @@ pub fn summary_from_log(path: &Path) -> Option<crate::TaskView> {
         failure,
         evidence: Vec::new(),
         history: Vec::new(),
-        awaiting_confirmation: false,
         evidence_artifacts: Vec::new(),
         log_path: Some(path.display().to_string()),
         from_log: true,

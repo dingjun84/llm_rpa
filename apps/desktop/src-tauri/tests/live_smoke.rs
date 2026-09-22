@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use automation_core::{
-    AuditSink, AutomationError, CancelToken, DesktopPlatform, HumanConfirmation, LocalOcr,
-    ProgressSink, Rect, RelativeRegion, SendLedger, SendTask, StateChange, TaskState,
+    AuditSink, CancelToken, DesktopPlatform, LocalOcr, ProgressSink, Rect,
+    RelativeRegion, SendLedger, SendTask, StateChange, TaskState,
 };
 use desktop_lib::runtime::{RegionConfig, RunChoice, RuntimeConfig, RuntimeMode, WindowGeometry};
 use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
@@ -78,19 +78,6 @@ const MESSAGE: &str = "rpa_llm 真实模式联调：本消息由本地截屏 + �
 ///   正文第一行紧贴其下。取 0.20 会把第一行（也就是姓名）切在外面。
 /// - 下边界 0.80：再往下就压到任务栏了，会把任务栏上的时间一起识别进来。
 const TEXT_AREA: [f32; 4] = [0.02, 0.12, 0.96, 0.68];
-
-/// 自动放行的确认端口。
-///
-/// 真实界面里这一步是 `UiConfirmation`，会阻塞等操作者点确认。
-/// 本用例只验证**平台层与视觉层的真实链路**，人工确认环节已由
-/// `tests/ipc_flow.rs` 的界面用例覆盖，因此这里替身放行。
-struct AutoApprove;
-
-impl HumanConfirmation for AutoApprove {
-    fn confirm_send(&self, _task: &SendTask, _expires_in: Duration) -> Result<(), AutomationError> {
-        Ok(())
-    }
-}
 
 /// 把状态迁移打到标准输出，便于人工核对每一步是否按预期推进。
 struct PrintProgress;
@@ -167,7 +154,6 @@ fn live_config(ocr: &Path) -> RuntimeConfig {
         wecom_exe: None,
         ocr_command: Some(ocr.to_string_lossy().into_owned()),
         min_confidence: 0.85,
-        confirmation_ttl_secs: 30,
         regions: RegionConfig {
             contact_panel: TEXT_AREA,
             chat_header: TEXT_AREA,
@@ -323,7 +309,6 @@ fn live_run_against_a_stand_in_window() {
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
         ledger.clone() as Arc<dyn SendLedger>,
-        Arc::new(AutoApprove),
     )
     .expect("装配真实模式运行器失败");
 
@@ -392,7 +377,6 @@ fn live_run_refuses_to_send_when_the_contact_is_absent() {
         &icons_dir(),
         audit.clone() as Arc<dyn AuditSink>,
         ledger.clone() as Arc<dyn SendLedger>,
-        Arc::new(AutoApprove),
     )
     .expect("装配真实模式运行器失败");
 

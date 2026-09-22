@@ -10,7 +10,6 @@ export type TaskState =
   | "opening_chat_from_profile"
   | "verifying_chat_header"
   | "preparing_message"
-  | "awaiting_human_confirmation"
   | "sending"
   | "verifying_delivery"
   | "completed"
@@ -46,7 +45,6 @@ export const HAPPY_PATH: TaskState[] = [
   "opening_chat_from_profile",
   "verifying_chat_header",
   "preparing_message",
-  "awaiting_human_confirmation",
   "sending",
   "verifying_delivery",
   "completed",
@@ -68,7 +66,6 @@ export const STATE_LABELS: Record<TaskState, string> = {
   opening_chat_from_profile: "从资料页进入聊天",
   verifying_chat_header: "核验聊天页标题",
   preparing_message: "准备消息",
-  awaiting_human_confirmation: "等待人工确认",
   sending: "发送",
   verifying_delivery: "核验送达",
   completed: "已完成",
@@ -125,7 +122,6 @@ export interface TaskView {
   failure: Failure | null;
   evidence: string[];
   history: HistoryEntry[];
-  awaiting_confirmation: boolean;
   evidence_artifacts: EvidenceView[];
   /** 过程日志路径；重启后从日志恢复的条目也会带上。 */
   log_path?: string | null;
@@ -264,7 +260,6 @@ export interface RuntimeConfig {
    * 实际生效值会与「OCR 超时 + 5 秒余量」取较大者，所以调大 OCR 超时不会被它悄悄截断。
    */
   step_timeout_secs: number;
-  confirmation_ttl_secs: number;
   min_confidence: number;
   regions: RegionConfig;
   /** 「只填不发」：正文填进输入框后就结束，绝不发送。 */
@@ -945,9 +940,3 @@ export interface StartTaskRequest {
  */
 export type TaskFormValues = Omit<StartTaskRequest, "run_choice">;
 
-export interface ConfirmationRequest {
-  task_id: string;
-  external_contact_name: string;
-  text: string;
-  expires_in_ms: number;
-}

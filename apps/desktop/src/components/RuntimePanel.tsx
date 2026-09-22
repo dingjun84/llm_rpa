@@ -239,23 +239,11 @@ export function RuntimePanel({
             打开后流程走到「准备消息」就结束：把正文填进输入框，<strong>绝不发送</strong>。
             用来验证"定位联系人 + 输入文字"是否准确，不会给对方造成任何影响。
             <br />
-            关掉它时，三条工作流走的是同一条路：<strong>先过人工确认，确认之后才真的发出去</strong>。
+            关掉它时，三条工作流走的是同一条路：<strong>填完正文就直接点发送按钮发出去</strong>，
+            中间不再问一遍。所以关之前先想清楚找的人对不对——发送这一步没有第二道闸门。
             演练模式下端口整组都是替身，本来就不会发到任何地方，所以这条路在演练模式下也跑得完。
           </span>
         </span>
-      </label>
-
-      <label className="field">
-        <span className="field-label">人工确认有效期（秒）</span>
-        <input
-          type="number"
-          min={5}
-          max={600}
-          value={draft.confirmation_ttl_secs}
-          onChange={(event) =>
-            update("confirmation_ttl_secs", Number(event.target.value) || 60)
-          }
-        />
       </label>
 
       <label className="field">

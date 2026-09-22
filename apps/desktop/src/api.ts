@@ -4,7 +4,6 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   CalibrationPlan,
   CircleTraceView,
-  ConfirmationRequest,
   HotkeyRequest,
   IconClickResult,
   IconEntry,
@@ -21,7 +20,6 @@ import type {
 } from "./types";
 
 export const EVENT_TASK_UPDATED = "task://updated";
-export const EVENT_CONFIRMATION_REQUESTED = "task://confirmation-requested";
 /**
  * 「一键截屏」热键被按下。
  *
@@ -87,15 +85,6 @@ export function assetUrl(path: string): string {
 
 export function getTask(taskId: string): Promise<TaskView> {
   return invoke<TaskView>("get_task", { taskId });
-}
-
-/** 提交人工确认结果。只有确认之后工作流才会进入发送步骤。 */
-export function confirmTask(
-  taskId: string,
-  approved: boolean,
-  reason?: string,
-): Promise<void> {
-  return invoke<void>("confirm_task", { taskId, approved, reason: reason ?? null });
 }
 
 export function cancelTask(taskId: string): Promise<void> {
@@ -417,12 +406,4 @@ export function drawCursorCircle(): Promise<CircleTraceView> {
 
 export function onTaskUpdated(handler: (task: TaskView) => void): Promise<UnlistenFn> {
   return listen<TaskView>(EVENT_TASK_UPDATED, (event) => handler(event.payload));
-}
-
-export function onConfirmationRequested(
-  handler: (request: ConfirmationRequest) => void,
-): Promise<UnlistenFn> {
-  return listen<ConfirmationRequest>(EVENT_CONFIRMATION_REQUESTED, (event) =>
-    handler(event.payload),
-  );
 }

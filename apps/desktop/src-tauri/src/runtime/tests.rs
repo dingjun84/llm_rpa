@@ -83,7 +83,6 @@ fn assemble_with_icons(
         icons_dir,
         Arc::new(MemoryAudit::new()),
         Arc::new(MemorySendLedger::new()),
-        Arc::new(MockHumanConfirmation::default()),
     )
 }
 
@@ -646,7 +645,6 @@ fn the_run_choice_decides_the_workflow_not_the_config() {
         &icons,
         Arc::new(MemoryAudit::new()),
         Arc::new(MemorySendLedger::new()),
-        Arc::new(MockHumanConfirmation::default()),
     )
     .expect("运行参数是列表式时，不该按配置里的搜索式去要求那三块区域");
 
@@ -686,7 +684,6 @@ fn the_run_choice_decides_the_mode_not_the_config() {
             &icons,
             Arc::new(MemoryAudit::new()),
             Arc::new(MemorySendLedger::new()),
-            Arc::new(MockHumanConfirmation::default()),
         )
     };
 

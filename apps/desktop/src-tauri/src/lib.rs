@@ -6,15 +6,16 @@
 //! 界面 ──invoke──> start_task ──> 工作流线程 ──> WorkflowRunner
 //!   ^                                                  │
 //!   └────────── task://updated 事件（状态实时推送）──────┘
-//!   ^
-//!   └── task://confirmation-requested ──> 确认框 ──> confirm_task
 //! ```
+//!
+//! 曾经还有一条 `task://confirmation-requested` → 确认框 → `confirm_task` 的回路
+//! （发送前等操作者点一次确认）。2026-09-22 随人工确认一起移除，理由见
+//! `automation_core::runner::message` 的模块文档。
 //!
 //! 消息正文只存在于内存与界面预览中，**不落库**；审计表只保存长度与哈希。
 
 pub mod calibration;
 pub mod capture_hotkey;
-pub mod confirmation;
 pub mod cursor_trace;
 pub mod data_dir;
 pub mod icon_library;
@@ -40,7 +41,6 @@ use tauri_plugin_opener::OpenerExt as _;
 use uuid::Uuid;
 use vision::RedactionPlan;
 
-use crate::confirmation::UiConfirmation;
 use crate::icon_library::IconEntry;
 use crate::runtime::{ModeNotices, RunChoice, RuntimeConfig, WindowGeometry};
 use crate::task_diagnostics::{overview_title, TaskDiagnostics};
@@ -105,7 +105,6 @@ pub struct TaskView {
     pub failure: Option<Failure>,
     pub evidence: Vec<String>,
     pub history: Vec<HistoryEntry>,
-    pub awaiting_confirmation: bool,
     pub evidence_artifacts: Vec<EvidenceView>,
     /// 本次任务的过程日志路径（`data/task-xxxxxxxx.log`）。
     pub log_path: Option<String>,
@@ -202,7 +201,7 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
-    fn to_view(&self, awaiting_confirmation: bool) -> TaskView {
+    fn to_view(&self) -> TaskView {
         TaskView {
             id: self.task.id.to_string(),
             external_contact_name: self.task.external_contact_name.clone(),
@@ -224,7 +223,6 @@ impl TaskRecord {
                     detail: change.detail.clone(),
                 })
                 .collect(),
-            awaiting_confirmation,
             evidence_artifacts: self.evidence_artifacts.clone(),
             log_path: self.log_path.as_ref().map(|p| p.display().to_string()),
             from_log: false,
@@ -237,7 +235,6 @@ impl TaskRecord {
 struct TaskProgress<R: Runtime> {
     app: AppHandle<R>,
     tasks: Arc<Mutex<HashMap<TaskId, TaskRecord>>>,
-    confirmation: Arc<UiConfirmation<R>>,
     /// 这次任务的后台活动日志。
     log_path: std::path::PathBuf,
 }
@@ -256,7 +253,6 @@ impl<R: Runtime> ProgressSink for TaskProgress<R> {
             }
             log_line!(&self.log_path, &line);
         }
-        let awaiting = self.confirmation.is_pending(change.task_id);
         let view = {
             let mut tasks = match self.tasks.lock() {
                 Ok(tasks) => tasks,
@@ -276,7 +272,7 @@ impl<R: Runtime> ProgressSink for TaskProgress<R> {
                 });
             }
             record.history.push(change.clone());
-            record.to_view(awaiting)
+            record.to_view()
         };
         let _ = self.app.emit(EVENT_TASK_UPDATED, view);
     }
@@ -309,11 +305,19 @@ impl EvidenceRecorder for RedactingRecorder {
 
 // ── 应用状态 ────────────────────────────────────────────────────────────
 
-pub struct AppState<R: Runtime> {
+/// 应用状态。**不带运行时泛型参数**。
+///
+/// 它曾经是 `AppState<R>`，唯一的用途是装下 `UiConfirmation<R>`（人工确认的
+/// 阻塞等待）。2026-09-22 取消人工确认后，`R` 在这里就没有任何字段用得上了——
+/// 留着它只会逼出一个 `PhantomData<R>`，而那种"为了让类型表过编译"的字段
+/// 迟早会被人当成真有用途。
+///
+/// 各命令上的 `R` 由 `_app: AppHandle<R>` 钉住，不靠这里（理由见上面
+/// 「关于每个命令上那个 `_app` 参数」那一段）。
+pub struct AppState {
     tasks: Arc<Mutex<HashMap<TaskId, TaskRecord>>>,
     order: Arc<Mutex<Vec<TaskId>>>,
     cancels: Arc<Mutex<HashMap<TaskId, CancelToken>>>,
-    confirmation: Arc<UiConfirmation<R>>,
     audit: Arc<SqliteAuditStore>,
     ledger: Arc<SqliteSendLedger>,
     evidence: Arc<EvidenceStore>,
@@ -372,8 +376,8 @@ fn migrate_legacy_data<R: Runtime>(
     }
 }
 
-impl<R: Runtime> AppState<R> {
-    pub fn new(app: &AppHandle<R>) -> Result<Self, String> {
+impl AppState {
+    pub fn new<R: Runtime>(app: &AppHandle<R>) -> Result<Self, String> {
         // 数据目录：**程序运行当前路径**下的 `data/`，每次启动都检查一遍，
         // 不存在就建（见 `data_dir`）。路径规则不在这里另写一份——
         // 图标库的默认位置也从那儿取。
@@ -388,7 +392,6 @@ impl<R: Runtime> AppState<R> {
             .map_err(|err| err.to_string())?;
 
         Ok(Self::assemble(
-            app,
             data_dir,
             migration_note,
             Arc::new(audit),
@@ -406,10 +409,7 @@ impl<R: Runtime> AppState<R> {
     /// 顺带把**图标库**也按到那个临时目录里（配置里没写时才按）：
     /// 图标库的默认位置现在是数据目录下的 `icons/`，而测试进程的工作目录
     /// 就是 `src-tauri/`，跑去那儿读写会把仓库弄脏，多个用例还会互相踩。
-    pub fn in_memory(
-        app: &AppHandle<R>,
-        evidence_root: impl Into<std::path::PathBuf>,
-    ) -> Result<Self, String> {
+    pub fn in_memory(evidence_root: impl Into<std::path::PathBuf>) -> Result<Self, String> {
         let evidence_root = evidence_root.into();
         let data_dir = evidence_root
             .parent()
@@ -422,7 +422,6 @@ impl<R: Runtime> AppState<R> {
             .map_err(|err| err.to_string())?;
 
         let state = Self::assemble(
-            app,
             data_dir.clone(),
             None,
             Arc::new(audit),
@@ -450,7 +449,6 @@ impl<R: Runtime> AppState<R> {
     }
 
     fn assemble(
-        app: &AppHandle<R>,
         data_dir: std::path::PathBuf,
         migration_note: Option<String>,
         audit: Arc<SqliteAuditStore>,
@@ -468,7 +466,6 @@ impl<R: Runtime> AppState<R> {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             order: Arc::new(Mutex::new(Vec::new())),
             cancels: Arc::new(Mutex::new(HashMap::new())),
-            confirmation: Arc::new(UiConfirmation::new(app.clone())),
             audit,
             ledger,
             evidence,
@@ -521,7 +518,7 @@ impl<R: Runtime> AppState<R> {
 //
 // `tauri` 的 `impl<'r, T, R> CommandArg<'de, R> for State<'r, T>` 里，`R` 与 `T`
 // 之间**没有任何约束关系**。因此如果一个命令的运行时信息只出现在
-// `State<'_, AppState<R>>` 内部，`R` 就成了无法推断的自由变量，
+// `State<'_, AppState>` 内部，`R` 就成了无法推断的自由变量，
 // `generate_handler!` 会直接报 `E0283: cannot infer type`。
 //
 // 只有 `AppHandle<R>` / `Window<R>` / `Webview<R>` 这类实现里
@@ -532,7 +529,7 @@ impl<R: Runtime> AppState<R> {
 
 #[tauri::command]
 fn start_task<R: Runtime>(
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     app: AppHandle<R>,
     request: StartTaskRequest,
 ) -> Result<String, String> {
@@ -609,7 +606,6 @@ fn start_task<R: Runtime>(
         &state.icons_dir(),
         state.audit.clone(),
         state.ledger.clone(),
-        state.confirmation.clone(),
     )?
     .with_evidence_recorder(Arc::new(RedactingRecorder { store: state.evidence.clone() }))
     .with_diagnostic_recorder(diagnostics.clone());
@@ -664,14 +660,13 @@ fn start_task<R: Runtime>(
     let progress = TaskProgress {
         app: app.clone(),
         tasks: state.tasks.clone(),
-        confirmation: state.confirmation.clone(),
         log_path: log_path.clone(),
     };
     let tasks = state.tasks.clone();
     let cancels = state.cancels.clone();
     let evidence = state.evidence.clone();
 
-    // 工作流是同步阻塞的（还要等人工确认），因此放到独立线程，不阻塞界面。
+    // 工作流是同步阻塞的（截图、点击、输入都要等），因此放到独立线程，不阻塞界面。
     std::thread::spawn(move || {
         let outcome = runner.run(&task, &progress, &cancel);
 
@@ -712,7 +707,7 @@ fn start_task<R: Runtime>(
                 record.failure = outcome.failure.clone();
                 record.evidence = outcome.evidence.clone();
                 record.evidence_artifacts = artifacts;
-                record.to_view(false)
+                record.to_view()
             })
         } else {
             None
@@ -734,7 +729,7 @@ fn start_task<R: Runtime>(
 
 #[tauri::command]
 fn read_task_log<R: Runtime>(
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     _app: AppHandle<R>,
     task_id: String,
 ) -> Result<String, String> {
@@ -771,7 +766,7 @@ fn read_task_log<R: Runtime>(
 /// 这个给的是**每一步看到什么、怎么判的**（见 [`task_replay`]）。
 #[tauri::command]
 fn read_task_events<R: Runtime>(
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     _app: AppHandle<R>,
     task_id: String,
 ) -> Result<task_replay::TaskReplay, String> {
@@ -792,7 +787,7 @@ fn read_task_events<R: Runtime>(
 #[tauri::command]
 fn open_task_dir<R: Runtime>(
     app: AppHandle<R>,
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     task_id: String,
 ) -> Result<String, String> {
     let Some(dir) = task_replay::task_dir_for(&state.data_dir, &task_id) else {
@@ -808,7 +803,7 @@ fn open_task_dir<R: Runtime>(
 
 #[tauri::command]
 fn list_tasks<R: Runtime>(
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     _app: AppHandle<R>,
 ) -> Result<Vec<TaskView>, String> {
     let order = state.order.lock().map_err(|_| "任务顺序锁已中毒".to_string())?.clone();
@@ -816,7 +811,7 @@ fn list_tasks<R: Runtime>(
     let mut views: Vec<TaskView> = order
         .iter()
         .filter_map(|id| tasks.get(id))
-        .map(|record| record.to_view(state.confirmation.is_pending(record.task.id)))
+        .map(TaskRecord::to_view)
         .collect();
     let live_ids: std::collections::HashSet<String> =
         views.iter().map(|v| v.id.clone()).collect();
@@ -843,30 +838,18 @@ fn list_tasks<R: Runtime>(
 
 #[tauri::command]
 fn get_task<R: Runtime>(
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     _app: AppHandle<R>,
     task_id: String,
 ) -> Result<TaskView, String> {
     let id: Uuid = task_id.parse().map_err(|_| "任务 ID 非法".to_string())?;
     let record = state.record(id).ok_or_else(|| "任务不存在".to_string())?;
-    Ok(record.to_view(state.confirmation.is_pending(id)))
-}
-
-#[tauri::command]
-fn confirm_task<R: Runtime>(
-    state: State<'_, AppState<R>>,
-    _app: AppHandle<R>,
-    task_id: String,
-    approved: bool,
-    reason: Option<String>,
-) -> Result<(), String> {
-    let id: Uuid = task_id.parse().map_err(|_| "任务 ID 非法".to_string())?;
-    state.confirmation.decide(id, approved, reason)
+    Ok(record.to_view())
 }
 
 #[tauri::command]
 fn cancel_task<R: Runtime>(
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     _app: AppHandle<R>,
     task_id: String,
 ) -> Result<(), String> {
@@ -883,7 +866,7 @@ fn cancel_task<R: Runtime>(
 
 #[tauri::command]
 fn runtime_info<R: Runtime>(
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     _app: AppHandle<R>,
 ) -> Result<RuntimeInfo, String> {
     let config = state.config.lock().map_err(|_| "配置锁已中毒".to_string())?.clone();
@@ -907,7 +890,7 @@ fn runtime_info<R: Runtime>(
 
 #[tauri::command]
 fn set_runtime_config<R: Runtime>(
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     _app: AppHandle<R>,
     config: RuntimeConfig,
 ) -> Result<(), String> {
@@ -919,7 +902,7 @@ fn set_runtime_config<R: Runtime>(
 /// [`set_runtime_config`] 与 [`prune_stale_marks`] 都走这里。抽出来是为了让
 /// 「**落到盘上的配置一定过了这一关**」只有一处实现——两条写入路径各写一份的话，
 /// 迟早有一条会漏掉校验，而漏掉的表现是配置里安静地躺着一个没人读的键。
-fn persist_config<R: Runtime>(state: &AppState<R>, mut config: RuntimeConfig) -> Result<(), String> {
+fn persist_config(state: &AppState, mut config: RuntimeConfig) -> Result<(), String> {
     // 旧配置只有顶层字段时先迁进 `calibrations`；再把当前工作副本 upsert 进去，
     // 这样「界面标定」页改完点保存，对应缩放那份一定落盘。
     config.ensure_calibrations_migrated();
@@ -971,13 +954,13 @@ fn persist_config<R: Runtime>(state: &AppState<R>, mut config: RuntimeConfig) ->
 ///
 /// `_app` 这个参数**不读请求体**，它存在的唯一理由是钉住泛型 `R`：
 /// `State<'r, T>` 的 `CommandArg` 实现里 `R` 与 `T` 没有约束关系，
-/// 所以只写 `State<'_, AppState<R>>` 时 `R` 是自由变量，
+/// 所以只写 `State<'_, AppState>` 时 `R` 是自由变量，
 /// `generate_handler!` 会报 `E0283: type annotations needed`。
 /// 带上 `AppHandle<R>` 之后 `R` 就出现在 trait 的 `Self` 类型上，能推断出来了。
 /// 前端调用方式完全不变。
 #[tauri::command]
 fn prune_stale_marks<R: Runtime>(
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     _app: AppHandle<R>,
 ) -> Result<usize, String> {
     let mut config = state
@@ -1358,7 +1341,7 @@ fn record_window_geometry<R: Runtime>(
 #[tauri::command]
 fn list_calibration_plan<R: Runtime>(
     _app: AppHandle<R>,
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
 ) -> Result<calibration::CalibrationPlan, String> {
     let config = state.config.lock().map_err(|_| "配置锁已中毒".to_string())?;
     Ok(calibration::plan(&config))
@@ -1471,7 +1454,7 @@ pub struct NavIconHit {
 #[tauri::command]
 fn probe_nav_icon<R: Runtime>(
     _app: AppHandle<R>,
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     window_class: String,
     wecom_exe: Option<String>,
     nav_strip: [f32; 4],
@@ -1722,7 +1705,7 @@ fn probe_nav_icon<R: Runtime>(
 #[tauri::command]
 fn list_icons<R: Runtime>(
     _app: AppHandle<R>,
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<IconEntry>, String> {
     icon_library::list(&state.icons_dir())
 }
@@ -1730,7 +1713,7 @@ fn list_icons<R: Runtime>(
 #[tauri::command]
 fn delete_icon<R: Runtime>(
     _app: AppHandle<R>,
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     name: String,
 ) -> Result<(), String> {
     icon_library::delete(&state.icons_dir(), &name)
@@ -1745,7 +1728,7 @@ fn delete_icon<R: Runtime>(
 #[tauri::command]
 fn delete_icon_variant<R: Runtime>(
     _app: AppHandle<R>,
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     name: String,
     relative: String,
 ) -> Result<(), String> {
@@ -1831,7 +1814,7 @@ fn window_rect_from_preview(
 #[allow(clippy::too_many_arguments)]
 fn save_icon_from_crop<R: Runtime>(
     _app: AppHandle<R>,
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     name: String,
     window_class: String,
     wecom_exe: Option<String>,
@@ -1931,7 +1914,7 @@ pub struct IconClickResult {
 #[allow(clippy::too_many_arguments)]
 fn click_icon<R: Runtime>(
     _app: AppHandle<R>,
-    state: State<'_, AppState<R>>,
+    state: State<'_, AppState>,
     window_class: String,
     wecom_exe: Option<String>,
     nav_strip: [f32; 4],
@@ -2164,7 +2147,6 @@ pub fn with_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R
         read_task_events,
         open_task_dir,
         get_task,
-        confirm_task,
         cancel_task,
         runtime_info,
         set_runtime_config,

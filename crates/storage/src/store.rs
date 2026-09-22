@@ -68,17 +68,17 @@ impl SqliteAuditStore {
         let conn = lock(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT task_id, actor, platform, from_state, to_state, at_unix_ms,
-                    confirmation_at_unix_ms, failure_code, failure_reason, evidence_json,
+                    failure_code, failure_reason, evidence_json,
                     message_char_count, message_sha256, message_recorded_at_ms
              FROM audit_entries
              WHERE task_id = ?1
              ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![task_id.to_string()], |row| {
-            let evidence_json: String = row.get(9)?;
-            let char_count: Option<i64> = row.get(10)?;
-            let sha256: Option<String> = row.get(11)?;
-            let recorded_at: Option<i64> = row.get(12)?;
+            let evidence_json: String = row.get(8)?;
+            let char_count: Option<i64> = row.get(9)?;
+            let sha256: Option<String> = row.get(10)?;
+            let recorded_at: Option<i64> = row.get(11)?;
             Ok(RawEntry {
                 task_id: row.get(0)?,
                 actor: row.get(1)?,
@@ -86,9 +86,8 @@ impl SqliteAuditStore {
                 from_state: row.get(3)?,
                 to_state: row.get(4)?,
                 at_unix_ms: row.get(5)?,
-                confirmation_at_unix_ms: row.get(6)?,
-                failure_code: row.get(7)?,
-                failure_reason: row.get(8)?,
+                failure_code: row.get(6)?,
+                failure_reason: row.get(7)?,
                 evidence_json,
                 message_char_count: char_count,
                 message_sha256: sha256,
@@ -133,9 +132,9 @@ impl SqliteAuditStore {
         conn.execute(
             "INSERT INTO audit_entries (
                 task_id, actor, platform, from_state, to_state, at_unix_ms,
-                confirmation_at_unix_ms, failure_code, failure_reason, evidence_json,
+                failure_code, failure_reason, evidence_json,
                 message_char_count, message_sha256, message_recorded_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 entry.task_id.to_string(),
                 entry.actor,
@@ -143,7 +142,6 @@ impl SqliteAuditStore {
                 entry.from.as_str(),
                 entry.to.as_str(),
                 to_unix_ms(entry.at),
-                entry.confirmation_at.map(to_unix_ms),
                 entry.failure_code,
                 entry.failure_reason,
                 evidence_json,
@@ -227,7 +225,6 @@ struct RawEntry {
     from_state: String,
     to_state: String,
     at_unix_ms: i64,
-    confirmation_at_unix_ms: Option<i64>,
     failure_code: Option<String>,
     failure_reason: Option<String>,
     evidence_json: String,
@@ -261,7 +258,6 @@ impl RawEntry {
             from: parse_state(&self.from_state)?,
             to: parse_state(&self.to_state)?,
             at: from_unix_ms(self.at_unix_ms),
-            confirmation_at: self.confirmation_at_unix_ms.map(from_unix_ms),
             failure_code: self.failure_code,
             failure_reason: self.failure_reason,
             evidence: serde_json::from_str(&self.evidence_json)?,

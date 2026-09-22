@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import * as api from "./api";
 import { CalibrationPanel, type CachedPreview } from "./components/CalibrationPanel";
-import { ConfirmationDialog } from "./components/ConfirmationDialog";
 import { CursorMotionPanel } from "./components/CursorMotionPanel";
 import { IconLibraryPanel } from "./components/IconLibraryPanel";
 import { regionsAreValid } from "./components/RegionCalibration";
@@ -14,7 +13,6 @@ import { TaskReplay } from "./components/TaskReplay";
 import { contactLabel } from "./taskDisplay";
 import {
   TERMINAL_STATES,
-  type ConfirmationRequest,
   type RunChoice,
   type RuntimeConfig,
   type RuntimeInfo,
@@ -29,7 +27,6 @@ type Tab = "tasks" | "calibration" | "icons" | "trace" | "replay";
 export function App() {
   const [tasks, setTasks] = useState<TaskView[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
   const [info, setInfo] = useState<RuntimeInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [taskLog, setTaskLog] = useState<string | null>(null);
@@ -181,16 +178,6 @@ export function App() {
     void api
       .onTaskUpdated((task) => {
         upsert(task);
-      })
-      .then((fn) => {
-        if (disposed) fn();
-        else unlisteners.push(fn);
-      });
-
-    void api
-      .onConfirmationRequested((request) => {
-        setConfirmation(request);
-        setActiveId(request.task_id);
       })
       .then((fn) => {
         if (disposed) fn();
@@ -372,17 +359,6 @@ export function App() {
     setTab("replay");
   }, []);
 
-  const handleDecision = async (approved: boolean, reason?: string) => {
-    if (!confirmation) return;
-    const taskId = confirmation.task_id;
-    setConfirmation(null);
-    try {
-      await api.confirmTask(taskId, approved, reason);
-    } catch (err) {
-      setError(String(err));
-    }
-  };
-
   const handleCancel = async () => {
     if (!activeTask) return;
     try {
@@ -420,7 +396,7 @@ export function App() {
         <div>
           <h1>本地消息辅助</h1>
           <p className="app-subtitle">
-            企业微信一对一纯文本发送 · 本地视觉 · 每条消息都必须人工确认
+            企业微信一对一纯文本发送 · 本地视觉 · 发不发由「只填不发」决定
           </p>
         </div>
         {info && (
@@ -671,9 +647,6 @@ export function App() {
         </main>
       )}
 
-      {confirmation && (
-        <ConfirmationDialog request={confirmation} onDecide={handleDecision} />
-      )}
     </div>
   );
 }

@@ -15,7 +15,6 @@ fn only_the_full_verified_path_can_complete() {
         TaskState::VerifyingCandidate,
         TaskState::VerifyingChatHeader,
         TaskState::PreparingMessage,
-        TaskState::AwaitingHumanConfirmation,
         TaskState::Sending,
         TaskState::VerifyingDelivery,
         TaskState::Completed,
@@ -61,7 +60,7 @@ fn all_variants_round_trip_through_their_identifier() {
     // 先钉住表本身没被漏改：长度与去重后的数量必须一致。
     assert_eq!(
         TaskState::ALL.len(),
-        19,
+        18,
         "状态数量变了——请同时更新 ALL 的长度与内容"
     );
     let mut names: Vec<&str> = TaskState::ALL.iter().map(|s| s.as_str()).collect();
@@ -86,6 +85,28 @@ fn all_variants_round_trip_through_their_identifier() {
     // 未知标识必须返回 None，不能悄悄落到某个默认状态上。
     assert_eq!(TaskState::from_str_name("NoSuchState"), None);
     assert_eq!(TaskState::from_str_name(""), None);
+}
+
+/// 已退场状态的标识仍要能读回来。
+///
+/// `AwaitingHumanConfirmation` 在 2026-09-22 取消人工确认后不再产生，
+/// 但审计库里已经有一批按它落库的记录。读不回来的后果不是"少显示一个状态"，
+/// 而是 `storage` 读那些记录时报 `UnknownState`——整条记录连同这个任务的历史
+/// 一起打不开。所以它映射到当时含义最接近的前驱（正文已就绪、还没发出去）。
+///
+/// 这条用例与 `LaunchingClient` 那条注释同一条约定：**落过库的标识不许读不回来**。
+#[test]
+fn a_retired_state_identifier_is_still_readable() {
+    assert_eq!(
+        TaskState::from_str_name("AwaitingHumanConfirmation"),
+        Some(TaskState::PreparingMessage),
+        "历史审计记录靠这个映射才读得回来"
+    );
+    // 但它**不能**再被产出：`ALL` 里没有它，状态机也没有一条通到它的边。
+    assert!(
+        !TaskState::ALL.iter().any(|s| s.as_str() == "AwaitingHumanConfirmation"),
+        "这个状态已经退场，不该再出现在 ALL 里"
+    );
 }
 
 /// 终态集合必须与 `is_terminal` 一致，且**恰好**是那六个。
@@ -114,12 +135,36 @@ fn exactly_six_states_are_terminal() {
     );
 }
 
+/// `Sending` 只能从 `PreparingMessage` 到达，不能凭空跳进去。
+///
+/// 取消人工确认把这条边缩短了（原来中间还夹一个 `AwaitingHumanConfirmation`），
+/// 但**没有**把它变成"任意状态都能发"：发送仍然必须建立在
+/// "已经定位到人、正文已就绪"之上。
 #[test]
-fn sending_cannot_skip_human_confirmation() {
-    let mut task = TaskMachine::default();
+fn sending_can_only_be_reached_from_a_prepared_message() {
+    let mut fresh = TaskMachine::default();
     assert_eq!(
-        task.transition(TaskState::Sending),
+        fresh.transition(TaskState::Sending),
         Err(StateError::InvalidTransition { from: TaskState::Draft, to: TaskState::Sending })
+    );
+
+    // 反例再取一个"已经走了几步但与消息无关"的位置：核验标题之后直接发也不行，
+    // 必须先经过 `PreparingMessage`（那一步才聚焦输入框、记发送前基线）。
+    let mut early = TaskMachine::default();
+    for state in [
+        TaskState::LaunchingClient,
+        TaskState::WaitingForClient,
+        TaskState::SearchingContact,
+        TaskState::VerifyingCandidate,
+    ] {
+        early.transition(state).unwrap();
+    }
+    assert_eq!(
+        early.transition(TaskState::Sending),
+        Err(StateError::InvalidTransition {
+            from: TaskState::VerifyingCandidate,
+            to: TaskState::Sending
+        })
     );
 }
 
@@ -184,12 +229,7 @@ fn prepared_can_never_be_followed_by_sending() {
     task.transition(TaskState::Prepared).unwrap();
 
     // 从 Prepared 出发，无论想去哪一步都不行——它是终态。
-    for next in [
-        TaskState::Sending,
-        TaskState::VerifyingDelivery,
-        TaskState::Completed,
-        TaskState::AwaitingHumanConfirmation,
-    ] {
+    for next in [TaskState::Sending, TaskState::VerifyingDelivery, TaskState::Completed] {
         assert_eq!(
             task.transition(next),
             Err(StateError::TerminalState { from: TaskState::Prepared }),
