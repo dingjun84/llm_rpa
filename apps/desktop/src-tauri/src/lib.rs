@@ -44,7 +44,7 @@ use crate::confirmation::UiConfirmation;
 use crate::icon_library::IconEntry;
 use crate::runtime::{ModeNotices, RunChoice, RuntimeConfig, WindowGeometry};
 use crate::task_diagnostics::{overview_title, TaskDiagnostics};
-use crate::task_log::{append_task_log, task_dir, task_log_path, write_start_header};
+use crate::task_log::{task_dir, task_log_path, write_start_header};
 
 pub const EVENT_TASK_UPDATED: &str = "task://updated";
 const EVIDENCE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -254,7 +254,7 @@ impl<R: Runtime> ProgressSink for TaskProgress<R> {
                 line.push_str("  | 失败码=");
                 line.push_str(code);
             }
-            append_task_log(&self.log_path, &line);
+            log_line!(&self.log_path, &line);
         }
         let awaiting = self.confirmation.is_pending(change.task_id);
         let view = {
@@ -675,19 +675,19 @@ fn start_task<R: Runtime>(
     std::thread::spawn(move || {
         let outcome = runner.run(&task, &progress, &cancel);
 
-        append_task_log(&log_path, "=== 结束 ===");
-        append_task_log(&log_path, &format!("终态     : {}", outcome.state.as_str()));
+        log_line!(&log_path, "=== 结束 ===");
+        log_line!(&log_path, &format!("终态     : {}", outcome.state.as_str()));
         if let Some(failure) = outcome.failure.as_ref() {
-            append_task_log(&log_path, &format!("失败码   : {}", failure.code));
-            append_task_log(&log_path, &format!("失败原因 : {}", failure.reason));
+            log_line!(&log_path, &format!("失败码   : {}", failure.code));
+            log_line!(&log_path, &format!("失败原因 : {}", failure.reason));
         }
         if !outcome.evidence.is_empty() {
-            append_task_log(&log_path, "过程证据 :");
+            log_line!(&log_path, "过程证据 :");
             for item in &outcome.evidence {
-                append_task_log(&log_path, &format!("  - {item}"));
+                log_line!(&log_path, &format!("  - {item}"));
             }
         }
-        append_task_log(&log_path, &format!("日志文件 : {}", log_path.display()));
+        log_line!(&log_path, &format!("日志文件 : {}", log_path.display()));
         // 单步图已经在每一步就落盘了（崩了也留得住），这里只是补上那张拼图，
         // 并把这批诊断材料的去处记进日志。
         diagnostics.finish();

@@ -6,6 +6,20 @@
 
 use super::*;
 
+/// 量一段代码花了多久，并把它记成一条证据行（见 [`Run::note_elapsed`]）。
+///
+/// 位置（`file:line`）取在**展开处**——`file!()`/`line!()` 对 `macro_rules!` 是
+/// 透明的，所以证据里那条指的就是"被量的这段代码"，不是这个宏自己。
+/// 与 `log_line!` 同一个道理。
+macro_rules! timed {
+    ($run:expr, $what:expr, $body:expr) => {{
+        let started = Instant::now();
+        let value = $body;
+        ($run).note_elapsed($what, concat!(file!(), ":", line!()), started.elapsed());
+        value
+    }};
+}
+
 impl Run<'_> {
     /// 算出"图标大概应该在哪"，供 [`IconPrior`] 使用。
     ///
@@ -66,9 +80,16 @@ impl Run<'_> {
         // 用**联系人候选区**当"视图变了没有"的参照物：切换成功的话，
         // 这一块的内容必然整体换掉。用它而不是整窗，是因为整窗里有闪烁的光标、
         // 未读红点之类会自己变的东西，"变了"就不再是"切换成功了"的证据。
-        let before = self.capture_frame(panel, "切换视图前")?.fingerprint;
+        //
+        // 每一段都记一条耗时证据（[`Run::note_elapsed`]）：单步超时只回答
+        // "超了没有"，而"超在哪一段"只能靠这些行——它们必须在**超时之前**
+        // 就写好，因为超时那一刻现场已经过去了。
+        let before =
+            timed!(self, "导航·截「切换视图前」", self.capture_frame(panel, "切换视图前")?)
+                .fingerprint;
 
-        let frame = self.capture_frame(strip, "导航图标搜索区")?;
+        let frame =
+            timed!(self, "导航·截「导航图标搜索区」", self.capture_frame(strip, "导航图标搜索区")?);
         self.evidence.push(format!(
             "nav_strip#{}   搜索区 屏幕 ({}, {}) {}x{}",
             frame.fingerprint, strip.x, strip.y, strip.width, strip.height
@@ -90,10 +111,16 @@ impl Run<'_> {
                  到「图标库」页对着那个图标截一张图存下来，再回到「任务」页选它。"
             )));
         }
-        let found = runner.ports.icons.locate(
-            &frame,
-            &IconQuery::new(templates, min_score).with_prior(prior),
-        )?;
+        // 图标匹配是这一步里唯一"算"的活（模板匹配要逐位置比一遍），
+        // 也是实测里最慢的一段——单独计时，别让它藏在总数里。
+        let found = timed!(
+            self,
+            "导航·图标匹配 icons.locate",
+            runner
+                .ports
+                .icons
+                .locate(&frame, &IconQuery::new(templates, min_score).with_prior(prior))?
+        );
 
         // `frame` 在 macOS Retina 上可能是物理像素，而 `strip` 是屏幕逻辑点。
         // 命中框要先按帧尺寸相对搜索区比例，再加回搜索区原点。
@@ -141,25 +168,37 @@ impl Run<'_> {
         // 把命中框也交给诊断记录器：图标上没有文字，这一步唯一的可读结果就是
         // "它把哪个图标认成了目标"。复用**刚匹配过的那一帧**，不重截——
         // 重截一张会让画上的框与画面对不上。
-        self.report_icon_hit(
-            "导航图标命中",
-            strip,
-            &frame,
-            &IconHit {
-                bounds: found.bounds,
-                score: found.score,
-                template: found.template_label.clone(),
-            },
+        //
+        // 这一次上报会顺带截一张整窗、渲染标注图并编码成 PNG 落盘。那是**观测**
+        // 的开销，不是任务本身该花的，所以单独计时：它要是把单步预算吃掉一大半，
+        // 该改的是诊断的落盘方式，而不是把单步上限调大。
+        timed!(
+            self,
+            "导航·上报命中（整窗截图+标注渲染+落盘）",
+            self.report_icon_hit(
+                "导航图标命中",
+                strip,
+                &frame,
+                &IconHit {
+                    bounds: found.bounds,
+                    score: found.score,
+                    template: found.template_label.clone(),
+                },
+            )
         );
 
-        self.ensure_not_frozen("已取消切换视图")?;
-        // 先滑到命中点（不点）：任务若在标定校验处失败，操作者仍能看见认到的位置。
-        self.runner.ports.platform.move_pointer(target)?;
-        let expected_window = self.ensure_calibrated()?;
-        self.runner
-            .ports
-            .platform
-            .guarded_click(target, expected_window)?;
+        // 守卫与点击分开计时：前者是只读校验，后者会真的落到界面上。
+        let expected_window = timed!(self, "导航·点击前守卫（存活检查+移到命中点+标定复核）", {
+            self.ensure_not_frozen("已取消切换视图")?;
+            // 先滑到命中点（不点）：任务若在标定校验处失败，操作者仍能看见认到的位置。
+            self.runner.ports.platform.move_pointer(target)?;
+            self.ensure_calibrated()?
+        });
+        timed!(
+            self,
+            "导航·guarded_click 点击",
+            self.runner.ports.platform.guarded_click(target, expected_window)?
+        );
         self.check_deadline("点击导航图标")?;
 
         // 视图切换是重绘，同样要等停稳再比指纹——否则会截到动画中间帧，

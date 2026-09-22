@@ -81,10 +81,10 @@
 | --- | --- | --- | --- |
 | `src/ports.rs` | 388 | **五个端口的 trait 定义** + `AutomationError` + `IconQuery`/`IconPrior` | `DesktopPlatform`、`LocalOcr`、`IconLocator`、`ContactMatcher`、`HumanConfirmation` |
 | `src/state.rs` | 532 | 任务状态枚举与合法迁移 | `TaskState` |
-| `src/runner/mod.rs` | 1350 | **编排骨架**：配置、端口、主循环、通用工具 | `WorkflowRunner`、`RunnerConfig`、`execute()` |
+| `src/runner/mod.rs` | 1509 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
 | `src/runner/search.rs` | 440 | **搜索式工作流**（工作流 3） | `search_contact_by_keyword`、`pick_contact_from_dropdown`、`open_chat_from_profile` |
 | `src/runner/list.rs` | 261 | **列表扫描式**（原有那条路） | `locate_contact`、`sweep_contact_list`、`scroll_to_top` |
-| `src/runner/navigate.rs` | 163 | 导航图标模板匹配 + 点击（工作流 1 / 2） | `navigate_to_view`、`nav_prior` |
+| `src/runner/navigate.rs` | 238 | 导航图标模板匹配 + 点击（工作流 1 / 2）。★ 每一步都记一条分段耗时（`timed!` 宏 + `Run::note_elapsed`）：截屏 / `icons.locate` / 诊断上报 / 守卫 / 点击各一段，`file:line` 取在宏展开处 | `navigate_to_view`、`nav_prior` |
 | `src/runner/message.rs` | 131 | 聚焦输入框 + 逐字填正文 | `prepare_message` |
 | `src/policy.rs` | 445 | `ContactMatcher` 的实现：逐字精确匹配 + 宽松开关 | `ExactNameMatcher` |
 | `src/policy/trail.rs` | 369 | ★★ **姓名匹配的判据本体**：结论（选中谁）与轨迹（每块为什么）**同一次交出** | `strict_judge`、`contains_judge`、`name_match_decision` |
@@ -137,7 +137,7 @@
 | 文件 | 行数 | 职责 | 关键符号 |
 | --- | --- | --- | --- |
 | `src/ocr.rs` | 273 | `ExternalOcr`：截图 → PNG → 子进程 stdin → JSON stdout。★ `recognize_png` 吃的就是**那串 PNG 字节**（`raw/NN-*.png` 存的就是它）——离线重跑要原样喂回去，重新解码再编码等于给"跑的是不是当时那张图"多加一道可疑环节 | `ExternalOcr`、`UnconfiguredOcr` |
-| `src/template.rs` | 793 | 纯 Rust NCC 模板匹配（等价 `TM_CCOEFF_NORMED`），逐通道平均。★ **分数不够时**再报"每个模板的前 3 个候选"（`top_candidates` / `candidate_report`）—— 只报最高分分不出「模板对不上画面」和「搜索区里根本没有它」这两件事 | 匹配函数、失败诊断 |
+| `src/template.rs` | 904 | 纯 Rust NCC 模板匹配（等价 `TM_CCOEFF_NORMED`），逐通道平均。★ **分数不够时**再报"每个模板的前 3 个候选"（`top_candidates` / `candidate_report`）—— 只报最高分分不出「模板对不上画面」和「搜索区里根本没有它」这两件事。★★ **开销 = 搜索位置数 × 模板像素数**：每张模板都要把搜索区**逐位置扫一遍**，所以慢的原因几乎总是「搜索区太大 / 模板太大 / 模板太多 / debug 构建」，不是阈值（见 `docs/todo.md` T31）。⚠️ 七档金字塔（`TEMPLATE_SCALE_PYRAMID`）**不在主路径上**（`locate` 是单尺度），它那几个函数目前是 dead code | 匹配函数、失败诊断 |
 | `src/pixels.rs` | 274 | **BGRA / 自上而下**的像素约定、裁切、放大 | — |
 | `src/evidence.rs` | 116 | 证据脱敏（每个文字框涂成中灰） | — |
 | `src/render.rs` | 375 | ★★ **过程诊断图的渲染**：`annotate_step` 一页（底图 + 三类框 + 右侧栏）+ `compose_overview` 总图。★ 底图优先**整窗**（拿不到才退回裁图）；橙框 = 要识别的区域、绿框 = 文字块、蓝框 = 图标命中。★ 坐标换算只在这一处：**屏幕坐标 / 帧图像坐标 → 页面坐标**（Retina 上帧是物理像素，先除回逻辑点、再乘底图比例）。用例在 `render/tests.rs`（主体已贴行数上限） | `annotate_step`、`compose_overview`、`Step` |
@@ -172,8 +172,8 @@
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
 | `src/lib.rs` | 2219 | **27 个 IPC 命令** + `with_commands` 注册（含**托管状态**）。★ 任务日志**不在这里**了，见 `task_log.rs`；过程事件流的读盘在 `task_replay.rs`。⚠️ **已破 `CONVENTIONS.md` §9 的存量基线（1903），见那一节的 2026-09-21 复测** |
-| `src/task_log.rs` | 159 | ★ **任务日志的两件事**：`append_task_log`（纯追加、带毫秒时间戳、写完 flush）+ `write_start_header`（开跑前那份**配置快照**——"当时到底按哪份配置跑的"）。★ 快照里的**运行参数**（模式 / 工作流 / 导航目标）全部取自 `RunChoice`，与界面上选的必须一致。T27 从 `lib.rs` 整段搬出来（那一百来行是"写日志"的活，与"装配 / 登记 / 起线程"不是一回事） |
-| `src/task_diagnostics.rs` | 287 | ★★ **过程诊断的落盘侧**（T29）：每个任务一个目录 `data/tasks/<ID>/`，逐步存标注图 + 总图 + `events.jsonl` + 人读的 `task.log` + **`raw/`（未标注的 OCR 输入图 + 引擎 stdout 原文）**。★★ **判据执行到哪就记到哪**：记的是判据**自己**交出来的轨迹，不是在编排层再复述一遍（否则迟早和判据不一致） |
+| `src/task_log.rs` | 490 | ★ **任务日志的三件事**：`write_task_log_line`（纯追加、带毫秒时间戳、写完 flush）+ **`log_line!` 宏**（把**调用点的文件 / 行号 / 模块**自动挂上——位置只有取在宏展开处才是真的，靠人维护"文案 → 代码位置"必然静默出错）+ `write_start_header`（开跑前那份**配置快照**——"当时到底按哪份配置跑的"）。★ 快照里的**运行参数**（模式 / 工作流 / 导航目标）全部取自 `RunChoice`，与界面上选的必须一致。T27 从 `lib.rs` 整段搬出来（那一百来行是"写日志"的活，与"装配 / 登记 / 起线程"不是一回事） |
+| `src/task_diagnostics.rs` | 315 | ★★ **过程诊断的落盘侧**（T29）：每个任务一个目录 `data/tasks/<ID>/`，逐步存标注图 + 总图 + `events.jsonl` + 人读的 `task.log` + **`raw/`（未标注的 OCR 输入图 + 引擎 stdout 原文）**。★★ **判据执行到哪就记到哪**：记的是判据**自己**交出来的轨迹，不是在编排层再复述一遍（否则迟早和判据不一致）。★ `observe` / `finish` 各自报一条 ⏱ 耗时（渲染+编码 / 写盘 / 总图拼装）：这段跑在**任务线程**上，每一毫秒都吃单步预算 |
 | `src/task_diagnostics/events.rs` | 198 | ★★ **`events.jsonl` 的格式（唯一一处定义）**：`read`（这一步看到了什么：图 + 区域 + 每块文字与坐标与置信度 + **可重跑的原料 `ocr_input`/`ocr_raw`**）+ `decision`（这一步怎么判的：判据 / 阈值 / 每个候选过没过 + 理由 / 重跑要的参数）。`tools/replay` 只**读**这个格式 |
 | `src/task_diagnostics/page.rs` | 79 | 把这一步的图 + 识别框 + 区域渲染成一张**标注图**（排查时先看它）。★ 底图优先用**整窗**（`observation.window`），拿不到才退回裁图；图标命中画成**蓝框**（与文字框的绿框区分），搜索区域画成橙框 | `render_page` |
 | `src/task_replay.rs` | 171 | ★★ **「过程重放」的读盘侧**（T29）：读出事件流给界面，并把图补成**绝对路径**（asset 协议按目录前缀匹配，路径里的分隔符不能让前端猜）。★ `task_dir_for` 是**任务目录在哪的唯一判据**（界面「打开任务目录」按钮也走它）。⚠️ 旧布局的任务只有日志、没有目录 ⇒ 如实报"没有重放材料"，不拿空面板冒充 |
@@ -249,8 +249,8 @@ draw_cursor_circle    read_task_log        read_task_events     open_task_dir
 
 `lib.rs` 内部辅助函数：`persist_config` 校验 + 落盘 + 更新内存（两条写入路径共用）、
 `migrate_legacy_data` 启动时搬一次旧数据、`desktop_for` 按类名+exe 造平台对象、
-`preview_data_url` 截屏转 base64、`window_rect_from_preview` 预览坐标 → 窗口坐标、
-`append_task_log` 任务日志落盘。
+`preview_data_url` 截屏转 base64、`window_rect_from_preview` 预览坐标 → 窗口坐标。
+任务日志的落盘**不在这里**（`task_log.rs` 的 `write_task_log_line` / `log_line!`）。
 
 ### 3.7 `apps/desktop/src` —— 界面
 
@@ -311,7 +311,8 @@ draw_cursor_circle    read_task_log        read_task_events     open_task_dir
 | **改「只做导航」**（工作流 1 / 2） | `runner/navigate.rs`（判据与点击）+ `vision/src/template.rs`（匹配算法） |
 | **改「在哪一步停下 / 要不要发」** | `runner/message.rs` 的 `prepare_message`。搜索式与「只填不发」都停在 `Prepared` |
 | **改「这条工作流到底要什么」**（要标哪些区域 / 要不要填联系人·正文） | **`src-tauri/src/runtime/requirements.rs`** 的 `required_marks` 与 `workflow_inputs`。★★ **判据只有这一处**：装配期按它拒绝、界面通过 `workflow_requirements` 命令读它渲染。★ 分叉的两种后果都很难查：`required_marks` 分叉 ⇒「界面说齐了、点开始却被拒」；`workflow_inputs` 分叉 ⇒「按钮点不动、也不说为什么」（2026-09-20 实测，见 T27） |
-| 给任务日志**加一行** / 改开头那份配置快照 | `src-tauri/src/task_log.rs` 的 `write_start_header`。★ **别加回 `lib.rs`**（它贴着基线，那一百来行是整段搬出去的）。运行参数（模式 / 工作流 / 导航目标）一律取自 `choice`，与界面上选的必须一致 |
+| **排查「某一步为什么慢 / 单步超时超在哪」** | ① 打开 `data/tasks/<任务ID>/task.log`：先搜 `超过单步上限`（文案里带**实际耗时**与**判据的代码位置**），再看它上面那一批 `⏱ …` 行——每条都带 `@文件:行`，走得最久的那条指的就是要开的地方；② 实测最常见的两段是 `导航·图标匹配 icons.locate`（`vision/src/template.rs`，逐位置扫搜索区 × 每个模板）与 `⏱ 单步图 NN`（`task_diagnostics.rs`：标注图的渲染/编码/写盘**跑在任务线程上**，直接吃单步预算）；③ 别先怀疑匹配阈值——阈值只决定"够不够格"，**不影响耗时**（见 `docs/todo.md` T31） |
+| **给任务日志加一行** / 改开头那份配置快照 | `src-tauri/src/task_log.rs` 的 `write_start_header`。★ **别加回 `lib.rs`**（它贴着基线，那一百来行是整段搬出去的）。运行参数（模式 / 工作流 / 导航目标）一律取自 `choice`，与界面上选的必须一致 |
 | **改「本次走哪条路」怎么传到后端**（**模式** / 工作流 / 导航目标） | `runtime.rs` 的 `RunChoice` + `lib.rs::start_task`（读 `request.run_choice`，**不读也不写配置**）+ `App.tsx::handleStart`（补进请求）+ **`components/RunChoiceFields.tsx`** 的三个选择器（绑 `runChoice`）。★★ **这是运行参数、不是配置项**——别改回读 `state.config`，那正是 2026-09-19「选了 A 跑的是 B」那个 bug。★ `nav_target` 的值域是**图标库目录名**（`String`），装配期在 `runtime.rs` 的 `build_runner` 里收敛成"要点这一个图标" |
 | 改**模式**（演练 / 真实）影响到的行为 | ① 挑哪组端口 ② 真实模式没标定尺寸就拒 ③ 审计里的平台字段（`RuntimeMode::platform_label`）④ 要不要带标定窗口（`RuntimeMode::calibrated_window`）。★ 上面四条**全部**通过 `build_runner` 开头那句 `config.mode = choice.mode` 跟随本次运行参数，**判据只有一处**。界面侧：页头徽标 / `canSave` / 演练场景显隐一律看 `App` 的 `activeMode`，**别用 `draft.mode`**。提示文案只有一处：`RuntimeMode::notice()`，后端成对下发（`RuntimeInfo.mode_notices`）。★ 这几样**全在 `src-tauri/src/runtime/mode.rs`** 里，改模式相关的东西先开它 |
 | 改区域比例默认值 / 加一个区域 | `automation-core/src/regions.rs` + `src-tauri/src/runtime.rs` 的 `RegionConfig` + `components/RegionCalibration.tsx` |

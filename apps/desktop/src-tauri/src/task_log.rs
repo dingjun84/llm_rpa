@@ -62,18 +62,69 @@ pub fn task_log_path(data_dir: &Path, task_id: TaskId) -> PathBuf {
     task_dir(data_dir, task_id).join(LOG_FILE_NAME)
 }
 
-/// 把一行后台活动追加到任务日志。
+/// 把一行后台活动追加到任务日志（**低层写入**）。
 ///
 /// 刻意保持极简：纯追加、每行带时间戳、**写完立刻 flush**——
 /// 这样进程被强杀或崩溃时，已经写下的内容仍然在盘上。
-pub fn append_task_log(path: &Path, line: &str) {
+///
+/// ⚠️ 调用方不要直接用它，用 [`log_line!`]：那一版会把**调用点的文件、行号与模块**
+/// 一并写进去。位置只有在宏的**展开处**取才是真的，转手一层就变成了"打日志的那一行"。
+pub fn write_task_log_line(path: &Path, line: &str) {
     append_raw_line(path, &format!("[{}] {line}", now_stamp()));
+}
+
+/// 给一行日志挂上它的**出处**：`[src/runner/navigate.rs:93 runner::navigate] 正文`。
+///
+/// 摆在时间戳之后、正文之前：左边一律是"什么时候"与"从哪儿来"，
+/// 正文从固定的第 4 段开始，扫日志时眼睛不用来回找。
+pub fn with_origin(file: &str, line: u32, module: &str, text: String) -> String {
+    format!("[{file}:{line} {module}] {text}")
+}
+
+/// 写一行任务日志，**自动带上调用点**（文件、行号、模块路径）。
+///
+/// ## 为什么非要机器来记
+///
+/// 排查时最常问的一句是「这行是谁打的、是从哪儿走到这儿的」——而日志自己答不出来。
+/// 靠人维护"文案 → 代码位置"的对应，改一次文案就全错，而且是**静默**全错。
+/// `file!()/line!()/module_path!()` 在**展开处**求值，位置永远是真的，
+/// 也不必为此给每个调用点加参数。
+///
+/// 用法很直白——**一个已经算好的字符串**：
+/// `log_line!(log_path, &format!("窗口 {}x{}", w, h))`、`log_line!(log_path, "=== 结束 ===")`。
+///
+/// 刻意**不收** `format!` 的参数列表：那样写的人会以为 `{x}` 内联捕获照常生效，
+/// 而它在"先算字符串"这条路上是**静默失效**的（原样打印 `{x}`）。
+///
+/// 位置由 `log_line!` 自己取、再传给内部的 [`__log_line_at!`]：位置必须取在
+/// **调用 `log_line!` 的那一行**，转一手就会变成宏定义所在的那一行。
+/// 拆成两个宏是为了让多行调用点末尾那个逗号（`);` 前的 `,`）也能照常写——
+/// `expr` 片段后面不允许跟可选的 `,`，所以只能显式列一条带逗号的规则。
+#[macro_export]
+macro_rules! log_line {
+    ($path:expr, $line:expr) => {
+        $crate::__log_line_at!(file!(), line!(), module_path!(), $path, $line)
+    };
+    ($path:expr, $line:expr,) => {
+        $crate::__log_line_at!(file!(), line!(), module_path!(), $path, $line)
+    };
+}
+
+/// [`log_line!`] 的内部实现，不要直接用（见它的说明：位置要取在调用点）。
+#[macro_export]
+macro_rules! __log_line_at {
+    ($file:expr, $line_no:expr, $module:expr, $path:expr, $line:expr) => {
+        $crate::task_log::write_task_log_line(
+            &$path,
+            &$crate::task_log::with_origin($file, $line_no, $module, $line.to_string()),
+        )
+    };
 }
 
 /// 追加一行**原样**文本（不加时间戳前缀）。
 ///
 /// 事件流（`events.jsonl`）要的是纯 JSON，加前缀就没法解析了。
-/// 这里的"建目录 → 追加 → flush"三件事与 [`append_task_log`] **共用一份实现**：
+/// 这里的"建目录 → 追加 → flush"三件事与 [`write_task_log_line`] **共用一份实现**：
 /// 各写一份的话，漏掉 `create_dir_all` 的那一份会静默失败——
 /// 现象是"跑完一个任务，这个文件一个字节都没有"，而任务本身可能一切正常。
 ///
@@ -123,11 +174,11 @@ pub fn write_start_header(
 ) {
     let navigate_only = choice.workflow == Workflow::NavigateOnly;
 
-    append_task_log(log_path, "=== 任务开始 ===");
-    append_task_log(log_path, &format!("任务 ID    : {task_id}"));
+    log_line!(log_path, "=== 任务开始 ===");
+    log_line!(log_path, &format!("任务 ID    : {task_id}"));
     // 「只做导航」根本不找人，任务请求里那个联系人字段是空的——
     // 那不是"漏填了"，所以不能显示成空白，否则看日志的人会以为操作者忘了填。
-    append_task_log(
+    log_line!(
         log_path,
         &format!(
             "目标联系人 : {}",
@@ -143,7 +194,7 @@ pub fn write_start_header(
     // 模式与工作流是同一类东西：界面上选完就该按这个跑，不需要先点保存。
     // 所以"日志里记的"与"界面上选的"必须始终一致——不一致就说明请求那条链路
     // 出了问题，而不是"用户选错了"。
-    append_task_log(log_path, &format!("运行模式   : {:?}", choice.mode));
+    log_line!(log_path, &format!("运行模式   : {:?}", choice.mode));
     // 「哪条工作流」必须写进日志。
     //
     // 三条路的失败现象**一模一样**（都是「找不到联系人」），而处置方向完全相反：
@@ -151,7 +202,7 @@ pub fn write_start_header(
     // 日志里没有这一行时，看日志的人只能靠"有没有点过搜索框"去反推，
     // 而那条证据要往后翻十几行才看得到——于是很容易把"跑的不是这条工作流"
     // 误判成"这条工作流坏了"。
-    append_task_log(
+    log_line!(
         log_path,
         &format!("工作流     : {}（{:?}）", choice.workflow.describe(), choice.workflow),
     );
@@ -159,13 +210,13 @@ pub fn write_start_header(
         // 记的是**图标库目录名**（`data/icons/` 下一级）；空 = 界面还没选。
         let target = choice.nav_target.trim();
         let shown = if target.is_empty() { "（没选）" } else { target };
-        append_task_log(log_path, &format!("导航目标   : {shown}"));
+        log_line!(log_path, &format!("导航目标   : {shown}"));
     }
-    append_task_log(log_path, &format!("窗口类名   : {}", config.window_class));
-    append_task_log(log_path, &format!("目标程序   : {:?}", config.wecom_exe));
-    append_task_log(log_path, &format!("OCR 程序   : {:?}", config.ocr_command));
-    append_task_log(log_path, &format!("标定尺寸   : {:?}", config.calibrated_window));
-    append_task_log(
+    log_line!(log_path, &format!("窗口类名   : {}", config.window_class));
+    log_line!(log_path, &format!("目标程序   : {:?}", config.wecom_exe));
+    log_line!(log_path, &format!("OCR 程序   : {:?}", config.ocr_command));
+    log_line!(log_path, &format!("标定尺寸   : {:?}", config.calibrated_window));
+    log_line!(
         log_path,
         &format!(
             "滚动/扫描  : 每次 {} 格，最多 {} 次，最多扫 {} 轮，停稳等待 ≤{}ms",
@@ -175,7 +226,7 @@ pub fn write_start_header(
             config.scroll_settle_ms
         ),
     );
-    append_task_log(
+    log_line!(
         log_path,
         &format!(
             "只填不发   : {}    卡死检测: {}    记录识别结果: {}",
@@ -192,7 +243,7 @@ pub fn write_start_header(
             .filter(|name| !name.is_empty())
             .collect::<Vec<_>>()
             .join(" | ");
-        append_task_log(
+        log_line!(
             log_path,
             &format!(
                 "切换视图   : 开    图标 {} 个 [{}]    图标库 {}    搜索区 {:?}    最低分 {:.2}",
@@ -207,18 +258,18 @@ pub fn write_start_header(
     // 放宽匹配是**临时措施**，但它会改变"点到谁"这个结果，
     // 所以必须在每次任务的配置快照里留痕：事后复盘时不用去翻当时改没改配置。
     if config.relaxed_name_match {
-        append_task_log(
+        log_line!(
             log_path,
             "⚠️ 姓名匹配 : 已放宽为「包含即可」（临时措施，非架构要求的逐字精确匹配）",
         );
         if !config.stop_before_send {
-            append_task_log(
+            log_line!(
                 log_path,
                 "⚠️ 注意     : 放宽匹配 + 允许真实发送同时打开 —— 存在「找错人」的风险",
             );
         }
     }
-    append_task_log(log_path, "=== 状态轨迹 ===");
+    log_line!(log_path, "=== 状态轨迹 ===");
 }
 
 
@@ -385,11 +436,20 @@ mod tests {
         let root = temp_root("append");
         let path = task_log_path(&root, TaskId::nil());
 
-        append_task_log(&path, "=== 任务开始 ===");
+        log_line!(&path, "=== 任务开始 ===");
 
         let text = std::fs::read_to_string(&path).unwrap();
         let line = text.lines().next().unwrap();
         assert!(line.ends_with("=== 任务开始 ==="), "实际：{line}");
+        // 出处（文件:行号 + 模块）必须真的落在**这一行**上。
+        //
+        // **为什么钉住它**：排查时最常问的是「这行是谁打的」。靠人维护"文案 → 代码位置"
+        // 的对应表，改一次文案就全错，而且是静默全错——所以位置必须由 `log_line!`
+        // 在展开处取。这条断言就是防它哪天被"简化"掉。
+        assert!(
+            line.contains("task_log.rs:") && line.contains("task_log::tests"),
+            "应当带上调用点的文件、行号与模块，实际：{line}"
+        );
         let stamp = line.trim_start_matches('[').split(']').next().unwrap();
         // 可读的本地时间（而不是 Unix 毫秒）：能被按同一个格式解回来。
         assert!(
@@ -407,9 +467,9 @@ mod tests {
     fn the_history_lists_both_the_new_directory_and_the_old_flat_file() {
         let root = temp_root("both_layouts");
         let id = TaskId::nil();
-        append_task_log(&task_log_path(&root, id), "=== 任务开始 ===");
+        log_line!(&task_log_path(&root, id), "=== 任务开始 ===");
         let old = root.join("task-abcd1234.log");
-        append_task_log(&old, "=== 任务开始 ===");
+        log_line!(&old, "=== 任务开始 ===");
 
         let paths = list_task_log_paths(&root);
 

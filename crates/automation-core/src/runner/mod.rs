@@ -809,14 +809,40 @@ impl<'a> Run<'a> {
         self.cancel.check()
     }
 
+    /// 单步超时校验（协作式：端口返回后才查得到）。
+    ///
+    /// 文案里必须带**实际耗时**与**判据自己的位置**：只写"超过上限 20s"时，
+    /// 看日志的人既不知道超到哪儿（20.1s 还是 200s），也不知道这条结论是从
+    /// 哪一段代码里冒出来的——而这正是"这一步为什么慢"唯一能追的入口。
     fn check_deadline(&self, step: &str) -> Result<(), AutomationError> {
-        if self.step_started.elapsed() > self.cfg().step_timeout {
+        let elapsed = self.step_started.elapsed();
+        if elapsed > self.cfg().step_timeout {
             return Err(AutomationError::Timeout(format!(
-                "{step} 超过单步上限 {:?}",
-                self.cfg().step_timeout
+                "{step} 超过单步上限 {:?}（实际 {:.1}s，判据 {}:{}）",
+                self.cfg().step_timeout,
+                elapsed.as_secs_f64(),
+                file!(),
+                line!(),
             )));
         }
         Ok(())
+    }
+
+    /// 记一条「这一段花了多久」的证据行，`at` 是测量点的代码位置。
+    ///
+    /// ## 为什么耗时也要进证据
+    ///
+    /// [`Self::check_deadline`] 只回答"超了没有"，不回答"超在哪一段"。
+    /// 而等到超时那一刻再去插桩已经来不及了——那一次的现场已经过去。
+    /// 所以分段耗时必须在**超时之前就写进证据**，超时后随"过程证据"一起落盘。
+    ///
+    /// `at` 由调用点给出（`concat!(file!(), ":", line!())`），理由与 `log_line!` 一样：
+    /// 位置只有取在**展开处**才是真的。
+    fn note_elapsed(&mut self, what: &str, at: &str, elapsed: Duration) {
+        self.evidence.push(format!(
+            "⏱ {what} {:.0}ms  @{at}",
+            elapsed.as_secs_f64() * 1000.0
+        ));
     }
 
     /// 把失败收敛为终态，并写入带失败代码的审计记录。

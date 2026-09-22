@@ -44,12 +44,12 @@ pub use events::read_events;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use automation_core::{Decision, DiagnosticRecorder, Observation, TaskId};
 
-use crate::task_log::{
-    append_task_log, now_stamp, LOG_FILE_NAME, OVERVIEW_FILE_NAME, RAW_DIR, STEPS_DIR,
-};
+use crate::log_line;
+use crate::task_log::{now_stamp, LOG_FILE_NAME, OVERVIEW_FILE_NAME, RAW_DIR, STEPS_DIR};
 
 /// 总图最多拼多少步。
 ///
@@ -166,6 +166,10 @@ impl TaskDiagnostics {
         };
         let title = format!("{}  ·  共 {total} 步", self.title);
 
+        // 总图是**收尾时**一次性拼的：解码每步 PNG、纵向拼装、再编码一张大图。
+        // 它同样跑在任务线程上（命令层 `finish()` 就在 `run()` 返回之后），
+        // 所以耗时必须自己报出来——否则"任务跑完还卡了好几秒"会找不到主人。
+        let composing = Instant::now();
         if let Some(font) = inner.font.as_ref() {
             if let Ok(sheet) = vision::render::compose_overview(&title, &note, font, &decoded) {
                 if let Ok(png) = vision::pixels::encode_png(&sheet) {
@@ -173,8 +177,13 @@ impl TaskDiagnostics {
                 }
             }
         }
+        let compose_ms = composing.elapsed().as_millis();
         let log_path = self.dir.join(LOG_FILE_NAME);
-        append_task_log(
+        log_line!(
+            &log_path,
+            &format!("⏱ 总图拼装 {compose_ms}ms（{total} 步：解码 + 纵向拼装 + 编码）"),
+        );
+        log_line!(
             &log_path,
             &format!(
                 "过程诊断 : {STEPS_DIR}/ 共 {total} 步，{OVERVIEW_FILE_NAME} 是拼起来的总图{note}"
@@ -183,7 +192,7 @@ impl TaskDiagnostics {
         if inner.raw_count > 0 {
             // 这一句是给"要把现场拿出去重跑 OCR"的人看的：`raw/` 那对文件才是原料，
             // `steps/` 上的图有框有字，拿它重跑读出来的是另一套结果。
-            append_task_log(
+            log_line!(
                 &log_path,
                 &format!(
                     "过程诊断 : {RAW_DIR}/ 有 {} 步的 OCR 原料（未标注的输入图 + 引擎原文），\
@@ -193,7 +202,7 @@ impl TaskDiagnostics {
             );
         }
         if let Some(err) = inner.font_error.as_deref() {
-            append_task_log(
+            log_line!(
                 &log_path,
                 &format!("过程诊断 : ⚠️ 本机没有中文字体，图上只有框没有文字（{err}）"),
             );
@@ -222,6 +231,11 @@ impl DiagnosticRecorder for TaskDiagnostics {
         // 图片与事件用**同一个**时间戳：看图的人不该怀疑"图上的时间和事件里的时间"
         // 是不是同一步。
         let stamp = now_stamp();
+        // 这一段是**在任务线程上**跑的（见端口契约）：渲染、编码、写盘花掉的每一毫秒
+        // 都直接吃单步预算。所以要分段计时写进日志——它慢起来的表现是
+        // "某一步莫名超时"，而超时那一刻现场已经过去了，只能靠这些行回溯。
+        let started = Instant::now();
+        let encoded = Instant::now();
         let png = match inner.font.as_ref() {
             Some(font) => page::render_page(font, &stamp, observation),
             // 没有字体也要留下画面：这一步的价值大半在"画面上是什么样"。
@@ -229,8 +243,10 @@ impl DiagnosticRecorder for TaskDiagnostics {
                 .ok()
                 .and_then(|image| vision::pixels::encode_png(&image).ok()),
         };
+        let encode_ms = encoded.elapsed().as_millis();
         let Some(png) = png else { return };
 
+        let writing = Instant::now();
         let steps = self.dir.join(STEPS_DIR);
         let _ = std::fs::create_dir_all(&steps);
         let name = page::image_name(index, observation.label);
@@ -246,6 +262,7 @@ impl DiagnosticRecorder for TaskDiagnostics {
             ),
             None => (None, None),
         };
+        let write_ms = writing.elapsed().as_millis();
         if ocr_input.is_some() {
             inner.raw_count += 1;
         }
@@ -264,6 +281,17 @@ impl DiagnosticRecorder for TaskDiagnostics {
         while inner.pages.len() > MAX_OVERVIEW_STEPS {
             inner.pages.remove(0);
         }
+        let log_path = self.dir.join(LOG_FILE_NAME);
+        log_line!(
+            &log_path,
+            &format!(
+                "⏱ 单步图 {index:02} {}：渲染+编码 {encode_ms}ms  写盘 {write_ms}ms  \
+                 合计 {}ms（底图 {}）",
+                observation.label,
+                started.elapsed().as_millis(),
+                if observation.window.is_some() { "整窗" } else { "裁图" }
+            ),
+        );
     }
 
     /// 记一次判定。**与 [`Self::observe`] 分开落盘**：不是每一步都有判定
