@@ -102,6 +102,33 @@ h2 {
   background: #fffbfa;
 }
 
+/* 面板标题 + 右侧动作（例如「任务历史」的刷新）。
+   `h2` 自己带下外边距，进了这个横排必须清掉，否则整行会被撑高、
+   按钮看起来像浮在标题底下。 */
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.panel-head h2 {
+  margin: 0;
+}
+
+.panel-head-side {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* 面板里的小动作按钮：比默认按钮小一号，别跟「保存配置」那种主操作抢注意力。 */
+.panel-action {
+  font-size: 12px;
+  padding: 5px 12px;
+}
+
 .field {
   display: block;
   margin-bottom: 14px;

@@ -34,6 +34,20 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [taskLog, setTaskLog] = useState<string | null>(null);
   const [taskLogError, setTaskLogError] = useState<string | null>(null);
+  /** 「刷新」进行中——按钮据此变成「读取中…」并禁用。 */
+  const [refreshing, setRefreshing] = useState(false);
+  /** 上一次「刷新」失败的原因。 */
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  /**
+   * 每按一次「刷新」就加一。
+   *
+   * 它存在的唯一理由是**让下面那个"读过程日志"的副作用重跑一次**：
+   * 那个副作用依赖的是 `activeId` / 状态 / 详情，选中的还是同一条任务时
+   * 这几个值都没变，React 就不会重跑——而盘上那份日志很可能刚被追加过内容
+   * （上一次没退干净的进程、或者别的入口写的）。刷新了列表却读到旧日志，
+   * 正是"刷新看起来没生效"最容易发生的方式。
+   */
+  const [logNonce, setLogNonce] = useState(0);
   const [tab, setTab] = useState<Tab>("tasks");
 
   /**
@@ -115,6 +129,40 @@ export function App() {
     });
   }, []);
 
+  /**
+   * 把后端给的那份任务清单落到界面上。
+   *
+   * ★ 选中项**尽量不动**：刷新时如果把它换掉，用户正开着的那条任务的
+   * 过程日志就被抽走了——而他按刷新的本意是"看看有没有新的"，不是"换一条看"。
+   * 只有在原来那条已经不在清单里时才退回第一条。
+   */
+  const applyTaskList = useCallback((list: TaskView[]) => {
+    setTasks(list);
+    setActiveId((current) =>
+      current && list.some((task) => task.id === current) ? current : list[0]?.id ?? null,
+    );
+  }, []);
+
+  /**
+   * 重新从**磁盘**读一遍任务清单（「任务历史」页头上那个按钮）。
+   *
+   * 与启动时那一次的差别只有两个：失败时报在这块面板上（而不是整页的 error），
+   * 以及顺带重读一次当前任务的过程日志（见 `logNonce`）。
+   * 清单本身走的是同一个命令，判据没有第二处。
+   */
+  const refreshTasks = useCallback(async () => {
+    setRefreshing(true);
+    setRefreshError(null);
+    try {
+      applyTaskList(await api.listTasks());
+      setLogNonce((count) => count + 1);
+    } catch (err) {
+      setRefreshError(String(err));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [applyTaskList]);
+
   useEffect(() => {
     const unlisteners: Array<() => void> = [];
     let disposed = false;
@@ -123,9 +171,8 @@ export function App() {
       try {
         const [list, runtime] = await Promise.all([api.listTasks(), api.runtimeInfo()]);
         if (disposed) return;
-        setTasks(list);
+        applyTaskList(list);
         setInfo(runtime);
-        setActiveId(list[0]?.id ?? null);
       } catch (err) {
         if (!disposed) setError(String(err));
       }
@@ -154,7 +201,7 @@ export function App() {
       disposed = true;
       unlisteners.forEach((fn) => fn());
     };
-  }, [upsert]);
+  }, [upsert, applyTaskList]);
 
   // 每次从后端拿到配置（首次加载、以及保存之后）都以它为准重置草稿。
   // 保存后 `setInfo(await runtimeInfo())` 会走到这里，于是"已保存"与
@@ -272,7 +319,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeId, activeTask?.state, activeTask?.failure?.reason, activeTask?.detail]);
+  }, [activeId, logNonce, activeTask?.state, activeTask?.failure?.reason, activeTask?.detail]);
 
 
   const running = useMemo(
@@ -547,6 +594,10 @@ export function App() {
               activeId={activeId}
               onSelect={setActiveId}
               onReplay={openReplay}
+              onRefresh={() => void refreshTasks()}
+              refreshing={refreshing}
+              refreshError={refreshError}
+              dataDir={info?.data_dir ?? null}
             />
           </div>
         </main>
