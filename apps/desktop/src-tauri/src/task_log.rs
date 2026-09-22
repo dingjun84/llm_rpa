@@ -342,6 +342,30 @@ pub fn task_id_from_path(path: &Path) -> String {
         .to_string()
 }
 
+/// 剥掉一行的前缀，只留下正文：`[时间戳] [代码出处] 正文` → `正文`。
+///
+/// ## ⚠️ 为什么必须**循环**剥，不能只剥一段
+///
+/// 每行日志的前缀不止一个：时间戳由 [`write_task_log_line`] 加，代码出处
+/// （`[file:line module]`）由 [`with_origin`] 加，两个都要剥掉，正文才露出来。
+///
+/// 只剥一段的后果很难看：正文前面还挂着 `[apps/.../task_log.rs:178 desktop_lib::task_log] `，
+/// 于是 [`summary_from_log`] 里每一条 `strip_prefix` **全部落空**，
+/// 而从磁盘恢复的每一条任务都会退化成「失败 / 只做导航」——
+/// 日志文件本身好好地在盘上，看起来却像历史记录坏了（2026-09-22 实测）。
+///
+/// 为什么「剥到行首不再以 `[` 开头为止」是安全的：正文里出现 `[` 是常事
+/// （`切换视图   : 开    图标 1 个 [通讯录] …`），但**行首**那个位置
+/// 只有前缀会占着——正文前面永远垫着时间戳。
+fn strip_line_prefixes(raw: &str) -> &str {
+    let mut rest = raw.trim_start();
+    while rest.starts_with('[') {
+        let Some(end) = rest.find(']') else { break };
+        rest = rest[end + 1..].trim_start();
+    }
+    rest
+}
+
 /// 从日志文件粗解析一份可展示的任务摘要（重启后恢复「任务历史」用）。
 ///
 /// 解析失败返回 `None`，不把坏文件塞进列表。
@@ -357,11 +381,7 @@ pub fn summary_from_log(path: &Path) -> Option<crate::TaskView> {
     let mut nav_target = String::new();
 
     for raw in text.lines() {
-        // 去掉 `[ms] ` 时间戳前缀
-        let line = raw
-            .find(']')
-            .map(|i| raw[i + 1..].trim_start())
-            .unwrap_or(raw);
+        let line = strip_line_prefixes(raw);
         if let Some(rest) = line.strip_prefix("任务 ID    : ") {
             id = rest.trim().to_string();
         } else if let Some(rest) = line.strip_prefix("目标联系人 : ") {
@@ -374,10 +394,9 @@ pub fn summary_from_log(path: &Path) -> Option<crate::TaskView> {
             failure_code = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("失败原因 : ") {
             failure_reason = Some(rest.trim().to_string());
-        } else if line.contains(" -> ") && detail.is_none() {
-            // 留最后一条状态行给 detail 更有用；这里先记下，后面覆盖
-            detail = Some(line.to_string());
         }
+        // 状态迁移行（`Draft -> LaunchingClient`）留**最后一条**：它既是"走到哪儿了"，
+        // 也是"停在哪一步"最直接的一句话。后面还有 `终态` 那几行，所以不能取第一条。
         if line.contains(" -> ") {
             detail = Some(line.to_string());
         }
@@ -423,68 +442,4 @@ pub fn summary_from_log(path: &Path) -> Option<crate::TaskView> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 写日志要顺手把任务目录建出来。
-    ///
-    /// **为什么钉住它**：`create(true)` 在父目录不存在时**静默失败**，
-    /// 现象是"跑完一个任务，日志一个字节都没有"——而任务本身可能一切正常，
-    /// 于是看起来像"日志功能坏了"，实际只是少了一次 `create_dir_all`。
-    #[test]
-    fn writing_a_line_creates_the_task_directory_and_stamps_the_time() {
-        let root = temp_root("append");
-        let path = task_log_path(&root, TaskId::nil());
-
-        log_line!(&path, "=== 任务开始 ===");
-
-        let text = std::fs::read_to_string(&path).unwrap();
-        let line = text.lines().next().unwrap();
-        assert!(line.ends_with("=== 任务开始 ==="), "实际：{line}");
-        // 出处（文件:行号 + 模块）必须真的落在**这一行**上。
-        //
-        // **为什么钉住它**：排查时最常问的是「这行是谁打的」。靠人维护"文案 → 代码位置"
-        // 的对应表，改一次文案就全错，而且是静默全错——所以位置必须由 `log_line!`
-        // 在展开处取。这条断言就是防它哪天被"简化"掉。
-        assert!(
-            line.contains("task_log.rs:") && line.contains("task_log::tests"),
-            "应当带上调用点的文件、行号与模块，实际：{line}"
-        );
-        let stamp = line.trim_start_matches('[').split(']').next().unwrap();
-        // 可读的本地时间（而不是 Unix 毫秒）：能被按同一个格式解回来。
-        assert!(
-            chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S%.3f").is_ok(),
-            "时间戳应当是给人读的「年-月-日 时:分:秒.毫秒」，实际：{stamp}"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// 升级后「任务历史」必须两种布局都列出来。
-    ///
-    /// **为什么钉住它**：旧的 `data/task-*.log` 不收，界面上就会凭空少一截历史，
-    /// 看起来像数据丢了，而文件其实都还在盘上。
-    #[test]
-    fn the_history_lists_both_the_new_directory_and_the_old_flat_file() {
-        let root = temp_root("both_layouts");
-        let id = TaskId::nil();
-        log_line!(&task_log_path(&root, id), "=== 任务开始 ===");
-        let old = root.join("task-abcd1234.log");
-        log_line!(&old, "=== 任务开始 ===");
-
-        let paths = list_task_log_paths(&root);
-
-        assert_eq!(paths.len(), 2, "两种布局都要收：{paths:?}");
-        assert!(paths.contains(&task_log_path(&root, id)));
-        assert!(paths.contains(&old));
-        assert_eq!(task_id_from_path(&task_log_path(&root, id)), id.to_string());
-        assert_eq!(task_id_from_path(&old), "abcd1234");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    fn temp_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("llm-rpa-log-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
-    }
-}
+mod tests;
