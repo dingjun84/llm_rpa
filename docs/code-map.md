@@ -21,6 +21,8 @@
 | `crates/platform-windows` | 真实平台：Win32 截屏/焦点/鼠标/键盘/剪贴板 + **全局热键** + 只读探针 | 改系统动作、排查「鼠标不动」 |
 | `crates/platform-mock` | 演练替身：四个端口的假实现 + 场景注入 | 加演练场景、改故障注入 |
 | `crates/storage` | SQLite：审计、发送台账、证据落盘 | 改落库结构、改清理策略 |
+| `crates/sigma-drift` | **拟人化鼠标轨迹生成**（Fitts MT + sigma-lognormal + OU 抖动 + tremor），纯计算、无平台依赖 | 改轨迹模型、调参数 |
+| `tools/sigma-drift-viz` | 轨迹录制与可视化：Raw Input(Windows) / IOHID(macOS) 采真实鼠标轨迹 + eframe 画图对比 | 改录制管线、改可视化 |
 | `apps/desktop/src-tauri` | **IPC 命令层 + 装配**：26 个命令、配置草稿/持久化、`build_runner`、**启动日志** | 加界面按钮、加配置项（改这里最多） |
 | `apps/desktop/src` | React 界面：配置面板、任务、图标库、**过程重放** | 改界面 |
 | `tools/winocr` | 独立 OCR 子进程（`Windows.Media.Ocr`） | 改 OCR 输出格式或放大倍数 |
@@ -50,6 +52,10 @@
   tools/winocr / macosocr   独立子进程，不依赖任何内部 crate，只走 stdin/stdout JSON
   tools/replay         依赖 automation-core（判据本体）与 vision（引擎调用 + stdout 解析）
   apps/webview-probe   独立探针，与主应用无代码依赖
+
+  crates/sigma-drift        拟人化鼠标轨迹生成：**零内部依赖**（只有 rand/rand_distr）
+                            与主应用无任何关系，是一条独立的子系统
+  tools/sigma-drift-viz     依赖 sigma-drift（只读它的轨迹格式）+ eframe/egui
 ```
 
 ★ `tools/replay` 这一条是**判据只有一处**（`CONVENTIONS.md` §1.3）撑起来的：
@@ -284,6 +290,10 @@ read_task_log         read_task_events     open_task_dir
 
 ### 3.8 `tools/` —— 仓库外挂的小工具（不在 workspace 依赖链上）
 
+> ⚠️ **`tools/sigma-drift-viz` 是个例外**：它不是"随手可删的探针"，
+> 而是一条**独立子系统**的界面（配合 `crates/sigma-drift`）。
+> 其余探针（`webview-probe` / `mem-diag` 等）删掉不影响主应用，它不同。
+
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
 | `replay/src/lib.rs` | 410 | ★★ **重放本体**：读 `events.jsonl` → 配帧（**与界面同一条配对规则**：同名、最近一次、还没被配走）→ 重跑判据 → 可选真 OCR → 归因。入口 `replay_dir_with_ocr` |
@@ -294,6 +304,24 @@ read_task_log         read_task_events     open_task_dir
 | `replay/src/tests.rs` | 360 | 重放回归 + **现场 fixture 的生成器**（`#[ignore]`，改判据措辞后重跑它一次） |
 | `replay/src/ocr_tests.rs` | 295 | ★ 真 OCR 那几条（**假引擎 `sh` 脚本**，只造临时目录与假 PNG，不依赖现场素材）。⚠️ `#[cfg(all(test, unix))]` |
 | `macosocr/macosocr.swift` | — | macOS 侧引擎（`Vision`）。契约与 `tools/winocr` 相同：PNG 走 stdin、JSON 数组走 stdout |
+| `sigma-drift-viz/src/main.rs` | 1987 | ⚠️ **超基线近 4 倍**（T17）。eframe/egui 界面：录制真实鼠标轨迹 ↔ 生成轨迹对照可视化。**目前未拆**，见 `baselines.toml` |
+| `sigma-drift-viz/src/hid/mod.rs` | 70 | 录制管线的平台无关层：定义采集接口，按 cfg 转发到 `platform/{windows,macos,stub}.rs` |
+| `sigma-drift-viz/src/hid/platform/windows.rs` | 596 | **Windows 侧录制**：Raw Input（`WM_INPUT`）采真实鼠标移动。⚠️ 文件头部有 `#![allow(dead_code)]` —— 跨平台端口里未被本平台用到的符号 |
+| `sigma-drift-viz/src/hid/platform/macos.rs` | 520 | **macOS 侧录制**：IOHIDManager 采鼠标移动。⚠️ 同上，文件级 `#![allow]` |
+| `sigma-drift-viz/src/hid/platform/stub.rs` | 38 | 未支持平台上的空实现 |
+
+### 3.9 `crates/sigma-drift` —— 拟人化鼠标轨迹生成（独立子系统）
+
+与主应用（微信自动化）**没有任何代码关系**，是一条平行子系统。
+`crates/sigma-drift` 零内部依赖，`tools/sigma-drift-viz` 只依赖它。
+
+| 文件 | 行数 | 职责 | 关键符号 |
+| --- | --- | --- | --- |
+| `src/lib.rs` | 580 | **轨迹生成本体**：Fitts 运动时间 + sigma-lognormal 主运动波 + 修正波 + 曲率剖面 + OU（Euler–Maruyama）抖动 + tremor + 伽马分布采样 dt，另含一个 WindMouse 对照实现。★ 是 `SigmaDrift/motor_synergy.h`（C++）的移植 | `generate`、`compute_metrics`、`TrajectoryPoint`、`Config`、`Metrics` |
+
+⚠️ **它是整个仓库唯一一处与「自动化对方客户端」无关的代码**，
+诊断/判据那一整套约定（「判据只有一处」等）不适用于它。
+但它**同样受规模与依赖方向门禁约束**（见 `AI_RULES.md` §5 / §6）。
 
 ## 4. ★ 需求 → 文件（反向索引）
 
@@ -338,6 +366,9 @@ read_task_log         read_task_events     open_task_dir
 | 加演练场景 / 故障注入 | `platform-mock/src/scenario.rs` + `fault.rs` |
 | 加界面按钮（会真的产生输入） | `lib.rs` 加命令 + `api.ts` + `App.tsx`/对应组件。**确认它该不该按运行模式设限** |
 | 改窗口识别规则（类名/exe） | `lib.rs` 的 `desktop_for` + `platform-windows/src/config.rs` |
+| **改拟人化鼠标轨迹的生成模型**（Fitts / sigma-lognormal / 抖动 / tremor） | `crates/sigma-drift/src/lib.rs` 的 `generate` + `Config`。★ 与主应用的鼠标动作**完全无关** —— 主应用的 `platform-windows/src/winapi/cursor.rs` 是另一套（画圆自检），别改错 |
+| **改轨迹录制管线**（采真实鼠标移动） | `tools/sigma-drift-viz/src/hid/`。平台无关层是 `hid/mod.rs`，实现按 cfg 分到 `platform/{windows,macos,stub}.rs` |
+| **改轨迹可视化界面** | `tools/sigma-drift-viz/src/main.rs`（⚠️ 1987 行，超基线近 4 倍，加功能前先拆） |
 
 ## 5. 跨层改动清单（最容易漏一处的那种）
 

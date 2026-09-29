@@ -133,31 +133,52 @@
   自查：`grep -rn '\*\*' apps/desktop/src --include=*.tsx` 会把注释一起报出来，
   **只看那些不在注释里的行**；Rust 侧同理（要区分「在字符串里」还是「在注释里」）。
 
-## 9. 存量超标清单（基线，2026-09-19 实测）
+## 9. 存量超标清单（基线）
 
 **不要求立即重构。** 规矩是**只减不增**：改动这些文件时顺手能拆就拆，
 不要在里面再添新职责。
 
-超过 500 行的生产文件（7 个）。「基线」是这条规矩的**参照值**，
-「现在」是 2026-09-19 **当天第四批改动**（T23 收尾：模式也改成运行参数）之后的实测值：
+> **⚠️ 具体数字一律以 `baselines.toml` 为准，本文档不再抄数字。**
+>
+> 为什么：这里原来有一张手抄的基线表。结果是它在 2026-09-19 写下、
+> 2026-09-21 就整表过期，只能在下面追加一段「复测」来纠偏；同一个文件
+> 在不同段落出现多个互相矛盾的行数（`lib.rs` 曾同时存在 1903 / 1793 /
+> 1894 / 2189 四个值）。**手抄必然漂移**，所以数字搬进了机器可读的
+> `baselines.toml`，由 `checks/size_gate.py` 读取与校验。
+>
+> 本文档只回答「怎么拆」，不回答「现在多少行」。
 
-| 文件 | 基线 | 现在 | |
-| --- | --- | --- | --- |
-| `apps/desktop/src-tauri/src/lib.rs` | 1903 | 1793 | ✅ **减了 110**。T27 把**开跑前那份配置快照**（一百来行，纯写日志）整段搬成 `task_log.rs`(159) —— 它本来就是一段"写日志"的活，与命令层"装配 / 登记 / 起线程"不是一回事。见 `docs/todo.md` T27 |
-| `crates/automation-core/src/runner/mod.rs` | 1395 | 1224 | ✅ 拆成 5 个文件 |
-| `apps/desktop/src-tauri/src/runtime.rs` | 1039 | 927 | ✅ **减了 85**。T27 把「这条工作流要什么」那一组（`required_marks` / `missing_marks` / `WorkflowRequirement` / `workflow_inputs`）整段搬成 `runtime/requirements.rs`(171)，父模块 `pub use` 再导出（同 `mode.rs` 的做法）。见 `docs/todo.md` T17 / T27 |
-| `crates/vision/src/template.rs` | 881 | 796 | ✅ **仍低于基线**。T28 加失败诊断（`top_candidates` / `candidate_report`）时涨了 129 行——它们**只在失败路径上跑**，与"逐位置取最高分"那条热路径无关，所以留在同一文件里；见 `docs/todo.md` T28 |
-| `crates/platform-windows/src/winapi.rs` | 862 | 796 | ✅ **已拆完**（1215 → 985 → **796**）。两刀：光标轨迹 → `winapi/cursor.rs`(267)、输入原语 → `winapi/input.rs`(228)。见 `docs/todo.md` T17 |
-| `apps/desktop/src/components/IconLibraryPanel.tsx` | 983 | 800 | ✅ **已拆**（1064 → 808 → 800）。列表搬成 `IconList.tsx`(204)，两段结果预览搬成 `NavResultSections.tsx`(140)。T26 删掉「用于聊天历史导航」那一组后又减了 8 行 |
-| `apps/desktop/src/components/RuntimePanel.tsx` | 596 | 288 | ✅ **已拆**（858 → 288）。按「归属」拆成四个同级组件：`RunChoiceFields`(270，运行参数) / `TargetWindowSection`(202) / `AdvancedParamsSection`(192) / `TypingTextSection`(87)。见 `docs/todo.md` T17 |
+### 规矩
 
-★★ **2026-09-21 复测：上表「现在」那一列已经全部过期，而且七行**都**又涨了。**
-实测值（跑的就是 §10 那条 `find`）：`lib.rs` **2189**、`runner/mod.rs` **1350**、
-`runtime.rs` **1025**、`crates/vision/src/template.rs` **904**、
-`IconLibraryPanel.tsx` **847**、`winapi.rs` **843**、`CalibrationPanel.tsx` **726**。
-也就是说「只减不增」在这几处**实际没守住**。本轮（T29 决策轨迹 + 离线重放）
-往 `lib.rs` / `runner/mod.rs` 里加了什么、为什么没先拆，写在
-`docs/todo.md` T29 的「落地（2026-09-21 完成）」一节；**下一批拆分见 `docs/todo.md` T17**
+- 生产文件 **≤500 行**（不含 `tests/`、`examples/`、`*tests.rs`）。
+- 在 `baselines.toml` 里的文件：**只许减，不许增**，拆小了顺手把数字改小；
+  降到 500 以下就把整行删掉。
+- **不在基线里的新文件一律受 500 行约束，不许进基线表** —— 不给新代码开口子。
+- 唯一允许上调基线的情形：**原文件被有意拆分前的过渡**，且必须在
+  `baselines.toml` 的注释里写明理由（已有一例：加 `TODO(Tn)` 债务锚点注释）。
+
+### 怎么拆（这是本节真正的价值）
+
+**通法**：把「自成一类的一段功能」整段搬成同级模块，父模块 `pub use` 再导出。
+`lib.rs` / `runtime.rs` / `winapi.rs` 三次拆分都是这个套路：
+
+| 拆法 | 例子 |
+| --- | --- |
+| 一整块「纯写日志」的活搬出去 | `lib.rs` → `task_log.rs` |
+| 一组同类的判据/数据搬出去 | `runtime.rs` → `runtime/requirements.rs`、`runtime/mode.rs` |
+| 一个独立子系统搬出去（搬完父模块只需再导出） | `winapi.rs` → `winapi/cursor.rs`、`winapi/input.rs` |
+| React 面板按「归属」拆成同级组件 | `RuntimePanel.tsx` → `RunChoiceFields` / `TargetWindowSection` / `AdvancedParamsSection` / `TypingTextSection` |
+
+**拆完必须做的两件事**（漏了会静默出错）：
+
+1. 父模块的再导出若少了 `pub use`，报的是一堆 `E0432: unresolved import`，
+   看着像"文件没编进去"。
+2. 命令的**注册点**仍留在 `lib.rs` 的 `with_commands`（见 §5 的说明）。
+
+**参照历史**：`winapi.rs` 拆过两刀（1215 → 985 → 843）、`IconLibraryPanel.tsx`
+拆过两次（1064 → 808 → 847）、`RuntimePanel.tsx` 一次（858 → 288）。
+每次都是"新功能眼看着要破基线时先搬出一段"，而不是攒到失控再大修。
+
 ——别以为上表那些旧数字还成立。
 
 ★ **T29 新建的四个文件都低于上限**，两刀都可照抄
@@ -304,18 +325,46 @@ get_webview_window`）。**搬完 `wc -l` 对一眼**，别信脚本的自报数
 ## 10. 检查
 
 ```bash
-# 超长生产文件（不含 tests/ 与 examples/；`*tests.rs` 是测试文件，一并排除）
-find crates apps/desktop/src apps/desktop/src-tauri/src tools \
-  \( -name "*.rs" -o -name "*.ts" -o -name "*.tsx" \) \
-  | grep -v "/tests/\|/examples/\|/tests\.rs$" | xargs wc -l | awk '$1>500 && $2!="total"'
+# ① 激活工具链（多机位置不同，见 AI_RULES.md §9.1；不写死绝对路径）
+source scripts/rust-env.sh
 
-# 全量测试（--no-fail-fast 不能省，否则首个失败目标会中断整轮）
-CARGO_INCREMENTAL=0 cargo test --workspace --no-fail-fast
+# ② 规模门禁（读 baselines.toml，秒级；pre-commit 与 CI 都跑它）
+python checks/size_gate.py
 
-# 静态检查
-CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets
+# ③ 架构门禁（依赖方向 + 分层，秒级）
+python checks/arch_gate.py
+
+# ④ 测试与静态检查。⚠️ 用 `-p` 指定 crate，**别用 `--workspace`** ——
+#    Tauri 依赖链里的 `schemars 0.8.22` 在 rustc 1.98 下编译失败（E0107，
+#    第三方问题），`--workspace` 在本机恒为红。见 AI_RULES.md §9.1。
+CARGO_INCREMENTAL=0 cargo test --no-fail-fast \
+  -p automation-core -p platform-mock -p storage -p vision -p replay -p sigma-drift
+CARGO_INCREMENTAL=0 cargo clippy --all-targets \
+  -p automation-core -p platform-mock -p storage -p vision \
+  -p replay -p sigma-drift -p winocr
 ```
 
-> 本仓库目前**没有 CI 门禁**，以上命令靠自觉执行。
-> 若日后要加门禁，从「超长文件」和 `cargo clippy` 这两条开始，
-> 别一上来就卡函数行数——那会把现有的正常改动全堵死。
+### 门禁已落地（2026-09-29）
+
+> 本节此前写着「本仓库目前**没有 CI 门禁**，以上命令靠自觉执行」。
+> 那份自觉在 vibe coding 下不成立 —— 于是补上了三道自动闸门：
+
+| 闸门 | 位置 | 拦什么 | 快慢 |
+| --- | --- | --- | --- |
+| **pre-commit** | `.githooks/pre-commit` | 规模 / 架构 / `dbg!`·`console.log` / clippy | 秒级 |
+| **CI** | `.github/workflows/ci.yml` | 同上 + 全量测试 + 前端 `tsc` | 分钟级 |
+| **workspace lints** | `Cargo.toml` 的 `[workspace.lints.clippy]` | `too_many_arguments` 等设为 deny | 编译期 |
+
+**启用本地 hook（每个克隆一次）**：`sh .githooks/install.sh`
+（git 的 `.git/hooks/` 不入库，所以 hook 放在 `.githooks/` 里随仓库走。）
+
+**给 AI 助手的强制指令在根目录 `AI_RULES.md`** —— 它把本节与 `code-map.md`
+散落的强制项提炼成可执行清单。改代码前应先读它。
+
+**基线唯一来源是 `baselines.toml`**（不再是本文档里的散文表格）。
+本文档只解释规矩，数字一律以那份文件为准 —— 手抄必然漂移，这是已经踩过的坑。
+
+> 加门禁时**别一上来就卡函数行数** —— 那会把现有的正常改动全堵死。
+> 当前策略：`too_many_lines` / `cognitive_complexity` 只做 warn，
+> 只有 `too_many_arguments` 是 deny（因为它的修法明确：收成参数结构体）。
+
