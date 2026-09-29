@@ -347,7 +347,7 @@ pub fn open_device_guarded(
                         "SetMouseMovementMode(2) result Err (ignored): {err}"
                     )),
                 }
-                match api.SetMouseMovementSpeed(5) {
+                match api.SetMouseMovementSpeed(3) {
                     Ok(speed_code) => append_replay_log(&format!(
                         "SetMouseMovementSpeed(5) result Ok code={speed_code}"
                     )),
