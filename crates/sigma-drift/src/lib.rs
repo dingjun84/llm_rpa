@@ -447,6 +447,11 @@ pub mod windmouse {
     }
 
     /// WindMouse with explicit gravity / wind / step / target-area parameters.
+    // TODO(T17): 9 个参数超过阈值（too_many_arguments 在 workspace 里是 deny）。
+    // 这是一处 C++ 移植代码（`SigmaDrift/motor_synergy.h`），参数与服务端保持
+    // 一一对应便于比对；将来若要收成结构体，先确认与 C++ 版的对照关系。
+    // 注意：`#[allow]` 是为了让存量代码不阻塞 CI，**不是**新代码可以照抄的先例。
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_with(
         x0: f64,
         y0: f64,

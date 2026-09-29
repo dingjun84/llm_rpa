@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "离线重放过程诊断事件流：拿盘上记下的那一帧重跑判据，回答「它为什么这么判」"
 
+# 继承 workspace 的 lint 配置（根 Cargo.toml 的 [workspace.lints.clippy]）。
+# ⚠️ 少了这一段，workspace 里设的 `too_many_arguments = "deny"` 等**完全不生效**
+# —— 2026-09-29 实测：12 个 crate 全缺这一段，导致 lints 白设。
+[lints]
+workspace = true
+
+
 [lib]
 name = "replay"
 path = "src/lib.rs"

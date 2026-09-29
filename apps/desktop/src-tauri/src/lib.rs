@@ -13,6 +13,12 @@
 //! `automation_core::runner::message` 的模块文档。
 //!
 //! 消息正文只存在于内存与界面预览中，**不落库**；审计表只保存长度与哈希。
+//!
+// TODO(T17): 本文件是仓库最大的生产文件（2210 行，基线 2210，见 baselines.toml）。
+// **只许减不许增**：再往这里加功能会破基线、被 checks/size_gate.py 拦下。
+// 正确做法照 CONVENTIONS.md §9 —— 把「自成一类」的功能整段搬成同级模块
+// （`task_log.rs` / `runtime/requirements.rs` / `cursor_trace.rs` 都是这么搬的），
+// 命令注册仍留在本文件的 `with_commands`。见 docs/todo.md T17。
 
 pub mod calibration;
 pub mod capture_hotkey;
@@ -1810,6 +1816,8 @@ fn window_rect_from_preview(
 /// 所以这里按框重新截一张原始分辨率的窗口画面再裁。
 ///
 /// 这是**只读**操作：只截屏，不点击、不聚焦、不产生任何输入。
+// TODO(T17): 参数过多，应把参数收成一个请求结构体（CONVENTIONS.md §10 要求
+// 「优先改成参数结构体，而不是继续加 allow」）。见 docs/todo.md T17。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn save_icon_from_crop<R: Runtime>(
@@ -1910,6 +1918,7 @@ pub struct IconClickResult {
 ///
 /// `settle_ms` 复用界面上「滚动停稳等待」那个值：等待的物理现象是同一个
 /// （界面动画还没画完），没有理由再立第二个旋钮。
+// TODO(T17): 参数过多，同 `save_icon_from_crop` —— 收成请求结构体，别再加 allow。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn click_icon<R: Runtime>(

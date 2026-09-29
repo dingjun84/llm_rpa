@@ -26,6 +26,59 @@ version = "0.1.0"
 edition = "2021"
 license = "UNLICENSED"
 
+# 集中式 lint 配置（Rust 1.74+ 的 `workspace.lints`）。
+# 为什么放这里而不是散落 `#[allow]`：`CONVENTIONS.md` §10 结尾写着
+# 「本仓库目前没有 CI 门禁，以上命令靠自觉执行」——Lint 是让规矩变成
+# **机器可拦**的第一道闸门。写在这里的规则对全部 crate 生效，
+# 想豁免必须在具体代码处写 `#[allow(...)]` 并说明理由（可被 grep 审计）。
+[workspace.lints.clippy]
+# 参数过多：`CONVENTIONS.md` §10 说「优先改成参数结构体，而不是继续加 allow」。
+# 设成 deny 之后，新代码不能再偷偷加第四个 `#[allow]` 蒙混过去。
+#
+# ⚠️ **各 crate 必须写 `[lints] workspace = true` 才会继承本段**。
+# 2026-09-29 实测踩过：12 个 crate 全缺那一行，导致这里设的 lint 一个都没生效
+# （`sigma-drift` 的 9 参数函数当时只报 warning 而非 error，就是这个原因）。
+#
+# 存量 4 处已各自带 `#[allow(clippy::too_many_arguments)]`，故不会触发 deny：
+#   `automation-core/src/dropdown.rs::trail`、`src-tauri/src/lib.rs` 的
+#   `save_icon_from_crop` / `click_icon`、`sigma-drift/src/lib.rs::generate_with`
+# 它们都已带 `TODO(T17)` 锚点，见 docs/todo.md T17。
+too_many_arguments = "deny"
+
+# ---- 以下全部只是 warn，刻意不设 deny ----
+#
+# 理由：本仓库有 4.6 万行存量代码，而这些 lint 在此前从未开过。
+# 一上来就设 deny 会让 CI 首次运行直接失败，而**长期红灯等于没有 CI**
+# （`CONVENTIONS.md` §10 也提醒过「别一上来就卡函数行数」）。
+# 策略是：先让它们以 warn 出现、看清噪音量级，再逐条决定是否升到 deny。
+
+# 大函数 / 深嵌套：与「生产文件 ≤500 行」同类的规模约束。
+# 已知存量有 `runner/mod.rs::execute`(~271 行) 等，见 CONVENTIONS.md §10。
+too_many_lines = "warn"
+cognitive_complexity = "warn"
+
+# 死代码：`vision/src/template.rs` 的七档金字塔是已知 dead code（已加
+# `#[allow(dead_code)]` + TODO(T17) 锚点）。其余平台层的跨平台端口也会有
+# 「本平台用不到」的符号 —— 那些在 `hid/platform/*.rs` 里是文件级 `#![allow]`。
+dead_code = "warn"
+
+# 真问题，一律拦下（这几条命中即失败，且不太可能被存量代码大量触发）
+dbg_macro = "deny"
+unimplemented = "deny"
+todo = "warn"
+
+# ⚠️ `unwrap_used` 实测后**刻意不开**：2026-09-29 用它在这套代码上跑了一次，
+# 产生 **261 条警告**（存量 `unwrap` 遍布各处），而其中绝大多数是合理的
+# ——本项目的错误处理是 `Result` 一路传上去、只在"程序性不可能失败"处 unwrap。
+# 261 条噪音会把真正要紧的警告（dead_code / too_many_lines）淹掉，
+# 而**被淹没的警告等于没有警告**。等将来某一轮专门清理 unwrap 时再开。
+# unwrap_used = "warn"   # ← 故意留注释，别打开
+
+# 安全相关：`CONVENTIONS.md` §7 定义了 unsafe 的边界。
+# 这里要求每个 unsafe 块必须写 SAFETY 注释，把「边界」从文档变成编译期要求。
+# ⚠️ 先设 warn：平台层（Win32 / IOHID）存量 unsafe 较多，逐个补注释要单独一轮。
+undocumented_unsafe_blocks = "warn"
+
 [workspace.dependencies]
 thiserror = "2.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }

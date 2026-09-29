@@ -349,6 +349,8 @@ fn conclude(
 ///
 /// **它只读上面已经算出来的事实**（分组、标题、命中集合），不再自己判一次——
 /// 判据仍然只有 `judge_dropdown` 那一条。
+// TODO(T17): 参数过多，应把这几个切片收成一个 `TrailInput` 结构体，
+// 而不是继续留着 `#[allow]`（CONVENTIONS.md §10 / §3）。见 docs/todo.md T17。
 #[allow(clippy::too_many_arguments)]
 fn trail(
     boxes: &[TextBox],

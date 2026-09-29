@@ -28,6 +28,9 @@
 //! 数学，并且把"怎么匹配"与"谁来匹配"分开——[`automation_core::IconLocator`]
 //! 是端口，将来真要换成 OpenCV，换的是端口实现，调用方一行都不用动。
 //!
+// TODO(T9): 纯 Rust NCC 实现。若将来要在**整窗**上匹配、或模板/搜索区大一个
+// 数量级，纯 Rust 会退化到秒级，届时换 `IconLocator` 端口的实现。见 docs/todo.md T9。
+//!
 //! ## 性能
 //!
 //! 一次匹配的开销是 `搜索位置数 × 模板像素数 × 通道数`。以默认的导航条
@@ -485,6 +488,11 @@ fn position_score(
 ///
 /// 覆盖 Retina / 轻微 UI 缩放差。档位固定且窄：每档都会完整扫搜索区，
 /// 不是先粗后精的近似。
+///
+// TODO(T17): ⚠️ 这一段目前是 dead code —— `locate` 走的是单尺度，
+// `best_match_pyramid*` 那几个函数不在主路径上。要么接回主路径，
+// 要么连同这一段一起删掉。别照它去算匹配耗时（见 docs/todo.md T17 / T31）。
+#[allow(dead_code)]
 pub const TEMPLATE_SCALE_PYRAMID: &[f32] = &[
     0.85, 0.90, 0.95, 1.0, 1.05, 1.10, 1.15,
 ];
@@ -784,6 +792,11 @@ fn candidate_report(hay: &[Plane], templates: &[IconTemplate]) -> String {
 /// 无状态、无外部依赖：一帧画面进，一个命中位置出。
 /// 之所以做成类型而不是自由函数，是为了满足 [`IconLocator`] 端口——
 /// 调用方（编排层）只认识端口，不认识这个实现。
+///
+// TODO(T31): 这是「单步超时超在哪儿」的头号嫌疑段。开销 = 搜索位置数 ×
+// 模板像素数 × 通道数，所以慢的原因几乎总是「搜索区太大 / 模板太大 /
+// 模板太多 / debug 构建」，**不是阈值**（阈值只决定够不够格，不影响耗时）。
+// 排查见 data/tasks/<ID>/task.log 里的分段耗时。见 docs/todo.md T31。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TemplateLocator;
 
