@@ -1,0 +1,65 @@
+# 换行符与二进制文件的统一约定。
+#
+# 为什么必须有这份文件（多机同步的必然坑）：
+#   本仓库在 Windows / macOS / Linux 多台机器上同步，而本机 git 的
+#   `core.autocrlf = true`（2026-09-29 实测）。它会把文本文件在检出时
+#   转成 CRLF —— 对 Rust / TS 无害，但对**shell 脚本是致命的**：
+#
+#     · `.githooks/pre-commit` 被转成 CRLF 后，在 Linux / macOS 上
+#       `#!/bin/sh` 后面跟着 \r，报 "bad interpreter: No such file or directory"
+#     · `scripts/rust-env.sh` 同理（它是 source 进去的，报错更隐晦）
+#
+#   结果是「在 Windows 上好好的门禁，换台机器全废」。
+#   所以下面把这些文件**钉死为 LF**，无论 checkout 到哪台机器。
+#
+# 判据：凡是**要被 Unix shell 直接执行 / source** 的文件，一律 LF。
+
+# ---------------------------------------------------------------- shell 脚本
+# 注意：本文件**不支持行尾注释** —— `#` 必须独占一行，
+# 写在属性后面会被当成属性名（踩过：`*.cmd text eol=crlf  # 说明` 报
+# "is not a valid attribute name"）。
+*.sh            text eol=lf
+*.bash          text eol=lf
+.githooks/*     text eol=lf
+# Windows 批处理必须是 CRLF，否则 cmd.exe 解析多行 if/goto 会出错
+*.cmd           text eol=crlf
+
+# ---------------------------------------------------------------- 无扩展名的可执行
+# git 认不出它们是脚本，显式标注（`*.sh` 匹配不到它们）
+pre-commit      text eol=lf
+install.sh      text eol=lf
+
+# ---------------------------------------------------------------- 源码与配置
+*.rs            text eol=lf
+*.ts            text eol=lf
+*.tsx           text eol=lf
+*.js            text eol=lf
+*.json          text eol=lf
+*.toml          text eol=lf
+*.md            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.py            text eol=lf
+*.swift         text eol=lf
+
+# ---------------------------------------------------------------- 二进制（禁止任何转换）
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.ico           binary
+*.icns          binary
+*.exe           binary
+*.dll           binary
+*.dylib         binary
+*.so            binary
+*.7z            binary
+*.zip           binary
+*.db            binary
+*.sqlite        binary
+*.pdf           binary
+
+# ---------------------------------------------------------------- 生成物
+# `Cargo.lock` 入库（应用类项目的标准做法），但保持 LF 免得每次 diff 全变
+Cargo.lock      text eol=lf
+.gitattributes  text eol=lf
+.gitignore      text eol=lf

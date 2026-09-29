@@ -1,0 +1,126 @@
+#!/bin/sh
+# pre-commit 门禁：把 AI_RULES.md 里的硬约束变成**提交时就拦下**的检查。
+#
+# 为什么要有它：在这之前，CONVENTIONS.md §10 结尾写着
+# 「本仓库目前没有 CI 门禁，以上命令靠自觉执行」——
+# 而 vibe coding 模式下「自觉」这个前提不成立：AI 没有职业羞耻感，
+# 它只服从上下文里的指令和**会报错的工具**。
+#
+# 启用方式（每个克隆只需一次）：
+#     sh .githooks/install.sh
+#
+# 跳过（仅在确有必要时，比如紧急修复）：
+#     git commit --no-verify
+#
+# 检查项按「快 → 慢」排列，快的先跑，尽量在 3 秒内给出第一波反馈。
+
+set -u
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT" || exit 1
+
+FAILED=0
+RED=''
+YELLOW=''
+RESET=''
+
+# 只在真正的终端里上色
+if [ -t 1 ]; then
+  RED='\033[31m'; YELLOW='\033[33m'; RESET='\033[0m'
+fi
+
+say()  { printf '%s\n' "$1"; }
+fail() { printf '%s\n' "${RED}$1${RESET}"; FAILED=1; }
+warn() { printf '%s\n' "${YELLOW}$1${RESET}"; }
+
+# ---------------------------------------------------------------- 工具探测
+# python 可能叫 python3 也可能叫 python；本机没有 cargo 时跳过 cargo 检查
+PY=""
+for cand in python3 python py; do
+  if command -v "$cand" >/dev/null 2>&1; then PY="$cand"; break; fi
+done
+
+# ---------------- 1. 规模门禁（秒级） ----------------
+if [ -n "$PY" ] && [ -f checks/size_gate.py ]; then
+  if ! "$PY" checks/size_gate.py --quiet; then
+    fail "✗ 规模门禁未通过（见上方清单）。"
+  fi
+else
+  warn "⚠ 跳过规模门禁：找不到 python 或 checks/size_gate.py"
+fi
+
+# ---------------- 2. 架构门禁（秒级） ----------------
+if [ -n "$PY" ] && [ -f checks/arch_gate.py ]; then
+  OUT="$("$PY" checks/arch_gate.py 2>&1)"
+  if [ $? -ne 0 ]; then
+    say "$OUT"
+    fail "✗ 架构门禁未通过（依赖方向 / 分层被破坏）。"
+  fi
+else
+  warn "⚠ 跳过架构门禁：找不到 python 或 checks/arch_gate.py"
+fi
+
+# ---------------- 3. 禁止调试残留（只查本次暂存的内容） ----------------
+DBG_HITS="$(git diff --cached --name-only --diff-filter=ACM \
+  | grep -E '\.(rs|ts|tsx)$' \
+  | while read -r f; do
+      [ -f "$f" ] || continue
+      grep -nE '(^|[^a-zA-Z_])dbg!|console\.log\(' "$f" 2>/dev/null \
+        | sed "s|^|$f:|"
+    done)"
+
+if [ -n "$DBG_HITS" ]; then
+  say "$DBG_HITS"
+  fail "✗ 发现 dbg! / console.log 残留（CONVENTIONS.md §4）。"
+fi
+
+# ---------------- 4. cargo clippy（有工具链才跑，较慢） ----------------
+# 工具链位置**跨机器不同**，所以走 scripts/rust-env.sh 自动发现：
+# 系统 PATH → 本项目 .toolchain/ → 同级目录的 .toolchain/（本机走这条）。
+# 早先这里写的是 `command -v cargo`，在本机（工具链在同级 rpa 项目里）
+# 会**静默跳过** clippy —— 「跳过」和「通过」在输出里长得一样，等于没检查。
+HAS_CARGO=0
+if command -v cargo >/dev/null 2>&1; then
+  HAS_CARGO=1
+elif [ -f scripts/rust-env.sh ]; then
+  # shellcheck disable=SC1091
+  if . scripts/rust-env.sh >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
+    HAS_CARGO=1
+  fi
+fi
+
+if [ "$HAS_CARGO" -eq 1 ]; then
+  # 只在有 .rs 文件进本次提交时才跑，避免纯文档提交白等
+  STAGED_RS="$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)"
+  if [ -n "$STAGED_RS" ]; then
+    say "[hook] 有 Rust 改动，跑 clippy（工具链可用的 crate，可能稍慢）…"
+    # ⚠️ **不能跑 `--workspace`**：Tauri 依赖链里的 `schemars 0.8.22` 会拉进
+    # `indexmap 1.9.3`，而它在 rustc 1.98 下编译失败（E0107，第三方问题，非本项目）。
+    # 全量 clippy 因此恒为红，而**长期红灯等于没有 CI**。
+    # 这里只跑工具链可用的 crate，与 .github/workflows/ci.yml 的排除列表一致。
+    # 顺带排除 desktop 的宿主 Tauri 依赖；platform-windows/macos 是 cfg 特化，
+    # sigma-drift-viz 需要 GL 系统库。
+    if ! CARGO_INCREMENTAL=0 cargo clippy --all-targets --quiet \
+           -p automation-core -p platform-mock -p storage -p vision \
+           -p replay -p sigma-drift -p winocr 2>&1 | tail -30; then
+      fail "✗ clippy 未通过。"
+    fi
+  fi
+else
+  warn "⚠ 没找到 Rust 工具链，跳过 clippy。"
+  warn "  工具链位置见 scripts/rust-env.sh（它会自动找系统 / 本项目 / 同级目录）。"
+  warn "  注意：『跳过』不等于『通过』—— CI 上会跑。"
+fi
+
+# ---------------------------------------------------------------- 结果
+if [ "$FAILED" -ne 0 ]; then
+  say ""
+  fail "════════════════════════════════════════════════════════"
+  fail " 提交被门禁拦下。修好上面标 ✗ 的问题后重新提交。"
+  fail " 规矩的解释见 AI_RULES.md；确需跳过用 git commit --no-verify"
+  fail "════════════════════════════════════════════════════════"
+  exit 1
+fi
+
+say "[hook] ✓ 门禁全部通过"
+exit 0

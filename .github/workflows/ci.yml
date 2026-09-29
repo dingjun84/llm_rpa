@@ -1,0 +1,198 @@
+name: CI
+
+# 为什么要有它：在这之前，`CONVENTIONS.md` §10 结尾写着
+# 「本仓库目前没有 CI 门禁，以上命令靠自觉执行」。
+# 而 vibe coding 下「自觉」不成立 —— 这个 workflow 就是那道自动闸门。
+#
+# 设计原则（按「快 → 慢」分层，早失败早反馈）：
+#   1. `gate`        —— 秒级，纯 Python，不依赖 Rust 工具链。任何 push/PR 都跑。
+#   2. `lint`        —— clippy + fmt，Ubuntu 上跑，几分钟。
+#   3. `test`        —— 全量测试，按平台分。
+#
+# ⚠️ 平台策略：这是个跨平台桌面项目（Win32 + macOS 原语 + Tauri）。
+#   - Ubuntu 上**不能**编译 `platform-windows` 与 `platform-macos` 的
+#     cfg 特化代码，也不能构建 Tauri 桌面二进制（缺 WebKitGTK 之外的原生依赖）。
+#   - 所以：Ubuntu 跑「不依赖平台的 crate」（automation-core / storage / vision /
+#     platform-mock / replay），这两条覆盖了判据与端到端演练的主体；
+#     Windows 与 macOS 各跑一次本平台契约测试。
+#   - 这样既守住了回归防线，又不至于让 CI 因为平台缺件而长期红灯（长期红灯
+#     等于没有 CI —— 这正是要避免的）。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 增量编译在 CI 上净亏（缓存从零开始），且会放大磁盘占用
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ============================================================
+  # 1. 规模 + 架构门禁（秒级；不依赖 Rust 工具链）
+  # ============================================================
+  gate:
+    name: 规模与架构门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 生产文件规模门禁
+        run: python3 checks/size_gate.py
+
+      - name: 依赖方向与分层门禁
+        run: python3 checks/arch_gate.py
+
+      - name: 禁止调试残留（dbg! / console.log）
+        run: |
+          # 只查入库的源文件；命中就失败
+          if grep -rnE '(^|[^a-zA-Z_])dbg!|console\.log\(' \
+               --include='*.rs' --include='*.ts' --include='*.tsx' \
+               crates apps tools 2>/dev/null; then
+            echo "::error::发现 dbg! / console.log 残留（CONVENTIONS.md §4）"
+            exit 1
+          fi
+          echo "没有调试残留"
+
+  # ============================================================
+  # 2. 格式与静态检查
+  # ============================================================
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 只对「能在 Linux 上编译的 crate」跑 —— 见文件头的平台策略说明
+      - name: cargo fmt --check
+        run: |
+          cargo fmt --all -- --check \
+            || { echo "::error::格式不符合 rustfmt。本地跑 cargo fmt --all 修一下。"; exit 1; }
+
+      - name: cargo clippy（可用工具链编译的 crate）
+        run: |
+          # 排除三类：
+          #   platform-windows / platform-macos  cfg 特化，Linux 上编不了
+          #   desktop（Tauri） + sigma-drift-viz（eframe）  原生依赖重
+          # 其余 crate 在 Linux 上都能编。
+          #
+          # ⚠️ 为什么不写 `--workspace`：Tauri 依赖链里的 `schemars 0.8.22`
+          # 会拉进 `indexmap 1.9.3`，它在 rustc 1.98 下编译失败（E0107
+          # "struct takes 3 generic arguments"）。这是**第三方问题**，不是本项目的，
+          # 但会让 `--workspace` 恒为红 —— 而长期红灯等于没有 CI。
+          # 详见 docs/todo.md 与 AI_RULES.md §9。
+          cargo clippy --all-targets --no-deps \
+            -p automation-core -p platform-mock -p storage -p vision \
+            -p replay -p sigma-drift -p winocr 2>&1 | tee clippy.log
+          if grep -q "^error" clippy.log; then
+            echo "::error::clippy 报错（见上方）。注意 workspace.lints 里把"
+            echo "::error::too_many_arguments 设成了 deny —— 优先改成参数结构体，"
+            echo "::error::而不是继续加 #[allow]。"
+            exit 1
+          fi
+          fi
+
+  # ============================================================
+  # 3. 测试（按平台分）
+  # ============================================================
+  test-linux:
+    name: 测试（Linux / 不依赖平台的 crate）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # 这几个 crate 是回归防线的主体：
+      #   automation-core 判据本体 / platform-mock 端到端演练 /
+      #   storage 审计往返 / vision 匹配算法 / replay 离线重放归因
+      # `--no-fail-fast` 不能省，否则首个失败目标会中断整轮（CONVENTIONS.md §10）
+      - name: 全量测试（无平台特化的 crate）
+        run: |
+          cargo test --no-fail-fast \
+            -p automation-core \
+            -p platform-mock \
+            -p storage \
+            -p vision \
+            -p replay \
+            -p sigma-drift
+
+  test-windows:
+    name: 测试（Windows / 平台契约）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # platform-windows 的契约测试里，会真的动鼠标/占热键的用例一律 #[ignore]，
+      # 所以这里跑默认集合是安全的（不带 --ignored）。
+      #
+      # ⚠️ 这里**不跑 `--workspace`**：会拉进 desktop（Tauri），而 Tauri 依赖链
+      # 里的 `schemars 0.8.22` → `indexmap 1.9.3` 在 rustc 1.98 下编译失败
+      # （E0107，第三方问题）。CI 也**不构建 desktop 桌面二进制**
+      # —— 那是 `run.sh` 的活（它在开发机上跑，依赖本机原生环境）。
+      - name: platform-windows 契约测试
+        run: cargo test --no-fail-fast -p platform-windows
+
+      - name: 平台无关 crate（顺带确认 Windows 上也能编过）
+        run: |
+          cargo test --no-fail-fast \
+            -p automation-core -p platform-mock -p vision -p storage -p sigma-drift
+
+  test-macos:
+    name: 测试（macOS / 平台契约）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: platform-macos 契约测试
+        run: cargo test --no-fail-fast -p platform-macos
+
+      - name: 平台无关 crate（顺带确认 macOS 上也能编过）
+        run: |
+          cargo test --no-fail-fast -p automation-core -p platform-mock -p vision -p storage
+
+  # ============================================================
+  # 4. 前端类型检查（Tauri 界面）
+  # ============================================================
+  web:
+    name: 前端类型检查
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci --no-fund --no-audit
+
+      # `types.ts` 是 Rust 侧 serde 结构的**手抄镜像**（见 code-map.md §3.7），
+      # 类型检查是唯一能发现两边漂移的手段。构建本身留给 run.sh（需要 Tauri 原生依赖）。
+      - name: tsc 类型检查
+        run: npx tsc --noEmit
