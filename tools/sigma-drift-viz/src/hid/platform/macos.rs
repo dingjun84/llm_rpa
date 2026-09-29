@@ -383,10 +383,7 @@ impl HidSession {
                 stop_flag.store(true, Ordering::SeqCst);
                 stop_run_loop(&run_loop_slot);
                 let _ = join.join();
-                Err(
-                    "HID: IOHIDManager open timed out (check Input Monitoring permission)"
-                        .into(),
-                )
+                Err("HID: IOHIDManager open timed out (check Input Monitoring permission)".into())
             }
         }
     }

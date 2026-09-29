@@ -1,0 +1,17 @@
+[package]
+name = "ghostbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GhostBox (幽灵盒子) SDK binding + HID relative-sequence replay"
+
+[lints]
+workspace = true
+
+[dependencies]
+libloading = "0.8"
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

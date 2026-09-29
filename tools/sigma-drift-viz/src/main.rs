@@ -4,6 +4,8 @@
 //! speed-encoded colors, exposes Config knobs, shows metrics, and can overlay
 //! a WindMouse comparison path. Second tab records real mouse trajectories.
 
+mod gb_replay;
+mod gb_selftest;
 mod hid;
 
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
@@ -11,6 +13,7 @@ use hid::{backend_label, HidEvent, HidSession};
 use serde::{Deserialize, Serialize};
 use sigma_drift::{compute_metrics, windmouse, Config, Metrics, TrajectoryPoint};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn main() -> eframe::Result<()> {
@@ -35,7 +38,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Install a macOS system font so egui can render Chinese labels instead of tofu.
+/// Install a system CJK font so egui can render Chinese labels instead of tofu.
 ///
 /// The font is inserted first in both proportional and monospace families, so it
 /// also acts as a fallback for the ASCII/numeric UI text. If no known system font
@@ -45,9 +48,16 @@ fn install_cjk_font(ctx: &egui::Context) -> bool {
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+        r"C:\Windows\Fonts\msyhbd.ttc",
     ];
 
-    let Some(path) = FONT_PATHS.iter().find(|path| std::path::Path::new(path).is_file())
+    let Some(path) = FONT_PATHS
+        .iter()
+        .find(|path| std::path::Path::new(path).is_file())
     else {
         eprintln!("No CJK system font found; using ASCII labels where needed");
         return false;
@@ -59,9 +69,10 @@ fn install_cjk_font(ctx: &egui::Context) -> bool {
     };
 
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("macos_cjk".to_owned(), egui::FontData::from_owned(bytes).into());
+    fonts.font_data.insert(
+        "macos_cjk".to_owned(),
+        egui::FontData::from_owned(bytes).into(),
+    );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         if let Some(fonts_for_family) = fonts.families.get_mut(&family) {
             fonts_for_family.push("macos_cjk".to_owned());
@@ -93,11 +104,7 @@ fn segment_speeds(path: &[TrajectoryPoint]) -> Vec<f64> {
         let dx = path[i].x - path[i - 1].x;
         let dy = path[i].y - path[i - 1].y;
         let dt = path[i].t - path[i - 1].t;
-        speeds[i] = if dt > 0.0 {
-            dx.hypot(dy) / dt
-        } else {
-            0.0
-        };
+        speeds[i] = if dt > 0.0 { dx.hypot(dy) / dt } else { 0.0 };
     }
     if path.len() > 1 {
         speeds[0] = speeds[1];
@@ -111,11 +118,7 @@ fn recorded_speeds(points: &[RecordedPoint]) -> Vec<f64> {
         let dx = points[i].x - points[i - 1].x;
         let dy = points[i].y - points[i - 1].y;
         let dt = points[i].t_ms - points[i - 1].t_ms;
-        speeds[i] = if dt > 0.0 {
-            dx.hypot(dy) / dt
-        } else {
-            0.0
-        };
+        speeds[i] = if dt > 0.0 { dx.hypot(dy) / dt } else { 0.0 };
     }
     if points.len() > 1 {
         speeds[0] = speeds[1];
@@ -128,7 +131,9 @@ fn peak_speed(speeds: &[f64]) -> f64 {
 }
 
 fn history_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data").join("history.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("data")
+        .join("history.json")
 }
 
 fn now_local_stamp() -> String {
@@ -169,7 +174,11 @@ struct RecordedPoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum RecordedEvent {
-    Move { x: f64, y: f64, t_ms: f64 },
+    Move {
+        x: f64,
+        y: f64,
+        t_ms: f64,
+    },
     Click {
         x: f64,
         y: f64,
@@ -177,7 +186,6 @@ enum RecordedEvent {
         button: String,
     },
 }
-
 
 #[derive(Clone, Debug)]
 struct ClickEndpoint {
@@ -223,6 +231,7 @@ impl Recording {
 enum AppTab {
     Generate,
     Record,
+    GhostBox,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -306,6 +315,14 @@ struct VizApp {
     rec_hid_status: String,
     /// Whether a CJK-capable system font was installed into egui.
     cjk_font_loaded: bool,
+    /// GhostBox replay: snap to recording end via MoveMouseTo after relative path.
+    gb_snap_final: bool,
+    /// GhostBox replay: skip per-step timeline waits (coalesced relative still emitted).
+    gb_fast: bool,
+    /// Background GhostBox HID replay status (shared with worker thread).
+    gb_replay: Arc<Mutex<gb_replay::GbReplayShared>>,
+    /// Background GhostBox absolute-move self-test status.
+    gb_selftest: Arc<Mutex<gb_selftest::GbSelfTestShared>>,
 }
 
 impl Default for VizApp {
@@ -362,6 +379,10 @@ impl Default for VizApp {
             hid_session: None,
             rec_hid_status: format!("{} — idle", backend_label()),
             cjk_font_loaded: false,
+            gb_snap_final: true,
+            gb_fast: true,
+            gb_replay: Arc::new(Mutex::new(gb_replay::GbReplayShared::default())),
+            gb_selftest: Arc::new(Mutex::new(gb_selftest::GbSelfTestShared::default())),
         };
         app.regenerate();
         app.load_history();
@@ -392,7 +413,8 @@ impl VizApp {
             return;
         }
 
-        self.sigma_path = sigma_drift::generate(self.x0, self.y0, self.x1, self.y1, &self.cfg, seed);
+        self.sigma_path =
+            sigma_drift::generate(self.x0, self.y0, self.x1, self.y1, &self.cfg, seed);
         self.sigma_speeds = segment_speeds(&self.sigma_path);
 
         if self.show_windmouse {
@@ -418,7 +440,8 @@ impl VizApp {
         self.status = format!(
             "Generated {} SigmaDrift points (seed={}).",
             self.sigma_path.len(),
-            seed.map(|s| s.to_string()).unwrap_or_else(|| "entropy".into())
+            seed.map(|s| s.to_string())
+                .unwrap_or_else(|| "entropy".into())
         );
     }
 
@@ -562,8 +585,7 @@ impl VizApp {
                     self.rec_id_counter = list
                         .iter()
                         .filter_map(|r| {
-                            r.id
-                                .strip_prefix("rec_")
+                            r.id.strip_prefix("rec_")
                                 .and_then(|s| s.parse::<u64>().ok())
                         })
                         .max()
@@ -788,6 +810,54 @@ impl VizApp {
         self.rec_status = "Playing back…".into();
     }
 
+    fn start_ghostbox_replay(&mut self) {
+        let Some(rec) = self.rec_current.as_ref() else {
+            self.rec_status = if self.cjk_font_loaded {
+                "没有可回放的录制 — 请先录制或从历史选择。".into()
+            } else {
+                "Nothing to replay — record or select from history.".into()
+            };
+            return;
+        };
+        if rec.hid_events.is_empty() {
+            self.rec_status = if self.cjk_font_loaded {
+                "hid_events 为空 — GhostBox 回放需要 Raw Input 录制的相对轨迹。".into()
+            } else {
+                "hid_events empty — GhostBox replay needs Raw Input relative samples.".into()
+            };
+            return;
+        }
+
+        {
+            let g = self.gb_replay.lock().unwrap_or_else(|e| e.into_inner());
+            if g.busy {
+                self.rec_status = g.status.clone();
+                return;
+            }
+        }
+
+        // Stop pixel animation so canvas isn't competing for attention.
+        self.rec_animating = false;
+        self.rec_anim_wall_start = None;
+
+        let snap = self.gb_snap_final;
+        let fast = self.gb_fast;
+        let n = rec.hid_events.len();
+        gb_replay::spawn_hid_replay(
+            rec.hid_events.clone(),
+            rec.start,
+            rec.end,
+            snap,
+            fast,
+            Arc::clone(&self.gb_replay),
+        );
+        self.rec_status = if self.cjk_font_loaded {
+            format!("幽灵盒回放已启动（{n} 个 HID 步，snap_final={snap}，fast={fast}）…")
+        } else {
+            format!("GhostBox replay started ({n} HID steps, snap_final={snap}, fast={fast})…")
+        };
+    }
+
     fn rec_visible_count(&self) -> usize {
         let n = self
             .rec_current
@@ -831,7 +901,10 @@ impl VizApp {
     }
 
     fn world_to_canvas(canvas: Rect, world: [f64; 2]) -> Pos2 {
-        Pos2::new(canvas.min.x + world[0] as f32, canvas.min.y + world[1] as f32)
+        Pos2::new(
+            canvas.min.x + world[0] as f32,
+            canvas.min.y + world[1] as f32,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -878,7 +951,10 @@ impl VizApp {
             let peak_w = peak_speed(&self.wind_speeds);
             for i in 1..self.wind_path.len() {
                 let a = self.world_to_screen(
-                    Pos2::new(self.wind_path[i - 1].x as f32, self.wind_path[i - 1].y as f32),
+                    Pos2::new(
+                        self.wind_path[i - 1].x as f32,
+                        self.wind_path[i - 1].y as f32,
+                    ),
                     bounds,
                     canvas,
                 );
@@ -898,7 +974,10 @@ impl VizApp {
         if n >= 2 {
             for i in 1..n {
                 let a = self.world_to_screen(
-                    Pos2::new(self.sigma_path[i - 1].x as f32, self.sigma_path[i - 1].y as f32),
+                    Pos2::new(
+                        self.sigma_path[i - 1].x as f32,
+                        self.sigma_path[i - 1].y as f32,
+                    ),
                     bounds,
                     canvas,
                 );
@@ -927,9 +1006,17 @@ impl VizApp {
         if self.show_start_end {
             let s = self.world_to_screen(Pos2::new(self.x0 as f32, self.y0 as f32), bounds, canvas);
             let e = self.world_to_screen(Pos2::new(self.x1 as f32, self.y1 as f32), bounds, canvas);
-            painter.circle_stroke(s, 7.0, Stroke::new(2.0_f32, Color32::from_rgb(80, 220, 120)));
+            painter.circle_stroke(
+                s,
+                7.0,
+                Stroke::new(2.0_f32, Color32::from_rgb(80, 220, 120)),
+            );
             painter.circle_filled(s, 3.0, Color32::from_rgb(80, 220, 120));
-            painter.circle_stroke(e, 7.0, Stroke::new(2.0_f32, Color32::from_rgb(255, 100, 100)));
+            painter.circle_stroke(
+                e,
+                7.0,
+                Stroke::new(2.0_f32, Color32::from_rgb(255, 100, 100)),
+            );
             painter.circle_filled(e, 3.0, Color32::from_rgb(255, 100, 100));
             painter.line_segment(
                 [s, e],
@@ -974,7 +1061,11 @@ impl VizApp {
             let lh = canvas.height();
             let pw = lw * ppp;
             let ph = lh * ppp;
-            let mode = if self.fit_path_to_canvas { "fit" } else { "1:1" };
+            let mode = if self.fit_path_to_canvas {
+                "fit"
+            } else {
+                "1:1"
+            };
             let label = format!(
                 "{:.0}×{:.0} pt · {:.0}×{:.0} px @{:.1}  [{mode}]",
                 lw, lh, pw, ph, ppp
@@ -1063,15 +1154,45 @@ impl VizApp {
 
         ui.separator();
         ui.heading("Primary / reach");
-        slider_f64(ui, "undershoot_min", &mut self.cfg.undershoot_min, 0.5..=1.0);
-        slider_f64(ui, "undershoot_max", &mut self.cfg.undershoot_max, 0.5..=1.05);
-        slider_f64(ui, "peak_time_ratio", &mut self.cfg.peak_time_ratio, 0.1..=0.7);
-        slider_f64(ui, "primary_sigma_min", &mut self.cfg.primary_sigma_min, 0.05..=0.5);
-        slider_f64(ui, "primary_sigma_max", &mut self.cfg.primary_sigma_max, 0.05..=0.6);
+        slider_f64(
+            ui,
+            "undershoot_min",
+            &mut self.cfg.undershoot_min,
+            0.5..=1.0,
+        );
+        slider_f64(
+            ui,
+            "undershoot_max",
+            &mut self.cfg.undershoot_max,
+            0.5..=1.05,
+        );
+        slider_f64(
+            ui,
+            "peak_time_ratio",
+            &mut self.cfg.peak_time_ratio,
+            0.1..=0.7,
+        );
+        slider_f64(
+            ui,
+            "primary_sigma_min",
+            &mut self.cfg.primary_sigma_min,
+            0.05..=0.5,
+        );
+        slider_f64(
+            ui,
+            "primary_sigma_max",
+            &mut self.cfg.primary_sigma_max,
+            0.05..=0.6,
+        );
 
         ui.separator();
         ui.heading("Corrections");
-        slider_f64(ui, "overshoot_prob", &mut self.cfg.overshoot_prob, 0.0..=1.0);
+        slider_f64(
+            ui,
+            "overshoot_prob",
+            &mut self.cfg.overshoot_prob,
+            0.0..=1.0,
+        );
         slider_f64(ui, "overshoot_min", &mut self.cfg.overshoot_min, 1.0..=1.3);
         slider_f64(ui, "overshoot_max", &mut self.cfg.overshoot_max, 1.0..=1.4);
         slider_f64(
@@ -1095,18 +1216,48 @@ impl VizApp {
 
         ui.separator();
         ui.heading("Curvature / OU / tremor");
-        slider_f64(ui, "curvature_scale", &mut self.cfg.curvature_scale, 0.0..=0.15);
+        slider_f64(
+            ui,
+            "curvature_scale",
+            &mut self.cfg.curvature_scale,
+            0.0..=0.15,
+        );
         slider_f64(ui, "ou_theta", &mut self.cfg.ou_theta, 0.1..=15.0);
         slider_f64(ui, "ou_sigma", &mut self.cfg.ou_sigma, 0.0..=8.0);
-        slider_f64(ui, "tremor_freq_min", &mut self.cfg.tremor_freq_min, 1.0..=20.0);
-        slider_f64(ui, "tremor_freq_max", &mut self.cfg.tremor_freq_max, 1.0..=25.0);
-        slider_f64(ui, "tremor_amp_min", &mut self.cfg.tremor_amp_min, 0.0..=3.0);
-        slider_f64(ui, "tremor_amp_max", &mut self.cfg.tremor_amp_max, 0.0..=5.0);
+        slider_f64(
+            ui,
+            "tremor_freq_min",
+            &mut self.cfg.tremor_freq_min,
+            1.0..=20.0,
+        );
+        slider_f64(
+            ui,
+            "tremor_freq_max",
+            &mut self.cfg.tremor_freq_max,
+            1.0..=25.0,
+        );
+        slider_f64(
+            ui,
+            "tremor_amp_min",
+            &mut self.cfg.tremor_amp_min,
+            0.0..=3.0,
+        );
+        slider_f64(
+            ui,
+            "tremor_amp_max",
+            &mut self.cfg.tremor_amp_max,
+            0.0..=5.0,
+        );
         slider_f64(ui, "sdn_k", &mut self.cfg.sdn_k, 0.0..=0.3);
 
         ui.separator();
         ui.heading("Sampling");
-        slider_f64(ui, "sample_dt_mean", &mut self.cfg.sample_dt_mean, 1.0..=30.0);
+        slider_f64(
+            ui,
+            "sample_dt_mean",
+            &mut self.cfg.sample_dt_mean,
+            1.0..=30.0,
+        );
         slider_f64(ui, "gamma_shape", &mut self.cfg.gamma_shape, 0.5..=12.0);
 
         ui.separator();
@@ -1157,9 +1308,7 @@ impl VizApp {
 
         if self.show_windmouse && !self.wind_path.is_empty() {
             ui.separator();
-            ui.label(
-                RichText::new(format!("WindMouse samples: {}", self.wind_path.len())).weak(),
-            );
+            ui.label(RichText::new(format!("WindMouse samples: {}", self.wind_path.len())).weak());
         }
     }
 
@@ -1208,7 +1357,10 @@ impl VizApp {
 
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!recording, egui::Button::new(RichText::new("Start").strong()))
+                .add_enabled(
+                    !recording,
+                    egui::Button::new(RichText::new("Start").strong()),
+                )
                 .on_hover_text("Begin recording pointer samples")
                 .clicked()
             {
@@ -1249,6 +1401,58 @@ impl VizApp {
                 self.rec_status = "Playback stopped.".into();
             }
         });
+
+        // GhostBox hardware HID relative replay (Raw Input hid_events → MoveMouseRelative).
+        let hid_n = self
+            .rec_current
+            .as_ref()
+            .map(|r| r.hid_events.len())
+            .unwrap_or(0);
+        let gb_busy = self.gb_replay.lock().map(|g| g.busy).unwrap_or(false);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.gb_snap_final, "snap_final");
+            ui.checkbox(&mut self.gb_fast, "fast")
+                .on_hover_text("Skip per-step timeline waits; still emit coalesced relative motion.");
+            #[cfg(windows)]
+            {
+                let enabled = hid_n > 0 && !gb_busy;
+                let label = gb_replay::button_label(self.cjk_font_loaded);
+                let resp = ui
+                    .add_enabled(enabled, egui::Button::new(label))
+                    .on_hover_text(gb_replay::disabled_hint(self.cjk_font_loaded));
+                if resp.clicked() {
+                    self.start_ghostbox_replay();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let label = gb_replay::button_label(self.cjk_font_loaded);
+                ui.add_enabled(false, egui::Button::new(label))
+                    .on_hover_text("GhostBox replay is Windows-only (gbilmd64.dll).");
+            }
+        });
+        {
+            let gb_status = self
+                .gb_replay
+                .lock()
+                .map(|g| g.status.clone())
+                .unwrap_or_default();
+            if !gb_status.is_empty() {
+                ui.label(RichText::new(&gb_status).small());
+            }
+            #[cfg(not(windows))]
+            {
+                ui.label(
+                    RichText::new("GhostBox HID replay: disabled on this OS (Windows-only).")
+                        .small()
+                        .weak(),
+                );
+            }
+        }
+        if gb_busy {
+            // Keep egui responsive / status refreshing while worker runs.
+            ui.ctx().request_repaint();
+        }
 
         ui.separator();
         ui.heading("History");
@@ -1319,27 +1523,26 @@ impl VizApp {
     }
 
     /// Start/end click endpoints for the current recording (Click events, else markers).
-    fn rec_click_endpoints(
-        &self,
-    ) -> Option<(ClickEndpoint, ClickEndpoint)> {
+    fn rec_click_endpoints(&self) -> Option<(ClickEndpoint, ClickEndpoint)> {
         let rec = self.rec_current.as_ref()?;
         let clicks: Vec<(f64, f64, f64, String)> = rec
             .events
             .iter()
             .filter_map(|e| match e {
-                RecordedEvent::Click {
-                    x,
-                    y,
-                    t_ms,
-                    button,
-                } => Some((*x, *y, *t_ms, button.clone())),
+                RecordedEvent::Click { x, y, t_ms, button } => {
+                    Some((*x, *y, *t_ms, button.clone()))
+                }
                 _ => None,
             })
             .collect();
 
         let start = if let Some((x, y, t_ms, button)) = clicks.first() {
             ClickEndpoint {
-                label: if self.cjk_font_loaded { "开始点击" } else { "Start click" },
+                label: if self.cjk_font_loaded {
+                    "开始点击"
+                } else {
+                    "Start click"
+                },
                 x: *x,
                 y: *y,
                 t_ms: *t_ms,
@@ -1349,7 +1552,11 @@ impl VizApp {
         } else {
             let t_ms = rec.points.first().map(|p| p.t_ms).unwrap_or(0.0);
             ClickEndpoint {
-                label: if self.cjk_font_loaded { "开始点击" } else { "Start click" },
+                label: if self.cjk_font_loaded {
+                    "开始点击"
+                } else {
+                    "Start click"
+                },
                 x: rec.start[0],
                 y: rec.start[1],
                 t_ms,
@@ -1361,7 +1568,11 @@ impl VizApp {
         let end = if clicks.len() >= 2 {
             let (x, y, t_ms, button) = &clicks[clicks.len() - 1];
             ClickEndpoint {
-                label: if self.cjk_font_loaded { "结束点击" } else { "End click" },
+                label: if self.cjk_font_loaded {
+                    "结束点击"
+                } else {
+                    "End click"
+                },
                 x: *x,
                 y: *y,
                 t_ms: *t_ms,
@@ -1372,7 +1583,11 @@ impl VizApp {
             // Single recorded click = start; end falls back to marker.
             let t_ms = rec.points.last().map(|p| p.t_ms).unwrap_or(start.t_ms);
             ClickEndpoint {
-                label: if self.cjk_font_loaded { "结束点击" } else { "End click" },
+                label: if self.cjk_font_loaded {
+                    "结束点击"
+                } else {
+                    "End click"
+                },
                 x: rec.end[0],
                 y: rec.end[1],
                 t_ms,
@@ -1382,7 +1597,11 @@ impl VizApp {
         } else {
             let t_ms = rec.points.last().map(|p| p.t_ms).unwrap_or(0.0);
             ClickEndpoint {
-                label: if self.cjk_font_loaded { "结束点击" } else { "End click" },
+                label: if self.cjk_font_loaded {
+                    "结束点击"
+                } else {
+                    "End click"
+                },
                 x: rec.end[0],
                 y: rec.end[1],
                 t_ms,
@@ -1397,7 +1616,11 @@ impl VizApp {
     /// Scrollable segment table + start/end click info (left-bottom, under history).
     fn record_segment_panel(&self, ui: &mut egui::Ui) {
         ui.separator();
-        ui.heading(if self.cjk_font_loaded { "段详情" } else { "Segment details" });
+        ui.heading(if self.cjk_font_loaded {
+            "段详情"
+        } else {
+            "Segment details"
+        });
 
         let Some(rec) = self.rec_current.as_ref() else {
             ui.label(
@@ -1406,18 +1629,29 @@ impl VizApp {
                 } else {
                     "Select a recording (or finish one) to view segment details."
                 })
-                    .weak()
-                    .small(),
+                .weak()
+                .small(),
             );
             return;
         };
 
         // ---- Start / end click info ----
-        ui.label(RichText::new(if self.cjk_font_loaded { "点击端点" } else { "Click endpoints" }).strong());
+        ui.label(
+            RichText::new(if self.cjk_font_loaded {
+                "点击端点"
+            } else {
+                "Click endpoints"
+            })
+            .strong(),
+        );
         if let Some((start, end)) = self.rec_click_endpoints() {
             for ep in [&start, &end] {
                 let src = if ep.from_marker {
-                    if self.cjk_font_loaded { "标记" } else { "marker" }
+                    if self.cjk_font_loaded {
+                        "标记"
+                    } else {
+                        "marker"
+                    }
                 } else if self.cjk_font_loaded {
                     "点击事件"
                 } else {
@@ -1436,7 +1670,14 @@ impl VizApp {
         }
 
         ui.add_space(4.0);
-        ui.label(RichText::new(if self.cjk_font_loaded { "HID 采样" } else { "HID samples" }).strong());
+        ui.label(
+            RichText::new(if self.cjk_font_loaded {
+                "HID 采样"
+            } else {
+                "HID samples"
+            })
+            .strong(),
+        );
         if rec.hid_events.is_empty() {
             ui.label(
                 RichText::new(if self.cjk_font_loaded {
@@ -1444,14 +1685,18 @@ impl VizApp {
                 } else {
                     "No HID samples (not captured, permission denied, or backend unavailable)"
                 })
-                    .weak()
-                    .small(),
+                .weak()
+                .small(),
             );
         } else {
             let hid_summary = if self.cjk_font_loaded {
                 format!("已保存 {} 条 · {}", rec.hid_events.len(), backend_label())
             } else {
-                format!("Saved {} samples · {}", rec.hid_events.len(), backend_label())
+                format!(
+                    "Saved {} samples · {}",
+                    rec.hid_events.len(),
+                    backend_label()
+                )
             };
             ui.label(RichText::new(hid_summary).small());
             egui::ScrollArea::vertical()
@@ -1514,7 +1759,15 @@ impl VizApp {
                         ui.end_row();
 
                         if rec.points.len() < 2 {
-                            ui.label(RichText::new(if self.cjk_font_loaded { "无段（点数 < 2）" } else { "No segments (fewer than 2 points)" }).weak().small());
+                            ui.label(
+                                RichText::new(if self.cjk_font_loaded {
+                                    "无段（点数 < 2）"
+                                } else {
+                                    "No segments (fewer than 2 points)"
+                                })
+                                .weak()
+                                .small(),
+                            );
                             ui.end_row();
                             return;
                         }
@@ -1534,10 +1787,8 @@ impl VizApp {
             });
     }
 
-
     fn draw_record_canvas(&mut self, ui: &mut egui::Ui) {
-        let (response, painter) =
-            ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let canvas = response.rect;
         self.rec_last_canvas = canvas;
         self.last_canvas_size = canvas.size();
@@ -1757,7 +2008,11 @@ impl VizApp {
             painter.text(
                 Pos2::new(canvas.min.x + 12.0, canvas.min.y + 10.0),
                 egui::Align2::LEFT_TOP,
-                format!("● REC  {:.0} ms  {} samples", self.rec_elapsed_ms(), points.len()),
+                format!(
+                    "● REC  {:.0} ms  {} samples",
+                    self.rec_elapsed_ms(),
+                    points.len()
+                ),
                 egui::FontId::monospace(14.0),
                 Color32::from_rgb(255, 70, 70),
             );
@@ -1865,7 +2120,12 @@ impl VizApp {
     }
 }
 
-fn slider_f64(ui: &mut egui::Ui, label: &str, value: &mut f64, range: std::ops::RangeInclusive<f64>) {
+fn slider_f64(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+) {
     ui.horizontal(|ui| {
         ui.set_min_width(160.0);
         ui.label(label);
@@ -1884,6 +2144,74 @@ fn metric_row(ui: &mut egui::Ui, name: &str, value: String) {
     ui.end_row();
 }
 
+impl VizApp {
+    fn ghostbox_selftest_panel(&mut self, ui: &mut egui::Ui) {
+        let (busy, status) = self
+            .gb_selftest
+            .lock()
+            .map(|state| (state.busy, state.status.clone()))
+            .unwrap_or_else(|poisoned| {
+                let state = poisoned.into_inner();
+                (state.busy, state.status.clone())
+            });
+        ui.heading(if self.cjk_font_loaded {
+            "GhostBox / 幽灵盒自检"
+        } else {
+            "GhostBox self-test"
+        });
+        ui.label(if self.cjk_font_loaded {
+            "确认 MoveMouseTo 与 GetMouseX/GetMouseY 可用。"
+        } else {
+            "Confirm MoveMouseTo with three absolute screen moves."
+        });
+        ui.add_space(8.0);
+        let button_label = if self.cjk_font_loaded {
+            "随机移到 3 点"
+        } else {
+            "Move to 3 random points"
+        };
+        if ui
+            .add_enabled(!busy, egui::Button::new(button_label))
+            .clicked()
+        {
+            gb_selftest::spawn_self_test(Arc::clone(&self.gb_selftest));
+        }
+        let reset_label = if self.cjk_font_loaded {
+            "复位 / Reset"
+        } else {
+            "Reset"
+        };
+        // Intentionally not gated by `busy`: this is the escape hatch for a stuck worker.
+        if ui
+            .button(reset_label)
+            .on_hover_text("Clear busy state and call CloseDevice (best effort)")
+            .clicked()
+        {
+            gb_selftest::reset_self_test(Arc::clone(&self.gb_selftest));
+        }
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(if self.cjk_font_loaded {
+                "状态："
+            } else {
+                "Status:"
+            })
+            .strong(),
+        );
+        ui.label(if status.is_empty() {
+            if self.cjk_font_loaded {
+                "尚未运行。"
+            } else {
+                "Not run yet."
+            }
+        } else {
+            &status
+        });
+        if busy {
+            ui.ctx().request_repaint();
+        }
+    }
+}
 impl eframe::App for VizApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Generate animation tick
@@ -1905,6 +2233,23 @@ impl eframe::App for VizApp {
 
         if self.tab == AppTab::Record {
             self.tick_rec_animation(ctx);
+            // Sync GhostBox worker status into the Record status line.
+            if let Ok(mut g) = self.gb_replay.lock() {
+                if !g.status.is_empty() {
+                    self.rec_status = g.status.clone();
+                    // Clear terminal messages after one sync so we don't stomp later UI status.
+                    if !g.busy
+                        && (g.status.starts_with("GhostBox done:")
+                            || g.status.starts_with("GhostBox error:")
+                            || g.status.contains("Windows-only"))
+                    {
+                        g.status.clear();
+                    }
+                }
+                if g.busy {
+                    ctx.request_repaint();
+                }
+            }
         }
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
@@ -1913,6 +2258,15 @@ impl eframe::App for VizApp {
                 ui.separator();
                 ui.selectable_value(&mut self.tab, AppTab::Generate, "Generate");
                 ui.selectable_value(&mut self.tab, AppTab::Record, "Record");
+                ui.selectable_value(
+                    &mut self.tab,
+                    AppTab::GhostBox,
+                    if self.cjk_font_loaded {
+                        "幽灵盒自检"
+                    } else {
+                        "GhostBox"
+                    },
+                );
             });
         });
 
@@ -1980,6 +2334,11 @@ impl eframe::App for VizApp {
 
                 egui::CentralPanel::default().show(ctx, |ui| {
                     self.draw_record_canvas(ui);
+                });
+            }
+            AppTab::GhostBox => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.ghostbox_selftest_panel(ui);
                 });
             }
         }

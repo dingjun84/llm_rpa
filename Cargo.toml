@@ -18,6 +18,9 @@ members = [
   "tools/replay",
   # SigmaDrift 轨迹可视化：eframe/egui 桌面端（Mac 先跑通，Win10 可复用）。
   "tools/sigma-drift-viz",
+  # GhostBox hardware HID replay: crates/ghostbox + tools/ghostbox-play (gbilmd64.dll).
+  "crates/ghostbox",
+  "tools/ghostbox-play",
 ]
 resolver = "2"
 

@@ -24,5 +24,10 @@ rfd = "0.15"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# GhostBox in-process HID relative replay (Windows DLL; crate itself is cfg-light).
+# Always depend so Mac builds still compile the module stubs; DLL calls are
+# behind `cfg(windows)` in `gb_replay.rs`.
+ghostbox = { path = "../../crates/ghostbox" }
+
 # HID: macOS IOKit FFI (platform/macos.rs); Windows Raw Input + message-only
 # HWND (platform/windows.rs). No extra crates — thin system FFI only.

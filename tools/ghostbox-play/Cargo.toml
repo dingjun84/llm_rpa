@@ -1,0 +1,19 @@
+[package]
+name = "ghostbox-play"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI: replay HID mouse sequences via GhostBox gbilmd64.dll"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ghostbox-play"
+path = "src/main.rs"
+
+[dependencies]
+ghostbox = { path = "../../crates/ghostbox" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,12 @@
+{
+  "final_pos": null,
+  "snap_final": true,
+  "steps": [
+    { "t_ms": 0, "dx": 1, "dy": 0, "buttons": 0 },
+    { "t_ms": 16, "dx": 2, "dy": 1, "buttons": 0 },
+    { "t_ms": 32, "dx": 1, "dy": 1, "buttons": 0 },
+    { "t_ms": 48, "dx": -1, "dy": 0, "buttons": 0 },
+    { "t_ms": 64, "dx": -2, "dy": -1, "buttons": 0 },
+    { "t_ms": 80, "dx": -1, "dy": -1, "buttons": 0 }
+  ]
+}
