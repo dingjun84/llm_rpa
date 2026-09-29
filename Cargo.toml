@@ -6,6 +6,7 @@ members = [
   "crates/platform-macos",
   "crates/storage",
   "crates/vision",
+  "crates/sigma-drift",
   "apps/desktop/src-tauri",
   # 独立的 WebView 渲染探针：只用来判断"界面出不来"是环境问题还是主应用前端栈的问题。
   # 与主应用没有任何代码依赖，删掉它（连同这一行）不影响主应用。
@@ -15,6 +16,8 @@ members = [
   # 离线重放：拿 `data/tasks/<id>/events.jsonl` 里记下的那一帧重跑判据，
   # 回答「它为什么这么判」（见 `docs/todo.md` T29）。
   "tools/replay",
+  # SigmaDrift 轨迹可视化：eframe/egui 桌面端（Mac 先跑通，Win10 可复用）。
+  "tools/sigma-drift-viz",
 ]
 resolver = "2"
 

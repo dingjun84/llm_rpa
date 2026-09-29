@@ -1,0 +1,21 @@
+[package]
+name = "sigma-drift-viz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mac-first (Win-ready) eframe/egui trajectory visualizer for sigma-drift"
+
+[[bin]]
+name = "sigma-drift-viz"
+path = "src/main.rs"
+
+[dependencies]
+sigma-drift = { path = "../../crates/sigma-drift" }
+eframe = { version = "0.31", default-features = true, features = ["default_fonts", "glow"] }
+egui = "0.31"
+rfd = "0.15"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HID: macOS IOKit FFI (platform/macos.rs); Windows Raw Input + message-only
+# HWND (platform/windows.rs). No extra crates — thin system FFI only.
