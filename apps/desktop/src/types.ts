@@ -658,6 +658,11 @@ export interface CircleTraceView {
    * 都是拍脑袋，且没有任何自动判据依赖它。
    */
   end_distance_px: number;
+  /**
+   * 后端摘要（Windows 上说明幽灵盒会话 / 步数等）。
+   * 逐步 MoveMouseTo 细节在 `%TEMP%\ghostbox-replay.log`。
+   */
+  notice: string;
 }
 
 /** 按显示器缩放保存的一份完整界面标定。 */

@@ -17,7 +17,7 @@ pub const OPEN_DEVICE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Append a timestamped GhostBox replay diagnostic to temp and exe-dir logs.
 ///
 /// Logging is best-effort and deliberately does not affect device operations.
-pub(crate) fn append_replay_log(line: &str) {
+pub fn append_replay_log(line: &str) {
     let mut paths = vec![std::env::temp_dir().join("ghostbox-replay.log")];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

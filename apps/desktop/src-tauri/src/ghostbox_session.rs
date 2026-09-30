@@ -60,13 +60,41 @@ pub fn ghostbox_reset_device() -> Result<GhostboxResetResult, String> {
 
 #[cfg(windows)]
 fn move_to_windows(x: i32, y: i32) -> Result<GhostboxMoveResult, String> {
-    let dll = resolve_dll(None)?;
+    ghostbox::append_replay_log(&format!("ghostbox_move_to: start target=({x}, {y})"));
+    let dll = match resolve_dll(None) {
+        Ok(path) => path,
+        Err(err) => {
+            ghostbox::append_replay_log(&format!("ghostbox_move_to: resolve_dll fail: {err}"));
+            return Err(err);
+        }
+    };
     let reused = ghostbox::shared_device_is_open();
-    let api = ghostbox::shared_device_session(&dll, ghostbox::OPEN_DEVICE_TIMEOUT)
-        .map_err(|err| format!("打开幽灵盒失败：{err}"))?;
-    let code = api
-        .MoveMouseTo(x, y)
-        .map_err(|err| format!("MoveMouseTo({x}, {y}) 失败：{err}"))?;
+    ghostbox::append_replay_log(&format!(
+        "ghostbox_move_to: before open reused_session={reused} dll={}",
+        dll.display()
+    ));
+    let api = match ghostbox::shared_device_session(&dll, ghostbox::OPEN_DEVICE_TIMEOUT) {
+        Ok(api) => api,
+        Err(err) => {
+            ghostbox::append_replay_log(&format!("ghostbox_move_to: open-session fail: {err}"));
+            return Err(format!("打开幽灵盒失败：{err}"));
+        }
+    };
+    ghostbox::append_replay_log(&format!(
+        "ghostbox_move_to: open-session ok reused_session={reused}; calling MoveMouseTo({x}, {y})"
+    ));
+    let code = match api.MoveMouseTo(x, y) {
+        Ok(code) => code,
+        Err(err) => {
+            ghostbox::append_replay_log(&format!(
+                "ghostbox_move_to: MoveMouseTo({x}, {y}) fail: {err}"
+            ));
+            return Err(format!("MoveMouseTo({x}, {y}) 失败：{err}"));
+        }
+    };
+    ghostbox::append_replay_log(&format!(
+        "ghostbox_move_to: MoveMouseTo({x}, {y}) → code {code}"
+    ));
     let session_note = if reused {
         "复用进程级会话"
     } else {
@@ -84,9 +112,11 @@ fn move_to_windows(x: i32, y: i32) -> Result<GhostboxMoveResult, String> {
 
 #[cfg(windows)]
 fn reset_windows() -> Result<GhostboxResetResult, String> {
+    ghostbox::append_replay_log("ghostbox_reset_device: begin");
     let dll = match resolve_dll(None) {
         Ok(path) => path,
         Err(err) => {
+            ghostbox::append_replay_log(&format!("ghostbox_reset_device: resolve_dll fail: {err}"));
             return Ok(GhostboxResetResult {
                 detail: err.clone(),
                 notice: format!("重置跳过（找不到 DLL）：{err}"),
@@ -96,6 +126,7 @@ fn reset_windows() -> Result<GhostboxResetResult, String> {
     let detail = ghostbox::reset_shared_device_session(&dll);
     std::thread::sleep(std::time::Duration::from_secs(2));
     let notice = format!("幽灵盒已重置（等待 2 秒后）：{detail}");
+    ghostbox::append_replay_log(&format!("ghostbox_reset_device: done {detail}"));
     Ok(GhostboxResetResult { detail, notice })
 }
 

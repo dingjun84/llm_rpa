@@ -2,7 +2,6 @@ import { useMemo, useState } from "react";
 
 import {
   ghostboxMoveTo,
-  ghostboxResetDevice,
   yoloDetectTargetWindow,
 } from "../api";
 import type { RuntimeConfig } from "../types";
@@ -37,14 +36,13 @@ export function YoloRemotePanel({ draft, busy }: Props) {
   const [conf, setConf] = useState("0.25");
   const [detecting, setDetecting] = useState(false);
   const [moving, setMoving] = useState(false);
-  const [resetting, setResetting] = useState(false);
   const [result, setResult] = useState<YoloDetectResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
 
   const windowClass = draft.window_class.trim();
   const windowReady = windowClass !== "";
-  const disabled = busy || detecting || moving || resetting;
+  const disabled = busy || detecting || moving;
 
   const chat = useMemo(
     () => (result ? bestByClass(result.detections, "nav_chat_icon") : null),
@@ -85,9 +83,15 @@ export function YoloRemotePanel({ draft, busy }: Props) {
   const moveTo = async (label: string, det: YoloDetectionView) => {
     setMoving(true);
     setError(null);
+    const { x, y } = det.screen;
+    pushLog(
+      `${label}：准备 ghostbox_move_to → 屏幕 (${x}, ${y}) · ${det.class_name} conf=${det.conf.toFixed(3)}`,
+    );
     try {
-      const moved = await ghostboxMoveTo(det.screen.x, det.screen.y);
-      pushLog(`${label}：${moved.notice}`);
+      const moved = await ghostboxMoveTo(x, y);
+      pushLog(
+        `${label}：完成 code=${moved.code} reused_session=${moved.reused_session} · ${moved.notice}`,
+      );
     } catch (err) {
       setError(String(err));
       pushLog(`${label}失败：${String(err)}`);
@@ -96,19 +100,6 @@ export function YoloRemotePanel({ draft, busy }: Props) {
     }
   };
 
-  const resetDevice = async () => {
-    setResetting(true);
-    setError(null);
-    try {
-      const reset = await ghostboxResetDevice();
-      pushLog(reset.notice);
-    } catch (err) {
-      setError(String(err));
-      pushLog(`重置失败：${String(err)}`);
-    } finally {
-      setResetting(false);
-    }
-  };
 
   return (
     <section className="panel">
@@ -173,14 +164,11 @@ export function YoloRemotePanel({ draft, busy }: Props) {
         >
           {detecting ? "检测中…" : "截窗并远程检测"}
         </button>
-        <button type="button" disabled={resetting} onClick={() => void resetDevice()}>
-          {resetting ? "重置中…" : "重置幽灵盒"}
-        </button>
       </div>
 
       <p className="field-hint">
-        「重置幽灵盒」始终可点：关闭进程级会话（CloseDevice → ResetDevice）并等待 2
-        秒。平时移动只 Open 一次，不会每次都关。
+        幽灵盒重置改到「轨迹自检」页。本页「移到消息 / 通讯录图标」走同一进程级会话的
+        MoveMouseTo；详细逐步日志在 %TEMP%\ghostbox-replay.log。
       </p>
 
       {error && (

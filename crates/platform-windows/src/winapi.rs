@@ -712,7 +712,7 @@ pub use input::{
 // 这里只留再导出，`winapi::move_cursor` 等原路径不变。
 mod cursor;
 
-pub use cursor::{move_cursor, move_cursor_circle, CircleTrace};
+pub use cursor::{move_cursor, move_cursor_circle, plan_cursor_circle, CircleTrace, CircleTracePlan};
 
 // ── 剪贴板 ──────────────────────────────────────────────────────────────
 

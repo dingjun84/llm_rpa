@@ -50,6 +50,8 @@ pub struct CircleTraceView {
     /// 这里刻意**不给"算不算动过"下结论**：那需要一个容差阈值，而阈值定在哪里
     /// 都是拍脑袋；这是给人看的自检，没有哪个自动判据依赖它。
     pub end_distance_px: i32,
+    /// 给界面看的摘要（开会话 / 步数 / 失败点等）；详细逐步日志在 ghostbox-replay.log。
+    pub notice: String,
 }
 
 /// 「画圆」：以**当前光标位置**为圆心，让光标沿圆周走满一圈。
@@ -119,18 +121,28 @@ pub fn draw_cursor_circle<R: Runtime>(app: AppHandle<R>) -> Result<CircleTraceVi
 
         let speed_px_per_sec = WindowsDesktopConfig::default().pointer_speed_px_per_sec;
         let center = winapi::cursor_position()?;
-        let trace = winapi::move_cursor_circle(center, radius, speed_px_per_sec)?;
+        let plan = winapi::plan_cursor_circle(center, radius, speed_px_per_sec)?;
+
+        // Windows 自检走幽灵盒共享会话（与远程检测同一条 MoveMouseTo 路径）。
+        let (trace_end, notice) = draw_circle_via_ghostbox(&plan)?;
+
+        let end_distance_px = {
+            let dx = (trace_end.0 - plan.center.0) as f64;
+            let dy = (trace_end.1 - plan.center.1) as f64;
+            (dx * dx + dy * dy).sqrt().round() as i32
+        };
 
         Ok(CircleTraceView {
-            center: [trace.center.0, trace.center.1],
-            radius: trace.radius,
+            center: [plan.center.0, plan.center.1],
+            radius: plan.radius,
             window_width: size.width,
             window_height: size.height,
-            steps: trace.steps,
-            duration_ms: trace.duration.as_millis() as u64,
+            steps: plan.steps,
+            duration_ms: plan.duration.as_millis() as u64,
             speed_px_per_sec,
-            end: [trace.end.0, trace.end.1],
-            end_distance_px: trace.end_distance_px(),
+            end: [trace_end.0, trace_end.1],
+            end_distance_px,
+            notice,
         })
     }
     #[cfg(target_os = "macos")]
@@ -173,6 +185,7 @@ pub fn draw_cursor_circle<R: Runtime>(app: AppHandle<R>) -> Result<CircleTraceVi
             speed_px_per_sec,
             end: [trace.end.0, trace.end.1],
             end_distance_px: trace.end_distance_px(),
+            notice: "macOS：系统 Accessibility 轨迹（非幽灵盒）。".into(),
         })
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -180,4 +193,111 @@ pub fn draw_cursor_circle<R: Runtime>(app: AppHandle<R>) -> Result<CircleTraceVi
         let _ = app;
         Err("鼠标轨迹自检目前只支持 Windows / macOS".to_string())
     }
+}
+
+/// Windows：用进程级幽灵盒会话按计划走完一圈，写 ghostbox-replay 日志。
+#[cfg(windows)]
+fn draw_circle_via_ghostbox(
+    plan: &platform_windows::winapi::CircleTracePlan,
+) -> Result<((i32, i32), String), String> {
+    use std::path::PathBuf;
+
+    let mut logs: Vec<String> = Vec::new();
+    let push = |logs: &mut Vec<String>, line: String| {
+        ghostbox::append_replay_log(&line);
+        logs.push(line);
+    };
+
+    push(
+        &mut logs,
+        format!(
+            "draw_cursor_circle_ghostbox: begin center=({}, {}) radius={} steps={}",
+            plan.center.0, plan.center.1, plan.radius, plan.steps
+        ),
+    );
+
+    let dll = {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("gbilmd64.dll"));
+            }
+        }
+        candidates.push(PathBuf::from("gbilmd64.dll"));
+        candidates
+            .into_iter()
+            .find(|c| c.is_file())
+            .ok_or_else(|| {
+                let msg = "找不到 gbilmd64.dll（可执行文件旁或当前目录）".to_string();
+                ghostbox::append_replay_log(&format!("draw_cursor_circle_ghostbox: {msg}"));
+                msg
+            })?
+    };
+
+    let reused = ghostbox::shared_device_is_open();
+    push(
+        &mut logs,
+        format!(
+            "draw_cursor_circle_ghostbox: open-session reused={reused} dll={}",
+            dll.display()
+        ),
+    );
+    let api = ghostbox::shared_device_session(&dll, ghostbox::OPEN_DEVICE_TIMEOUT).map_err(|err| {
+        let msg = format!("打开幽灵盒失败：{err}");
+        ghostbox::append_replay_log(&format!("draw_cursor_circle_ghostbox: {msg}"));
+        msg
+    })?;
+    push(
+        &mut logs,
+        format!("draw_cursor_circle_ghostbox: open-session ok reused={reused}"),
+    );
+
+    // 先到圆起点（正右方），再沿途经点走。
+    let move_one = |api: &ghostbox::GBMAPI, x: i32, y: i32, label: &str| -> Result<i32, String> {
+        ghostbox::append_replay_log(&format!(
+            "draw_cursor_circle_ghostbox: {label} MoveMouseTo({x}, {y})"
+        ));
+        let code = api.MoveMouseTo(x, y).map_err(|err| {
+            let msg = format!("{label} MoveMouseTo({x}, {y}) 失败：{err}");
+            ghostbox::append_replay_log(&format!("draw_cursor_circle_ghostbox: {msg}"));
+            msg
+        })?;
+        ghostbox::append_replay_log(&format!(
+            "draw_cursor_circle_ghostbox: {label} MoveMouseTo({x}, {y}) → code {code}"
+        ));
+        Ok(code)
+    };
+
+    move_one(api.as_ref(), plan.start.0, plan.start.1, "to_start")?;
+
+    let last = plan.points.len();
+    for (index, (x, y)) in plan.points.iter().copied().enumerate() {
+        move_one(api.as_ref(), x, y, &format!("step_{index}"))?;
+        if index + 1 < last {
+            std::thread::sleep(plan.step_delay);
+        }
+    }
+
+    let end = platform_windows::winapi::cursor_position()?;
+    push(
+        &mut logs,
+        format!(
+            "draw_cursor_circle_ghostbox: done end=({}, {}) measured",
+            end.0, end.1
+        ),
+    );
+
+    let session_note = if reused {
+        "复用进程级会话"
+    } else {
+        "新开进程级会话"
+    };
+    let notice = format!(
+        "幽灵盒画圆完成：{session_note}；{} 步；终点 ({}, {})。详见 ghostbox-replay.log。",
+        plan.steps, end.0, end.1
+    );
+    // 把关键摘要也放进 UI 日志（逐步细节只落文件，避免面板爆炸）。
+    logs.push(notice.clone());
+    let _ = logs;
+    Ok((end, notice))
 }

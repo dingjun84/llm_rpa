@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { drawCursorCircle } from "../api";
+import { drawCursorCircle, ghostboxResetDevice } from "../api";
 import { remainingSeconds, useCountdown } from "../countdown";
 import type { CircleTraceView } from "../types";
 
@@ -29,6 +29,11 @@ import type { CircleTraceView } from "../types";
  * 宽扁的窗口按宽度算，圆会超出屏幕高度。
  *
  * ⚠️ 所以**窗口拉大拉小，圆就跟着变** —— 想让圆大一点，先把窗口拉大。
+ *
+ * ## Windows：走幽灵盒
+ *
+ * 画圆的每一步都经进程级共享会话的 `MoveMouseTo`（与「远程检测」同一条路径）。
+ * 「重置幽灵盒」也放在本页：平时移动只 Open 一次，重置才 Close→Reset。
  */
 
 /**
@@ -54,6 +59,12 @@ export function CursorMotionPanel({ busy }: Props) {
   const [result, setResult] = useState<CircleTraceView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [log, setLog] = useState<string[]>([]);
+
+  const pushLog = (line: string) => {
+    setLog((prev) => [...prev.slice(-40), line]);
+  };
 
   const run = async () => {
     setRunning(true);
@@ -61,12 +72,31 @@ export function CursorMotionPanel({ busy }: Props) {
     try {
       // 这个 await 会一直挂到整圈走完。界面在这期间只是按钮变灰，
       // 不会给出中间反馈 —— 光标自己就是那个反馈。
-      setResult(await drawCursorCircle());
+      const next = await drawCursorCircle();
+      setResult(next);
+      if (next.notice) {
+        pushLog(next.notice);
+      }
     } catch (err) {
       setResult(null);
       setError(String(err));
+      pushLog(`画圆失败：${String(err)}`);
     } finally {
       setRunning(false);
+    }
+  };
+
+  const resetDevice = async () => {
+    setResetting(true);
+    setError(null);
+    try {
+      const reset = await ghostboxResetDevice();
+      pushLog(reset.notice);
+    } catch (err) {
+      setError(String(err));
+      pushLog(`重置失败：${String(err)}`);
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -76,7 +106,7 @@ export function CursorMotionPanel({ busy }: Props) {
   });
 
   const seconds = remainingSeconds(remainingMs);
-  const blocked = busy || running;
+  const blocked = busy || running || resetting;
 
   return (
     <section className="panel">
@@ -86,6 +116,9 @@ export function CursorMotionPanel({ busy }: Props) {
         点下面的按钮，光标会以<strong>倒计时结束时它所在的位置</strong>为圆心，
         沿圆周匀速走满一圈，<strong>画完停在圆的另一个位置</strong>（不回起点）。
         圆心、半径、以及<strong>走完之后光标实际在哪儿</strong>都会报出来。
+        Windows 上每一步经<strong>幽灵盒</strong>{" "}
+        <code className="mono">MoveMouseTo</code>
+        （进程级共享会话，与远程检测同一条路径）。
       </p>
 
       <div className="guide-stage-actions">
@@ -103,9 +136,15 @@ export function CursorMotionPanel({ busy }: Props) {
             {running ? "正在画圆…" : `画一个圆（${DELAY_TRACE_SECS} 秒后开始）`}
           </button>
         )}
+        <button type="button" disabled={busy || resetting || running} onClick={() => void resetDevice()}>
+          {resetting ? "重置中…" : "重置幽灵盒"}
+        </button>
       </div>
 
       <p className="field-hint">
+        「重置幽灵盒」始终可点（任务跑着时除外）：关闭进程级会话（CloseDevice →
+        ResetDevice）并等待 2 秒。平时画圆 / 远程移动只 Open 一次，不会每次都关。
+        <br />
         ⚠️ 轨迹<strong>只有跑起来才看得见</strong> —— 命令返回时已经走完了，
         不会留下任何痕迹。所以点完就别动鼠标，看着屏幕。
         <br />
@@ -147,7 +186,24 @@ export function CursorMotionPanel({ busy }: Props) {
           <dd className="mono">
             ({result.end[0]}, {result.end[1]}) · 离圆心 {result.end_distance_px} 像素
           </dd>
+          {result.notice ? (
+            <>
+              <dt>摘要</dt>
+              <dd>{result.notice}</dd>
+            </>
+          ) : null}
         </dl>
+      )}
+
+      {log.length > 0 && (
+        <div className="calibration">
+          <div className="calibration-head">
+            <h3>状态日志</h3>
+          </div>
+          <pre className="mono" style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>
+            {log.join("\n")}
+          </pre>
+        </div>
       )}
 
       <p className="field-hint">
@@ -156,6 +212,9 @@ export function CursorMotionPanel({ busy }: Props) {
         <br />
         速度<strong>不在这里配</strong> —— 它只在后端有一处定义，也就是任务里用的那个值；
         界面把它报出来只是让你能核对，而不是让你去调它。
+        <br />
+        逐步 MoveMouseTo 日志：<code className="mono">%TEMP%\ghostbox-replay.log</code>
+        （以及 exe 旁同名文件）。
       </p>
     </section>
   );

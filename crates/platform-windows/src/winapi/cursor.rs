@@ -218,34 +218,29 @@ pub(super) fn circle_points(
         .collect()
 }
 
-/// 以 `center` 为圆心，让光标沿圆周**走满一圈**。
+/// 画圆轨迹的几何/时序计划（还不移动光标）。
 ///
-/// ## 为什么单独有这个函数
-///
-/// 它是**给人看的**：把光标轨迹单独拎出来跑一遍，肉眼就能确认"鼠标是走过去的、
-/// 不是跳过去的"，以及走起来顺不顺。混在完整流程里时，轨迹的问题会被
-/// "找不到联系人""点歪了"之类的现象盖住，排查方向会一路偏掉。
-///
-/// ## 时序
-///
-/// 与 [`move_cursor`] 同一套：总时长 = 轨迹长度 ÷ 速度，按 [`POINTER_STEP_INTERVAL`]
-/// 切步。**不做缓动**——smoothstep 是给"从 A 点到 B 点"这种有始有终的动作用的；
-/// 圆周是匀速运动，逐段缓动只会让它一顿一顿的。
-///
-/// 开始之前先按普通轨迹走到圆的起点（正右方那一点）：**不能直接跳过去**，
-/// 跳过去正是"光标凭空出现在别处"，而这条功能存在的意义就是让人看见它怎么走。
-///
-/// ## 终点**不回到起点**
-///
-/// 走满一圈之后再多走 `CIRCLE_EXTRA_TURNS`（1/4）圈才停。理由见那个常量：
-/// 停在起点上的话，"走过"和"根本没动"在事后看光标位置时无法区分。
-///
-/// 只移动光标，**不点击、不输入、不抢前台**。
-pub fn move_cursor_circle(
+/// 给「OS SendInput」与「幽灵盒 MoveMouseTo」两条执行路径共用同一套几何。
+#[derive(Debug, Clone)]
+pub struct CircleTracePlan {
+    pub center: (i32, i32),
+    pub radius: i32,
+    pub steps: u32,
+    pub duration: Duration,
+    /// 圆的起点（正右方）；调用方应先走到这儿再跑 `points`。
+    pub start: (i32, i32),
+    /// 沿弧长均匀的途经点（含多走的 1/4 圈）。
+    pub points: Vec<(i32, i32)>,
+    /// 相邻两步之间的休眠（最后一步之后不睡）。
+    pub step_delay: Duration,
+}
+
+/// 算出画圆的途经点与时长，**不**移动光标。
+pub fn plan_cursor_circle(
     center: (i32, i32),
     radius: i32,
     speed_px_per_sec: f64,
-) -> WinResult<CircleTrace> {
+) -> WinResult<CircleTracePlan> {
     if radius <= 0 {
         return Err(format!("圆的半径必须是正数，收到 {radius}"));
     }
@@ -254,9 +249,6 @@ pub fn move_cursor_circle(
     }
 
     let (cx, cy) = center;
-    // 圆的起点：正右方那一点。**不跳过去**，按普通轨迹走过去。
-    move_cursor(cx + radius, cy, speed_px_per_sec)?;
-
     let turns = 1.0 + CIRCLE_EXTRA_TURNS;
     let path = std::f64::consts::TAU * radius as f64 * turns;
     let duration = Duration::from_secs_f64(path / speed_px_per_sec)
@@ -264,20 +256,48 @@ pub fn move_cursor_circle(
     let steps = ((duration.as_secs_f64() / POINTER_STEP_INTERVAL.as_secs_f64()).round() as u32)
         .max(CIRCLE_MIN_STEPS);
     let step_delay = duration / steps;
-
     let points = circle_points(center, radius, steps, turns);
-    let last = points.len();
-    for (index, (x, y)) in points.into_iter().enumerate() {
+    Ok(CircleTracePlan {
+        center,
+        radius,
+        steps,
+        duration,
+        start: (cx + radius, cy),
+        points,
+        step_delay,
+    })
+}
+
+/// 以 `center` 为圆心，让光标沿圆周**走满一圈**（OS `SendInput` 路径）。
+///
+/// 几何/时序见 [`plan_cursor_circle`]；硬件 HID 路径在桌面端用同一份计划。
+pub fn move_cursor_circle(
+    center: (i32, i32),
+    radius: i32,
+    speed_px_per_sec: f64,
+) -> WinResult<CircleTrace> {
+    let plan = plan_cursor_circle(center, radius, speed_px_per_sec)?;
+    // 圆的起点：正右方那一点。**不跳过去**，按普通轨迹走过去。
+    move_cursor(plan.start.0, plan.start.1, speed_px_per_sec)?;
+
+    let last = plan.points.len();
+    for (index, (x, y)) in plan.points.into_iter().enumerate() {
         move_cursor_absolute(x, y)?;
         // 最后一步之后不再睡：位置已经到位，多等一帧只是拖长这次演示。
         if index + 1 < last {
-            std::thread::sleep(step_delay);
+            std::thread::sleep(plan.step_delay);
         }
     }
 
     // 实测一次，而不是把算出来的终点当成结果：见 `CircleTrace::end` 的文档。
     let end = cursor_position()?;
-    Ok(CircleTrace { center, radius, steps, duration, end })
+    Ok(CircleTrace {
+        center: plan.center,
+        radius: plan.radius,
+        steps: plan.steps,
+        duration: plan.duration,
+        end,
+    })
 }
 
 /// 发一次绝对坐标的鼠标移动。
