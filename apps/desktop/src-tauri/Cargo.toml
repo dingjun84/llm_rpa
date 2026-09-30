@@ -51,9 +51,13 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+# 远程 YOLO `/predict`：Rust 侧发 HTTP，避开浏览器 CORS。
+ureq = "2.12"
 
 [target.'cfg(windows)'.dependencies]
 platform-windows = { path = "../../../crates/platform-windows" }
+# 幽灵盒 HID：仅 Windows（gbilmd64.dll）。
+ghostbox = { path = "../../../crates/ghostbox" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 platform-macos = { path = "../../../crates/platform-macos" }

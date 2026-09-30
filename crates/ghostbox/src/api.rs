@@ -272,6 +272,13 @@ pub fn shared_device_session(
 ///
 /// The caller owns the settling delay; this function deliberately performs no open
 /// and never propagates vendor errors, so the reset UI can remain an escape hatch.
+/// Whether the process-wide shared session is currently open (no I/O).
+pub fn shared_device_is_open() -> bool {
+    let slot = shared_device_slot();
+    let session = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    session.is_some()
+}
+
 pub fn reset_shared_device_session(path: &Path) -> String {
     let api = {
         let slot = shared_device_slot();
@@ -347,7 +354,7 @@ pub fn open_device_guarded(
                         "SetMouseMovementMode(2) result Err (ignored): {err}"
                     )),
                 }
-                match api.SetMouseMovementSpeed(3) {
+                match api.SetMouseMovementSpeed(5) {
                     Ok(speed_code) => append_replay_log(&format!(
                         "SetMouseMovementSpeed(5) result Ok code={speed_code}"
                     )),

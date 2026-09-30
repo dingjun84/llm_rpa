@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use automation_core::{Failure, SendTask, TaskId, TaskState, Workflow};
+use automation_core::{Failure, SendTask, TaskId, TaskState};
 
 use crate::runtime::{RunChoice, RuntimeConfig};
 
@@ -172,22 +172,11 @@ pub fn write_start_header(
     config: &RuntimeConfig,
     icons_dir: &Path,
 ) {
-    let navigate_only = choice.workflow == Workflow::NavigateOnly;
-
     log_line!(log_path, "=== 任务开始 ===");
     log_line!(log_path, &format!("任务 ID    : {task_id}"));
-    // 「只做导航」根本不找人，任务请求里那个联系人字段是空的——
-    // 那不是"漏填了"，所以不能显示成空白，否则看日志的人会以为操作者忘了填。
     log_line!(
         log_path,
-        &format!(
-            "目标联系人 : {}",
-            if navigate_only {
-                "（不适用：只做导航）".to_string()
-            } else {
-                task.external_contact_name.clone()
-            }
-        ),
+        &format!("目标联系人 : {}", task.external_contact_name),
     );
     // 记的是**本次请求带来的**模式（运行参数），不是配置里那个默认值。
     //
@@ -206,12 +195,6 @@ pub fn write_start_header(
         log_path,
         &format!("工作流     : {}（{:?}）", choice.workflow.describe(), choice.workflow),
     );
-    if navigate_only {
-        // 记的是**图标库目录名**（`data/icons/` 下一级）；空 = 界面还没选。
-        let target = choice.nav_target.trim();
-        let shown = if target.is_empty() { "（没选）" } else { target };
-        log_line!(log_path, &format!("导航目标   : {shown}"));
-    }
     log_line!(log_path, &format!("窗口类名   : {}", config.window_class));
     log_line!(log_path, &format!("目标程序   : {:?}", config.wecom_exe));
     log_line!(log_path, &format!("OCR 程序   : {:?}", config.ocr_command));

@@ -48,20 +48,10 @@ use super::{mark_region, RunChoice, RuntimeConfig};
 /// 发送那一步，没标「发送按钮」就该在**装配期**被拦下：
 /// 否则任务会一路跑到填完正文、等人确认，才在点按钮那一步转人工——
 /// 那时它已经登记进列表了。
-pub(super) fn required_marks(config: &RuntimeConfig, workflow: Workflow) -> Vec<&'static str> {
-    let mut keys: Vec<&'static str> = match workflow {
-        // 搜索式：点搜索框 → 在下拉里挑人 → 在资料页点「发消息」。
-        // 这三块各自对应一步点击，缺任何一块都走不下去。
-        Workflow::SearchContact => vec!["main_search", "search_dropdown", "contact_profile"],
-        // 列表扫描式只用 `regions.contact_panel`（必填、有默认值）。
-        Workflow::ScrollListContact | Workflow::NavigateOnly => Vec::new(),
-    };
-    // 「只做导航」连消息都不发，「只填不发」则刻意停在正文入框之后——
-    // 两种情况下发送按钮都用不上，不该拿它当门槛。
-    if !config.stop_before_send && workflow_inputs(workflow).message {
-        keys.push("send_button");
-    }
-    keys
+pub(super) fn required_marks(_config: &RuntimeConfig, _workflow: Workflow) -> Vec<&'static str> {
+    // YOLO 工作流用检测框定位 UI，不依赖区域标定清单。
+    // 真实模式仍要求「窗口标定尺寸」（见 build_runner），与工作流无关。
+    Vec::new()
 }
 
 /// 缺哪些区域、分别叫什么（给操作者看的名字取自标定清单，**不在这里另起一份**）。
@@ -111,11 +101,7 @@ pub struct WorkflowInputs {
 /// 一条工作流要不要填那两个输入框 —— **这条判据只此一处**。
 pub fn workflow_inputs(workflow: Workflow) -> WorkflowInputs {
     match workflow {
-        // 「只做导航」的任务就是"找到那个图标并点它"，既不找人也发不出消息：
-        // 那两个框在界面上根本不显示，命令层也不该拿它们当门槛。
-        Workflow::NavigateOnly => WorkflowInputs { contact: false, message: false },
-        // 另外两条路都要"找到某个人、发一句话给他"。
-        Workflow::SearchContact | Workflow::ScrollListContact => {
+        Workflow::ChatListSend | Workflow::ContactsSearchSend => {
             WorkflowInputs { contact: true, message: true }
         }
     }

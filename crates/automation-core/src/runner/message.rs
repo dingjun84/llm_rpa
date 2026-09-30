@@ -64,6 +64,20 @@ use crate::dropdown::normalize_text;
 impl Run<'_> {
     /// 聚焦输入框、记下发送前基线，然后把正文填进去；
     /// 要么停在 [`TaskState::Prepared`]，要么一路发出去。
+    /// 解析可选标定区域；`None` 如实转人工（不猜默认值）。
+    pub(super) fn resolve_extra(
+        &self,
+        region: Option<crate::regions::RelativeRegion>,
+        label: &str,
+    ) -> Result<Rect, AutomationError> {
+        let region = region.ok_or_else(|| {
+            AutomationError::NeedsHumanReview(format!(
+                "「{label}」还没有标定，无法继续。                 请到「界面标定」页把这一块框出来，保存配置后再跑。"
+            ))
+        })?;
+        self.resolve(region, label)
+    }
+
     pub(super) fn prepare_message(&mut self) -> Result<(), AutomationError> {
         // 选中联系人之后，焦点仍在会话列表（甚至搜索框）上，**不在消息输入框**里。
         // 不先点进输入框的话，后面那次输入会落到错误的位置——最坏情况是打进

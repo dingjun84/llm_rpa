@@ -138,6 +138,30 @@ export function AdvancedParamsSection({ draft, onPatch }: Props) {
           所以正常情况下开销只是多截一帧。
         </span>
       </div>
-    </>
+    
+      <label className="field">
+        <span className="field-label">YOLO API 地址</span>
+        <input
+          type="text"
+          value={draft.yolo_api_base ?? ""}
+          onChange={(event) => onPatch({ yolo_api_base: event.target.value })}
+          placeholder="http://192.168.1.22:8080"
+        />
+        <span className="field-hint">
+          远程检测服务根地址（默认内网 YOLO26）。保存后下次任务生效。
+        </span>
+      </label>
+      <label className="field">
+        <span className="field-label">YOLO 置信度阈值</span>
+        <input
+          type="number"
+          min={0}
+          max={1}
+          step={0.05}
+          value={draft.yolo_conf ?? 0.25}
+          onChange={(event) => onPatch({ yolo_conf: Number(event.target.value) })}
+        />
+      </label>
+</>
   );
 }

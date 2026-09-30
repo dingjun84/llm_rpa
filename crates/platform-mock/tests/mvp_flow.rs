@@ -2,6 +2,11 @@
 //!
 //! 全部基于 `platform-mock` 的替身端口运行，不接触真实桌面、不接触网络。
 //! 这些用例对应 `docs/architecture.md` §9 验收条件中可在软件层验证的部分。
+//!
+//! ⚠️ 2026-09-30：产品工作流已换成 YOLO 路径（`chat_list_send` /
+//! `contacts_search_send`）。本文件多数端到端用例仍按旧模板/OCR 脚本编写，
+//! 且 dry_run 端口挂的是 `UnconfiguredYolo`——**会大面积失败**。
+//! 编译已对齐新枚举；补 `MockYoloDetector` 脚本化检测后再恢复断言。
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -70,7 +75,7 @@ fn list_config() -> RunnerConfig {
     RunnerConfig {
         platform_label: "test".into(),
         retry_backoff: Duration::ZERO,
-        workflow: Workflow::ScrollListContact,
+        workflow: Workflow::ContactsSearchSend,
         // 列表扫描式**总是**先切到聊天历史；核心层测这条路时也要带上模板，
         // 否则会在导航那一步就转人工，而现象看起来像列表查找坏了。
         nav_icon_templates: vec![nav_template()],
@@ -216,7 +221,8 @@ impl Fixture {
                 ocr: ocr.clone(),
                 matcher,
                 icons,
-            },
+                        yolo: std::sync::Arc::new(automation_core::yolo::UnconfiguredYolo),
+        },
             config,
         )
         .with_audit(audit.clone())
@@ -642,6 +648,7 @@ fn the_same_task_cannot_be_sent_twice() {
             ocr: Arc::new(MockOcr::new(script)),
             matcher: Arc::new(platform_mock::MockContactMatcher::new()),
             icons: Arc::new(MockIconLocator::new()),
+            yolo: std::sync::Arc::new(automation_core::yolo::UnconfiguredYolo),
         },
         RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
     )
@@ -1949,7 +1956,7 @@ fn search_config() -> RunnerConfig {
     RunnerConfig {
         platform_label: "test".into(),
         retry_backoff: Duration::ZERO,
-        workflow: Workflow::SearchContact,
+        workflow: Workflow::ChatListSend,
         main_search: Some(region(0.10, 0.02, 0.60, 0.05)),
         search_dropdown: Some(region(0.10, 0.07, 0.60, 0.50)),
         contact_profile: Some(region(0.72, 0.05, 0.27, 0.90)),
@@ -2600,7 +2607,7 @@ fn a_click_that_lands_in_an_existing_chat_skips_the_profile_page() {
 fn navigate_only_finds_the_icon_and_stops_at_navigated() {
     let icons = Arc::new(MockIconLocator::new());
     let config = RunnerConfig {
-        workflow: Workflow::NavigateOnly,
+        workflow: Workflow::ChatListSend,
         nav_target_label: "通讯录".to_string(),
         nav_icon_templates: vec![nav_template()],
         ..list_config()
@@ -2642,7 +2649,7 @@ fn navigate_only_finds_the_icon_and_stops_at_navigated() {
 #[test]
 fn navigate_only_still_requires_a_calibrated_window_in_live_mode() {
     let config = RunnerConfig {
-        workflow: Workflow::NavigateOnly,
+        workflow: Workflow::ChatListSend,
         nav_icon_templates: vec![nav_template()],
         calibrated_window: Some(CalibratedWindow {
             width: 960,

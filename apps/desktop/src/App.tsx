@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { CalibrationPanel, type CachedPreview } from "./components/CalibrationPanel";
 import { CursorMotionPanel } from "./components/CursorMotionPanel";
-import { IconLibraryPanel } from "./components/IconLibraryPanel";
+import { IconsPage } from "./components/IconsPage";
 import { regionsAreValid } from "./components/RegionCalibration";
 import { RuntimePanel } from "./components/RuntimePanel";
 import { StateTimeline } from "./components/StateTimeline";
@@ -212,24 +212,17 @@ export function App() {
     setRunChoice(
       (current) =>
         current ?? {
-          mode: info.config.mode,
-          workflow: info.config.workflow,
-          nav_target: info.config.nav_target,
+          mode: "live",
+          workflow: info.config.workflow === "contacts_search_send"
+            ? "contacts_search_send"
+            : "chat_list_send",
+          nav_target: "",
         },
     );
   }, [info]);
 
-  /**
-   * **这一次真正会跑的模式** —— 判据只有这一处。
-   *
-   * ★★ 不能用 `draft.mode`：那只是配置里的默认值，界面上切了模式、没点保存时
-   * 它与真正会跑的不是一回事。真实模式那句提示是**安全提示**，
-   * 按错了方向（提示说"演练"、实际在动真窗口）比没有提示更糟。
-   *
-   * `runChoice` 还没读回来时退回配置里的值：那种状态下界面上两个选择器都是禁用的，
-   * 退回去只是为了首帧别显示空白。
-   */
-  const activeMode: RuntimeMode = runChoice?.mode ?? info?.config.mode ?? "dry_run";
+  /** 任务始终真实模式（演练选择器已移除）。 */
+  const activeMode: RuntimeMode = "live";
 
   /**
    * 当前工作流对**任务输入**的要求（要不要填「外部联系人名称」/「消息正文」）。
@@ -308,7 +301,6 @@ export function App() {
     };
   }, [activeId, logNonce, activeTask?.state, activeTask?.failure?.reason, activeTask?.detail]);
 
-
   const running = useMemo(
     () => tasks.some((task) => !TERMINAL_STATES.includes(task.state)),
     [tasks],
@@ -340,7 +332,7 @@ export function App() {
       return;
     }
     try {
-      const id = await api.startTask({ ...values, run_choice: runChoice });
+      const id = await api.startTask({ ...values, run_choice: { ...runChoice, mode: "live" } });
       setActiveId(id);
     } catch (err) {
       setError(String(err));
@@ -388,7 +380,7 @@ export function App() {
   // 否则后端 `RelativeRegion::validate` 会在执行时才报错，白白浪费一次任务。
   // 三个页面共用这一个判断——保存按钮在每页都有，判据只能有一处。
   // 看的是 `activeMode`（这一次会跑的那个），不是配置里那个默认值。
-  const canSave = draft ? activeMode === "dry_run" || regionsAreValid(draft.regions) : false;
+  const canSave = draft ? regionsAreValid(draft.regions) : false;
 
   return (
     <div className="app">
@@ -402,8 +394,8 @@ export function App() {
         {info && (
           // 徽标说的是**这一次会跑的模式**，不是配置里那个默认值：
           // 它是个安全指示，必须与真正会发生的事一致。
-          <span className={activeMode === "dry_run" ? "mode-pill" : "mode-pill is-live"}>
-            {activeMode === "dry_run" ? "演练模式" : "真实模式"}
+          <span className="mode-pill is-live">
+            真实模式
           </span>
         )}
       </header>
@@ -612,7 +604,7 @@ export function App() {
         <main className="app-grid is-single">
           <div className="column">
             {info && draft ? (
-              <IconLibraryPanel
+              <IconsPage
                 info={info}
                 draft={draft}
                 onPatch={patch}

@@ -179,7 +179,7 @@
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `src/lib.rs` | 2219 | **27 个 IPC 命令** + `with_commands` 注册（含**托管状态**）。★ 任务日志**不在这里**了，见 `task_log.rs`；过程事件流的读盘在 `task_replay.rs`。⚠️ **已破 `CONVENTIONS.md` §9 的存量基线（1903），见那一节的 2026-09-21 复测** |
+| `src/lib.rs` | 2219 | **29 个 IPC 命令** + `with_commands` 注册（含**托管状态**）。★ 任务日志**不在这里**了，见 `task_log.rs`；过程事件流的读盘在 `task_replay.rs`。⚠️ **已破 `CONVENTIONS.md` §9 的存量基线（1903），见那一节的 2026-09-21 复测** |
 | `src/task_log.rs` | 445 | ★ **任务日志的三件事**：`write_task_log_line`（纯追加、带毫秒时间戳、写完 flush）+ **`log_line!` 宏**（把**调用点的文件 / 行号 / 模块**自动挂上——位置只有取在宏展开处才是真的，靠人维护"文案 → 代码位置"必然静默出错）+ `write_start_header`（开跑前那份**配置快照**——"当时到底按哪份配置跑的"）。★ 快照里的**运行参数**（模式 / 工作流 / 导航目标）全部取自 `RunChoice`，与界面上选的必须一致。★ 读盘那侧：`summary_from_log` 用 `strip_line_prefixes` **循环剥行首前缀**（时间戳 + 代码出处两段都要剥，只剥一段会让每条 `strip_prefix` 落空、历史任务全变成"失败"）。T27 从 `lib.rs` 整段搬出来（那一百来行是"写日志"的活，与"装配 / 登记 / 起线程"不是一回事）；单测搬去了 `task_log/tests.rs` |
 | `src/task_diagnostics.rs` | 315 | ★★ **过程诊断的落盘侧**（T29）：每个任务一个目录 `data/tasks/<ID>/`，逐步存标注图 + 总图 + `events.jsonl` + 人读的 `task.log` + **`raw/`（未标注的 OCR 输入图 + 引擎 stdout 原文）**。★★ **判据执行到哪就记到哪**：记的是判据**自己**交出来的轨迹，不是在编排层再复述一遍（否则迟早和判据不一致）。★ `observe` / `finish` 各自报一条 ⏱ 耗时（渲染+编码 / 写盘 / 总图拼装）：这段跑在**任务线程**上，每一毫秒都吃单步预算 |
 | `src/task_diagnostics/events.rs` | 198 | ★★ **`events.jsonl` 的格式（唯一一处定义）**：`read`（这一步看到了什么：图 + 区域 + 每块文字与坐标与置信度 + **可重跑的原料 `ocr_input`/`ocr_raw`**）+ `decision`（这一步怎么判的：判据 / 阈值 / 每个候选过没过 + 理由 / 重跑要的参数）。`tools/replay` 只**读**这个格式 |
@@ -201,8 +201,10 @@
 | `src/icon_library.rs` | 195 | 图标库对外接口 + 名字校验（实现在 `icon_library/`） |
 | `src/icon_library/{layout,read,write}.rs` | 79 / 188 / 145 | 目录定位 / 目录 → 列表 / 存与删 |
 | `src/icon_library/tests.rs` | 470 | 图标库测试（名字校验、定位、读写、坏文件） |
+| `src/yolo_remote.rs` | ~170 | ★ 远程 YOLO：全分辨率截窗 → `POST /predict?annotated=1` → `shot_point_to_screen` | `yolo_detect_target_window` |
+| `src/ghostbox_session.rs` | ~130 | ★ 幽灵盒进程级会话（MoveMouseTo / 重置）；Windows only | `ghostbox_move_to`、`ghostbox_reset_device` |
 
-**26 个 IPC 命令清单**（`lib.rs` 里搜 `#[tauri::command]`；
+**29 个 IPC 命令清单**（`lib.rs` 里搜 `#[tauri::command]`；
 前端调用点见 `apps/desktop/src/api.ts`，**两边名字一一对应**）：
 
 ```text
@@ -213,6 +215,7 @@ list_icons            delete_icon          delete_icon_variant  save_icon_from_c
 click_icon            validate_area_mark   prune_stale_marks    workflow_requirements
 register_capture_hotkey  unregister_capture_hotkey  draw_cursor_circle
 read_task_log         read_task_events     open_task_dir
+yolo_detect_target_window  ghostbox_move_to  ghostbox_reset_device
 ```
 
 `read_task_log` 与 `read_task_events` 是一对（T29）：前一个给的是**给人读**的叙述，
@@ -275,6 +278,9 @@ read_task_log         read_task_events     open_task_dir
 | `components/AdvancedParamsSection.tsx` | 192 | **超时 + 滚动查找**两组旋钮（含 `ratioFromInput`：清空输入框时**保留原值**，别退回 0）。平时不动，机器慢/列表长才来调 |
 | `components/TypingTextSection.tsx` | 87 | **逐字输入间隔 + 靶标文字**（资料页入口文字、搜索下拉「联系人」分组标题）。这几个值**随客户端版本变**，改动理由相同，所以归到一起 |
 | `components/IconLibraryPanel.tsx` | 800 | 图标库页**主面板**：截一张窗口图 → 在图上框住图标 → 起名字存下来（一个名字可存多张变体）；再加匹配参数与保存按钮。★ 列表与结果预览已拆出，见下面两行 |
+| `components/IconsPage.tsx` | ~60 | 图标页子页签：「模板匹配」/「远程检测」 |
+| `components/YoloRemotePanel.tsx` | ~300 | 远程检测 UI：API、检测列表、幽灵盒移动/重置 |
+| `yoloRemoteTypes.ts` | ~50 | 远程检测 / 幽灵盒 IPC 类型镜像 |
 | `components/IconList.tsx` | 204 | 图标库**列表**：一行一个图标 + 全部变体缩略图 + 「用于联系人导航」勾选 + 测试匹配 / 定位并点击 / 删除。★ 它**自带两个"两下确认"状态**（`armed` / `armDelete`）—— 主面板不必知道"哪个按钮上了膛"。⚠️ 「用于聊天历史导航」那个勾选框**已删**（T26）：它的旧用途（给写死的 `NavTarget::History` 喂模板）不存在了 |
 | `components/NavResultSections.tsx` | 140 | 「匹配结果」「点击结果」两段**只读预览**（含 `ShotOverlay`：整窗图 + 搜索区蓝虚线 + 命中框 + 点击点）。★ 纯展示，**不判断结果对不对**——那句话是后端 `probe.notice` / `click.notice` 下发的 |
 | `iconNames.ts` | 15 | ★ **`normalizeName`（图标名的比较键）**。它是**判据**（"算不算同一个图标"），只能有一处 —— 主面板与 `IconList` 都从这里取 |

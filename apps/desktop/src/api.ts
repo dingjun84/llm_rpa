@@ -18,6 +18,12 @@ import type {
   WindowPreview,
   WorkflowRequirement,
 } from "./types";
+import type {
+  GhostboxMoveResult,
+  GhostboxResetResult,
+  YoloDetectRequest,
+  YoloDetectResult,
+} from "./yoloRemoteTypes";
 
 export const EVENT_TASK_UPDATED = "task://updated";
 /**
@@ -406,4 +412,21 @@ export function drawCursorCircle(): Promise<CircleTraceView> {
 
 export function onTaskUpdated(handler: (task: TaskView) => void): Promise<UnlistenFn> {
   return listen<TaskView>(EVENT_TASK_UPDATED, (event) => handler(event.payload));
+}
+
+/** 截目标窗口全分辨率图并调用远程 `/predict`。 */
+export function yoloDetectTargetWindow(
+  request: YoloDetectRequest,
+): Promise<YoloDetectResult> {
+  return invoke<YoloDetectResult>("yolo_detect_target_window", { request });
+}
+
+/** 幽灵盒 MoveMouseTo（屏幕绝对坐标；Windows）。 */
+export function ghostboxMoveTo(x: number, y: number): Promise<GhostboxMoveResult> {
+  return invoke<GhostboxMoveResult>("ghostbox_move_to", { x, y });
+}
+
+/** 重置幽灵盒进程级会话（CloseDevice → ResetDevice + 2s）。 */
+export function ghostboxResetDevice(): Promise<GhostboxResetResult> {
+  return invoke<GhostboxResetResult>("ghostbox_reset_device");
 }

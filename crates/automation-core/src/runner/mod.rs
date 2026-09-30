@@ -12,10 +12,11 @@
 //! 阻塞在端口内部的调用无法被抢占，平台层需要为自己的阻塞操作设置内部超时。
 
 mod decision;
-mod list;
 mod message;
-mod navigate;
-mod search;
+mod yolo_chat;
+mod yolo_common;
+mod yolo_contacts;
+// 旧 search/list/navigate 模块暂不编入（YOLO 工作流已替换）；文件仍在树中待删。
 
 /// 由「结论 + 轨迹」拼出一条决策记录（见 [`decision`]）。
 ///
@@ -34,8 +35,8 @@ use crate::diagnostics::{
     Decision, DiagnosticRecorder, IconHit, MatchTrail, Observation, ReplayInput, WindowShot,
 };
 use crate::ports::{
-    AutomationError, ContactMatcher, DesktopPlatform, EvidenceRecorder, IconLocator, IconPrior,
-    IconQuery, IconTemplate, LocalOcr, Point, Rect, ScreenMetrics, Screenshot, SendTask, TaskId,
+    AutomationError, ContactMatcher, DesktopPlatform, EvidenceRecorder, IconLocator,
+    IconTemplate, LocalOcr, Point, Rect, ScreenMetrics, Screenshot, SendTask, TaskId,
     TextBox,
 };
 use crate::regions::{RelativePoint, RelativeRegion};
@@ -250,65 +251,31 @@ pub const DEFAULT_SCROLL_ANCHOR: RelativePoint = RelativePoint::new(0.62, 0.5);
 /// 「界面显示一个落点、任务用另一个」这种事就迟早会发生。
 pub const DEFAULT_PROFILE_SCROLL_ANCHOR: RelativePoint = RelativePoint::new(0.5, 0.5);
 
-/// 本次任务跑到哪一步。
+/// 本次任务跑哪条 YOLO 工作流。
 ///
-/// ## 为什么要把它显式说出来
-///
-/// "找联系人"这件事有**两条完全不同的路**：一条是在顶部搜索框里打字、
-/// 从联想下拉里挑人；另一条是在会话列表里往下滚、用 OCR 一行行认名字。
-/// 两者适用的界面不同（前者要求搜索框能用，后者要求列表里滚得到人），
-/// 而它们的失败现象都是"找不到联系人"——不把路分开，现场就分不清
-/// 到底是搜索没生效还是列表里真的没有这个人。
-///
-/// 第三条路 `NavigateOnly` 是**只做导航**：它不查找任何人，
-/// 用来单独验证"找图标 → 点它"这一步（找联系人图标 / 找聊天历史图标）。
+/// 旧的三条（只做导航 / 搜索式 / 列表扫描）已下线；鼠标点击一律走 GhostBox（由
+/// 桌面端口在 Windows 上注入），界面元素一律走远程 YOLO + 局部 OCR。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Workflow {
-    /// 只做「找到导航图标并点击」：点完停在 [`TaskState::Navigated`]。
-    NavigateOnly,
-    /// 用顶部搜索框查找联系人，打开与他的聊天，填正文，然后发送
-    /// （勾了「只填不发」则填完即停）。
-    ///
-    /// 完整链路：点「联系人」导航（已在该页可点一下但画面不变）→
-    /// 点顶部搜索框 → 逐字输入姓名 → 在下拉「联系人」分组里点他 →
-    /// 核验资料页 → 能看见「发消息」就不滚，否则滚到底 → 点「发消息」→
-    /// 核验聊天标题 → 聚焦输入框 → 逐字输入正文 → 点发送按钮 → 核验送达。
-    /// **中间没有等待人工的环节**（人工确认已于 2026-09-22 移除，
-    /// 见 `runner/message.rs` 的模块文档）。
-    ///
-    /// ⚠️ 「发不发」与这条路无关：勾了「只填不发」才停在
-    /// [`TaskState::Prepared`]，见 `prepare_message`。
-    SearchContact,
-    /// 在**会话列表**里滚动扫描查找联系人，然后打开聊天、准备消息。
-    ///
-    /// 完整链路：先点「聊天 / 对话历史」导航回到会话列表 → 在列表里滚动 OCR
-    /// 找人 → 点开会话 → 准备消息。与搜索式互补：不依赖搜索框联想。
-    ScrollListContact,
+    /// 会话列表找人并发送（Flow A）：`nav_chat_icon` → `conversation_item` → 输入 → 发送。
+    ChatListSend,
+    /// 通讯录搜索找人并发送（Flow B）：`nav_contacts_icon` → 搜索 → `contact_item` → 「发消息」→ 输入 → 发送。
+    ContactsSearchSend,
 }
 
 impl Workflow {
     /// 全部工作流，**顺序即界面上的顺序**。
-    ///
-    /// 与 [`TaskState::ALL`] 同一个道理：给界面用的枚举要有一个稳定的清单，
-    /// 让界面遍历它而不是自己再列一遍——两边各列一份，加了新变体时
-    /// 界面那一份不会报错，只会**少一个选项**，而少掉的那个没人会发现。
-    pub const ALL: [Workflow; 3] = [
-        Workflow::SearchContact,
-        Workflow::ScrollListContact,
-        Workflow::NavigateOnly,
+    pub const ALL: [Workflow; 2] = [
+        Workflow::ChatListSend,
+        Workflow::ContactsSearchSend,
     ];
 
     /// 面向操作者的名字，用于界面下拉与失败信息。
-    ///
-    /// 必须能**区分**三条路：它们的失败现象都是"找不到联系人"，
-    /// 而处置方向完全不同（搜索没生效 / 列表里真没有 / 图标点错了）。
-    /// 名字里带上区分点，比只写"查找联系人"有用得多。
     pub fn describe(self) -> &'static str {
         match self {
-            Self::NavigateOnly => "只做导航（找到图标并点击）",
-            Self::SearchContact => "搜索式查找联系人",
-            Self::ScrollListContact => "列表扫描式查找联系人",
+            Self::ChatListSend => "会话列表发送（消息页找人 → 发消息）",
+            Self::ContactsSearchSend => "通讯录搜索发送（搜人 → 发消息 → 发正文）",
         }
     }
 }
@@ -509,10 +476,9 @@ pub struct RunnerConfig {
     /// 见 [`DEFAULT_SEARCH_CONTACT_GROUP_LABEL`]。
     pub search_contact_group_label: String,
     /// 资料页滚动时的落点（相对资料区）。默认正中。
-    ///
-    /// 与联系人列表的 `scroll_anchor` 不同：资料页是一整块可滚动内容，
-    /// 不存在"左边是头像列、右边是名字"这种要避开的列，取几何中心即可。
     pub profile_scroll_anchor: RelativePoint,
+    /// YOLO `/predict` 置信度阈值（0–1）。默认 0.25。
+    pub yolo_conf: f32,
 }
 
 impl Default for RunnerConfig {
@@ -551,7 +517,7 @@ impl Default for RunnerConfig {
             nav_strip: DEFAULT_NAV_STRIP,
             // 默认走**搜索式**：它是操作者当下要的那条路，也是不依赖
             // "列表里滚得到人"的那条路。列表扫描式仍然可用，改这一项即可。
-            workflow: Workflow::SearchContact,
+            workflow: Workflow::ChatListSend,
             // 空串 = 还没有人指定过。装配期一定会覆盖它（导航要么不做，
             // 要么就是带着一个明确的名字进来的），所以留空不是"缺省点某个图标"。
             nav_target_label: String::new(),
@@ -567,6 +533,7 @@ impl Default for RunnerConfig {
             search_contact_group_label: DEFAULT_SEARCH_CONTACT_GROUP_LABEL.to_string(),
             // 资料页是一整块可滚动内容，几何中心一定落在内容上。
             profile_scroll_anchor: DEFAULT_PROFILE_SCROLL_ANCHOR,
+            yolo_conf: 0.25,
         }
     }
 }
@@ -595,10 +562,10 @@ pub struct RunnerPorts {
     pub platform: Arc<dyn DesktopPlatform>,
     pub ocr: Arc<dyn LocalOcr>,
     pub matcher: Arc<dyn ContactMatcher>,
-    /// 图标定位（模板匹配）。只有 `navigate_before_search` 打开时才会被调用，
-    /// 但**端口本身必须始终在场**：让它变成 `Option` 的话，"忘了装配"就会
-    /// 在运行期变成一个 `unwrap` 或一次静默跳过，而不是装配期的报错。
+    /// 图标定位（模板匹配）。旧导航路径仍可能用到；YOLO 工作流不依赖它。
     pub icons: Arc<dyn IconLocator>,
+    /// 远程 YOLO UI 检测。工作流主路径依赖它；未配置时用 [`crate::yolo::UnconfiguredYolo`]。
+    pub yolo: Arc<dyn crate::yolo::YoloDetector>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1377,97 +1344,11 @@ impl<'a> Run<'a> {
     fn execute(&mut self) -> Result<(), AutomationError> {
         self.check_cancel()?;
         self.enter_client()?;
-
-        let workflow = self.cfg().workflow;
-
-        // ── 只做导航 ────────────────────────────────────────────────
-        //
-        // 这条路**不查找任何人**：找到指定图标、点它、结束。
-        // 它的价值是把"图标匹配得准不准"从整条链路里单独拎出来验证——
-        // 混在完整流程里时，点错图标的症状会表现为"找不到联系人"，
-        // 而排查方向会一路偏向 OCR。
-        if workflow == Workflow::NavigateOnly {
-            // 点的是哪一个图标，装配期已经定好了（见 `RunnerConfig::nav_target_label`）。
-            let label = self.cfg().nav_target_label.clone();
-            self.advance(
-                TaskState::NavigatingToView,
-                Some(format!("目标：{label}图标")),
-            )?;
-            self.navigate_to_view()?;
-            self.advance(
-                TaskState::Navigated,
-                Some(format!("已找到并点击「{label}」图标")),
-            )?;
-            return Ok(());
+        match self.cfg().workflow {
+            Workflow::ChatListSend => self.run_chat_list_send(),
+            Workflow::ContactsSearchSend => self.run_contacts_search_send(),
         }
-
-        // ── 切换视图（模板匹配）────────────────────────────────────
-        //
-        // 图标上没有文字，OCR 读不到。装配期已按工作流塞好模板与目标名：
-        //   - 搜索式 → 通讯录 / 联系人
-        //   - 列表扫描式 → 聊天 / 对话历史（先回到会话列表再扫）
-        // 若本来就停在目标页，点一下画面不变，只记警告、不转人工。
-        let must_navigate = matches!(
-            workflow,
-            Workflow::SearchContact | Workflow::ScrollListContact
-        ) || self.cfg().navigate_before_search;
-        if must_navigate {
-            let label = self.cfg().nav_target_label.clone();
-            self.advance(
-                TaskState::NavigatingToView,
-                Some(format!("目标：{label}图标")),
-            )?;
-            self.navigate_to_view()?;
-        }
-
-        // ── 查找联系人 ──────────────────────────────────────────────
-        //
-        // 两条路在状态机上同为 `SearchingContact`，但**看的是完全不同的界面**：
-        // 搜索式看顶部的联想下拉，列表扫描式看左侧的会话列表。
-        // 正因为界面不同，它们的失败原因也完全不同，所以走之前必须分开。
-        self.advance(TaskState::SearchingContact, None)?;
-        let matched = match workflow {
-            Workflow::SearchContact => self.search_contact_by_keyword()?,
-            _ => {
-                let panel = self.resolve(self.cfg().contact_panel, "联系人候选区")?;
-                // 列表一屏放不下时向下滚动继续找，找不到就转人工，绝不猜。
-                self.locate_contact(panel)?
-            }
-        };
-
-        // ── 核验候选人 ──────────────────────────────────────────────
-        self.advance(
-            TaskState::VerifyingCandidate,
-            Some(format!("候选文字：{}", matched.text.trim())),
-        )?;
-        self.verify_candidate(&matched)?;
-
-        // ── 打开与他的聊天 ──────────────────────────────────────────
-        //
-        // 两条路的落点不同：搜索式通常落在资料页、还要点「发消息」进去，
-        // 有时却直接打开已有会话；列表式点一下就是聊天页。搜索式两种落点
-        // 的收尾是同一件事（核验标题），所以连标题核验一起交给
-        // `open_chat_from_dropdown`，判据与顺序写在那边。
-        match workflow {
-            Workflow::SearchContact => self.open_chat_from_dropdown(&matched)?,
-            _ => {
-                self.open_chat_from_list(&matched)?;
-                // ── 核验聊天页标题 ──────────────────────────────────
-                self.advance(TaskState::VerifyingChatHeader, None)?;
-                self.verify_chat_header()?;
-            }
-        }
-
-        // ── 准备消息 ────────────────────────────────────────────────
-        self.advance(TaskState::PreparingMessage, None)?;
-        self.prepare_message()
     }
-
-
-
-
-
-
 
     /// 核验候选人：文字与置信度两道都要过。
     ///

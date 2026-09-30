@@ -123,7 +123,7 @@ impl Harness {
             RuntimeConfig {
                 mode: RuntimeMode::DryRun,
                 demo_scenario: scenario,
-                workflow: Workflow::ScrollListContact,
+                workflow: Workflow::ContactsSearchSend,
                 ..Default::default()
             },
         )
@@ -1350,7 +1350,7 @@ fn the_search_workflow_is_refused_without_its_regions() {
         "search-no-regions",
         RuntimeConfig {
             mode: RuntimeMode::DryRun,
-            workflow: Workflow::SearchContact,
+            workflow: Workflow::ChatListSend,
             ..Default::default()
         },
     );
@@ -1382,7 +1382,7 @@ fn the_list_workflow_does_not_need_the_search_regions() {
         "list-no-search-regions",
         RuntimeConfig {
             mode: RuntimeMode::DryRun,
-            workflow: Workflow::ScrollListContact,
+            workflow: Workflow::ContactsSearchSend,
             ..Default::default()
         },
     );
@@ -1407,7 +1407,7 @@ fn start_task_follows_the_request_not_the_saved_config() {
         "run-choice-from-request",
         RuntimeConfig {
             mode: RuntimeMode::DryRun,
-            workflow: Workflow::ScrollListContact,
+            workflow: Workflow::ContactsSearchSend,
             ..Default::default()
         },
     );
@@ -1416,7 +1416,7 @@ fn start_task_follows_the_request_not_the_saved_config() {
     let info: desktop_lib::RuntimeInfo = harness.ok("runtime_info", json!({}));
     assert_eq!(
         info.config.workflow,
-        Workflow::ScrollListContact,
+        Workflow::ContactsSearchSend,
         "前提：已保存的配置是列表式"
     );
 
@@ -1429,7 +1429,7 @@ fn start_task_follows_the_request_not_the_saved_config() {
             "text": "你好",
             "run_choice": {
                 "mode": "dry_run",
-                "workflow": "search_contact",
+                "workflow": "chat_list_send",
                 // 这条路不导航，所以这一项没有意义。留空串而不是随便写个名字：
                 // 写个像"选好了"的值，会让人以为它真的参与了什么判断。
                 "nav_target": "",
@@ -1458,7 +1458,7 @@ fn start_task_takes_the_mode_from_the_request_not_the_saved_config() {
         RuntimeConfig {
             mode: RuntimeMode::DryRun,
             calibrated_window: None,
-            workflow: Workflow::ScrollListContact,
+            workflow: Workflow::ContactsSearchSend,
             ..Default::default()
         },
     );
@@ -1479,7 +1479,7 @@ fn start_task_takes_the_mode_from_the_request_not_the_saved_config() {
             "text": "你好",
             "run_choice": {
                 "mode": "live",
-                "workflow": "scroll_list_contact",
+                "workflow": "contacts_search_send",
                 "nav_target": "",
             },
         } }),
@@ -1507,7 +1507,7 @@ fn start_task_navigate_only_takes_the_icon_name_from_the_request() {
     put_icon(&icons_dir, "通讯录", 1);
 
     let choice = |nav_target: &str| {
-        json!({ "mode": "dry_run", "workflow": "navigate_only", "nav_target": nav_target })
+        json!({ "mode": "dry_run", "workflow": "chat_list_send", "nav_target": nav_target })
     };
     let request = |nav_target: &str| {
         json!({ "request": {
@@ -1560,7 +1560,7 @@ fn the_two_contact_workflows_still_require_contact_and_message() {
         RuntimeConfig {
             mode: RuntimeMode::DryRun,
             // 列表扫描式：一块标定区域都不需要，所以下面报的错只可能来自输入校验。
-            workflow: Workflow::ScrollListContact,
+            workflow: Workflow::ContactsSearchSend,
             ..Default::default()
         },
     );
@@ -1574,7 +1574,7 @@ fn the_two_contact_workflows_still_require_contact_and_message() {
             json!({ "request": {
                 "external_contact_name": contact,
                 "text": text,
-                "run_choice": { "mode": "dry_run", "workflow": "scroll_list_contact", "nav_target": "" },
+                "run_choice": { "mode": "dry_run", "workflow": "contacts_search_send", "nav_target": "" },
             } }),
         );
         assert!(message.contains(expected), "应当报「{expected}」：{message}");
@@ -1592,7 +1592,7 @@ fn blank_target_texts_are_refused_at_assembly_time() {
         "blank-target-text",
         RuntimeConfig {
             mode: RuntimeMode::DryRun,
-            workflow: Workflow::ScrollListContact,
+            workflow: Workflow::ContactsSearchSend,
             profile_chat_entry_text: "   ".into(),
             ..Default::default()
         },
@@ -1621,7 +1621,7 @@ fn the_requirement_list_matches_what_assembly_enforces() {
         "requirements-match",
         RuntimeConfig {
             mode: RuntimeMode::DryRun,
-            workflow: Workflow::SearchContact,
+            workflow: Workflow::ChatListSend,
             ..Default::default()
         },
     );
@@ -1630,13 +1630,13 @@ fn the_requirement_list_matches_what_assembly_enforces() {
         "workflow_requirements",
         json!({ "config": serde_json::to_value(RuntimeConfig {
             mode: RuntimeMode::DryRun,
-            workflow: Workflow::SearchContact,
+            workflow: Workflow::ChatListSend,
             ..Default::default()
         }).unwrap() }),
     );
     let search = requirements
         .iter()
-        .find(|item| item.workflow == Workflow::SearchContact)
+        .find(|item| item.workflow == Workflow::ChatListSend)
         .expect("三条工作流都要下发");
     assert_eq!(
         search.required.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
@@ -1649,7 +1649,7 @@ fn the_requirement_list_matches_what_assembly_enforces() {
     );
 
     // 清单里说"一条都不用"的那两条工作流，实际装配也确实不要求。
-    for workflow in [Workflow::ScrollListContact, Workflow::NavigateOnly] {
+    for workflow in [Workflow::ContactsSearchSend, Workflow::ChatListSend] {
         let item = requirements
             .iter()
             .find(|item| item.workflow == workflow)

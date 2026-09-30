@@ -289,7 +289,7 @@ pub struct RuntimeConfig {
     /// 现场就分不清是"搜索没生效"还是"列表里真的没有这个人"——
     /// 这两种情况的处置方向完全相反。所以由操作者显式指定。
     pub workflow: Workflow,
-    /// 「只做导航」时要点哪一个图标（只有 [`Workflow::NavigateOnly`] 读它）。
+    /// 「只做导航」时要点哪一个图标（只有 [`Workflow::ChatListSend`] 读它）。
     ///
     /// 值是**图标库里的名字**——`data/icons/` 下的一级目录名，与
     /// [`RunChoice::nav_target`] 同一个值域。
@@ -357,7 +357,22 @@ pub struct RuntimeConfig {
     /// 换了窗口尺寸就得重标（见 `docs/todo.md` T2）。所以每一项都要能回答
     /// "这一份比例是在多大的窗口上量的"——只存四个浮点数是答不出来的。
     pub area_marks: calibration::AreaMarks,
+    /// 远程 YOLO API 根地址（如 `http://192.168.1.22:8080`）。
+    #[serde(default = "default_yolo_api_base")]
+    pub yolo_api_base: String,
+    /// YOLO 置信度阈值。
+    #[serde(default = "default_yolo_conf")]
+    pub yolo_conf: f32,
 }
+
+fn default_yolo_api_base() -> String {
+    "http://192.168.1.22:8080".to_string()
+}
+
+fn default_yolo_conf() -> f32 {
+    0.25
+}
+
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -405,7 +420,7 @@ impl Default for RuntimeConfig {
             nav_strip: flatten(DEFAULT_NAV_STRIP),
             // 默认走**搜索式**：它不依赖"列表里滚得到人"，是操作者当下要的那条路。
             // 列表扫描式仍然完整保留（`ScrollListContact`），改这一项即可切回去。
-            workflow: Workflow::SearchContact,
+            workflow: Workflow::ChatListSend,
             // 空串 = 还没选过。界面上会显示成「（还没选）」，选完才生效。
             nav_target: String::new(),
             icon_prior_score_tolerance: DEFAULT_ICON_PRIOR_SCORE_TOLERANCE,
@@ -418,6 +433,8 @@ impl Default for RuntimeConfig {
             // 空表 = 一个新增区域都还没标。这不是"缺失"，是如实反映现状：
             // 界面会把它们显示成「未标定」，而不是画一个猜出来的框。
             area_marks: calibration::AreaMarks::new(),
+            yolo_api_base: default_yolo_api_base(),
+            yolo_conf: default_yolo_conf(),
         }
     }
 }
@@ -515,6 +532,7 @@ impl RuntimeConfig {
             // 而不是退回一个猜出来的坐标。
             send_button: mark_region(self, "send_button"),
             send_button_text: self.send_button_text.clone(),
+            yolo_conf: self.yolo_conf.clamp(0.0, 1.0),
             // 资料页是一整块可滚动内容，正中一定落在内容上，所以**不给配置项**：
             // 会话列表那个落点之所以可调，是因为要避开头像列与姓名列，
             // 而这里没有需要避开的东西。多一个旋钮就多一处会被设错的地方。
@@ -569,8 +587,8 @@ fn dry_run_ports(
         platform: Arc::new(desktop),
         ocr: Arc::new(MockOcr::new(scenario.script())),
         matcher: Arc::new(MockContactMatcher::new()),
-        // 演练模式的图标定位：正中命中。真去读模板反而会让演示依赖一张真图片。
         icons: Arc::new(MockIconLocator::new()),
+        yolo: Arc::new(automation_core::yolo::UnconfiguredYolo),
     }
 }
 
@@ -637,15 +655,21 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
 
     #[cfg(any(windows, target_os = "macos"))]
     {
+        // Windows：鼠标走 GhostBox；macOS：保留原生指针（HID 不可用，编译需通过）。
+        #[cfg(windows)]
+        let platform: Arc<dyn automation_core::DesktopPlatform> =
+            Arc::new(crate::ghostbox_mouse::GhostboxMouseDesktop::new(platform));
+
+        let yolo: Arc<dyn automation_core::YoloDetector> = Arc::new(
+            crate::yolo_http::HttpYoloDetector::new(&config.yolo_api_base),
+        );
+
         Ok(RunnerPorts {
             platform,
             ocr,
-            // 真实模式的姓名匹配器在这里选型。
-            // 放宽层是**临时**的，理由与风险见 `ContainsNameMatcher` 与 `docs/todo.md`。
             matcher: build_matcher(config.relaxed_name_match),
-            // 纯 Rust 的模板匹配。为什么不挂 OpenCV 见 `vision::template` 的模块文档
-            // 与 `docs/todo.md` T9——端口在这里，换实现不用动调用方。
             icons: Arc::new(vision::TemplateLocator),
+            yolo,
         })
     }
 }
@@ -792,7 +816,7 @@ pub struct RunChoice {
     /// 这两种情况的处置方向完全相反。所以由操作者显式指定。
     pub workflow: Workflow,
     /// 「只做导航」时要点哪一个图标——**本次任务**要点的那个
-    /// （只有 [`Workflow::NavigateOnly`] 读它）。
+    /// （只有 [`Workflow::ChatListSend`] 读它）。
     ///
     /// ## 为什么是**图标库里的名字**，不是一个写死的枚举
     ///
@@ -818,7 +842,7 @@ impl Default for RunChoice {
             // 默认走**演练**：它是安全的那一侧。这份默认值只在测试与
             // "请求里没带"（不可能，字段必填）时用到。
             mode: RuntimeMode::DryRun,
-            workflow: Workflow::SearchContact,
+            workflow: Workflow::ChatListSend,
             nav_target: String::new(),
         }
     }
@@ -970,80 +994,9 @@ pub fn build_runner(
     // 已经是本次的那一份。再覆盖一遍等于把判据写成两处。
     runner_config.workflow = choice.workflow;
 
-    // ── 导航图标：这一次要点哪一个 ──────────────────────────────
-    //
-    // 「只做导航」那条路**导航就是任务本身**。
-    // 搜索式 → 通讯录/联系人；列表扫描式 → 聊天/对话历史；只做导航 → 任务页所选。
-    let navigate_only = choice.workflow == Workflow::NavigateOnly;
-    let search_contact = choice.workflow == Workflow::SearchContact;
-    let scroll_list = choice.workflow == Workflow::ScrollListContact;
-    // 搜索式 → 通讯录图标；列表扫描式 → 聊天历史图标；只做导航 → 任务页所选。
-    let need_nav = navigate_only || search_contact || scroll_list || config.navigate_before_search;
-
-    if need_nav {
-        let strip = runner_config.nav_strip;
-        if let Err(err) = strip.validate() {
-            return Err(format!(
-                "导航图标搜索区的比例不合法（{:.3}, {:.3}, {:.3}, {:.3}）：{err}。\
-                 它是相对窗口的比例，四项都要落在 0–1 之间且不能越出窗口。",
-                strip.x, strip.y, strip.width, strip.height
-            ));
-        }
-        if !(0.0..=1.0).contains(&config.nav_icon_min_score) {
-            return Err(format!(
-                "图标匹配最低分数必须在 0–1 之间（当前 {}）：\
-                 它是归一化互相相关系数，1.0 表示完全一致。",
-                config.nav_icon_min_score
-            ));
-        }
-        if config.icon_prior_score_tolerance < 0.0 {
-            return Err(format!(
-                "位置先验的分数容差不能是负数（当前 {}）：\
-                 它是「最高分往下多少以内才允许用位置取舍」的幅度，\
-                 0 表示关掉先验。",
-                config.icon_prior_score_tolerance
-            ));
-        }
-
-        if navigate_only {
-            let name = choice.nav_target.trim();
-            if name.is_empty() {
-                return Err(
-                    "「只做导航」要指定点哪一个图标，而现在还没选。\
-                     到「图标库」页把那个图标截下来存好，再回到「任务」页的\
-                     「要点哪一个图标」里选它。"
-                        .to_string(),
-                );
-            }
-            runner_config.nav_target_label = name.to_string();
-            runner_config.nav_icon_templates =
-                load_nav_icon_templates(icons_dir, &[name.to_string()], name)?;
-        } else if scroll_list {
-            // 列表扫描式：先切到「聊天 / 对话历史」页，再扫会话列表。
-            let names = resolve_nav_icon_names(
-                icons_dir,
-                &config.chat_history_nav_templates,
-                &["聊天", "微信"],
-                "对话历史",
-                "用于对话历史导航",
-            )?;
-            runner_config.nav_target_label = names[0].clone();
-            runner_config.nav_icon_templates =
-                load_nav_icon_templates(icons_dir, &names, &names[0])?;
-        } else {
-            // 搜索式，或旧开关 navigate_before_search：切「通讯录 / 联系人」。
-            let names = resolve_nav_icon_names(
-                icons_dir,
-                &config.nav_icon_templates,
-                &["通讯录", "联系人"],
-                "通讯录/联系人",
-                "用于联系人导航",
-            )?;
-            runner_config.nav_target_label = names[0].clone();
-            runner_config.nav_icon_templates =
-                load_nav_icon_templates(icons_dir, &names, &names[0])?;
-        }
-    }
+    // YOLO 工作流用远程检测点导航图标，不再装配模板匹配导航。
+    // 保留 nav_* 字段以兼容旧配置反序列化；新路径不读它们。
+    let _ = icons_dir;
 
     Ok(WorkflowRunner::new(ports, runner_config)
         .with_audit(audit)

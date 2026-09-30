@@ -374,7 +374,7 @@ export interface RuntimeConfig {
    *   资料页 → 点「发消息」→ 输入正文。需要 `main_search` /
    *   `search_dropdown` / `contact_profile` 三块区域。
    * - `scroll_list_contact`：在左侧会话列表里滚动扫描找人。只用「列表区」。
-   * - `navigate_only`：**只做导航**——找到图标、点它、结束。不找任何人，
+   * - `chat_list_send`：**只做导航**——找到图标、点它、结束。不找任何人，
    *   用来单独验证图标匹配准不准。
    *
    * ★★ **真正跑的那条路不在这里。** 它是本次任务的运行参数（见 `RunChoice`
@@ -386,7 +386,7 @@ export interface RuntimeConfig {
    */
   workflow: Workflow;
   /**
-   * `navigate_only` 要点哪一个图标。其余工作流不读它。**同上：只是初始值。**
+   * `chat_list_send` 要点哪一个图标。其余工作流不读它。**同上：只是初始值。**
    *
    * 值是**图标库里的名字**（`data/icons/` 下的一级目录名），与 `RunChoice.nav_target`
    * 同一个值域。空串 = 还没选过。
@@ -430,22 +430,19 @@ export interface RuntimeConfig {
    * 它要在「界面标定」的「发送按钮」那一块内被认出来。同样不能留空。
    */
   send_button_text: string;
+  /** 远程 YOLO API 根地址。 */
+  yolo_api_base: string;
+  /** YOLO 置信度阈值。 */
+  yolo_conf: number;
 }
 
 /** 工作流。见 `RunChoice.workflow`。 */
-export type Workflow = "navigate_only" | "search_contact" | "scroll_list_contact";
+export type Workflow = "chat_list_send" | "contacts_search_send";
 
-/**
- * 工作流的下拉选项。
- *
- * 文案要说清**看的是哪个界面**，而不只是"查找联系人"：
- * 两条路的失败现象一模一样，说清区别才能让人选对、也才能在失败时
- * 一眼看出是哪条路出的问题。
- */
+/** 工作流下拉文案（须区分两条路看的界面）。 */
 export const WORKFLOW_LABELS: Record<Workflow, string> = {
-  search_contact: "搜索式查找联系人（点顶部搜索框 → 从下拉里挑人 → 资料页 → 发消息）",
-  scroll_list_contact: "列表扫描式查找联系人（在左侧会话列表里滚动找人）",
-  navigate_only: "只做导航（找到图标并点击，不查找任何人）",
+  chat_list_send: "会话列表发送（消息页找会话 → 发消息）",
+  contacts_search_send: "通讯录搜索发送（搜人 → 发消息 → 发正文）",
 };
 
 /** 一项标定区域对某条工作流的必要性（后端算好下发）。 */
@@ -912,7 +909,7 @@ export interface RunChoice {
   /**
    * 「只做导航」要点哪一个图标 —— **图标库里的名字**（`data/icons/` 下的一级目录名）。
    *
-   * 只有 `workflow === "navigate_only"` 会读它。空串 = 还没选，
+   * 旧「只做导航」会读它；当前 YOLO 工作流不使用。空串 = 还没选，
    * 后端装配期会直接拒绝，不会替你挑一个。
    *
    * 为什么是图标库里的名字而不是写死的两个选项：图标库里通常有四五个图标

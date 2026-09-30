@@ -13,8 +13,8 @@ pub mod replay;
 pub mod timing;
 
 pub use api::{
-    open_device_guarded, reset_shared_device_session, shared_device_session, GBMAPI,
-    MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT, OPEN_DEVICE_TIMEOUT,
+    open_device_guarded, reset_shared_device_session, shared_device_is_open, shared_device_session,
+    GBMAPI, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT, OPEN_DEVICE_TIMEOUT,
 };
 pub use error::GhostboxError;
 pub use replay::{

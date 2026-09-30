@@ -2,7 +2,7 @@
 //!
 //! 图标上**没有文字**，OCR 读不到，所以这一步只能靠模板匹配。
 //! 它既是"查找之前先切视图"的一个可选步骤（`navigate_before_search`），
-//! 也是「只做导航」那条工作流（`Workflow::NavigateOnly`）的全部内容。
+//! 也是「只做导航」那条工作流（`Workflow::ChatListSend`）的全部内容。
 
 use super::*;
 

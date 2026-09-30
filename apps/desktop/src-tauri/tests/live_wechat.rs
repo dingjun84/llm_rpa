@@ -591,7 +591,7 @@ fn live_wechat_navigates_to_a_view() {
         !target.is_empty(),
         "RPA_LIVE_NAV_TARGET 不能是空的：它就是图标库里的目录名"
     );
-    config.workflow = Workflow::NavigateOnly;
+    config.workflow = Workflow::ChatListSend;
     config.nav_target = target.clone();
 
     // 把可选的目录名列出来：名字写错时不用去翻文件管理器。

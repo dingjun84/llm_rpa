@@ -24,14 +24,17 @@ pub mod calibration;
 pub mod capture_hotkey;
 pub mod cursor_trace;
 pub mod data_dir;
+pub mod ghostbox_session;
 pub mod icon_library;
 pub mod legacy_data;
+pub mod yolo_remote;
+pub mod yolo_http;
+pub mod ghostbox_mouse;
 pub mod runtime;
 pub mod startup_log;
 pub mod task_diagnostics;
 pub mod task_log;
 pub mod task_replay;
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -61,7 +64,6 @@ fn to_ms(time: SystemTime) -> u64 {
         .map(|delta| delta.as_millis() as u64)
         .unwrap_or(0)
 }
-
 // ── 传输对象 ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -732,7 +734,6 @@ fn start_task<R: Runtime>(
     Ok(task_id.to_string())
 }
 
-
 #[tauri::command]
 fn read_task_log<R: Runtime>(
     state: State<'_, AppState>,
@@ -990,7 +991,7 @@ fn prune_stale_marks<R: Runtime>(
 /// - Windows：`window_class` = Win32 类名；
 /// - macOS：`window_class` = 所有者名（应用显示名，`CGWindowOwnerName`）。
 #[cfg(windows)]
-fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_windows::WindowsDesktop {
+pub(crate) fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_windows::WindowsDesktop {
     use platform_windows::{WindowsDesktop, WindowsDesktopConfig};
 
     WindowsDesktop::new(WindowsDesktopConfig {
@@ -1004,7 +1005,7 @@ fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_windows:
 }
 
 #[cfg(target_os = "macos")]
-fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_macos::MacOSDesktop {
+pub(crate) fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_macos::MacOSDesktop {
     use platform_macos::{MacOSDesktop, MacOSDesktopConfig};
 
     MacOSDesktop::new(MacOSDesktopConfig {
@@ -1016,7 +1017,6 @@ fn desktop_for(window_class: &str, wecom_exe: Option<&str>) -> platform_macos::M
         ..MacOSDesktopConfig::default()
     })
 }
-
 
 /// 窗口内相对矩形（与 `window` 同单位）→ 截图像素。
 ///
@@ -1044,27 +1044,15 @@ fn window_rect_to_shot(rect: Rect, window: Rect, shot_w: u32, shot_h: u32) -> Re
 
 /// 截图像素 → 窗口内相对（逻辑点），用于换算到屏幕点击。
 #[cfg(any(windows, target_os = "macos"))]
-fn shot_point_to_screen(
+pub(crate) fn shot_point_to_screen(
     x: i32,
     y: i32,
     window: Rect,
     shot_w: u32,
     shot_h: u32,
 ) -> Point {
-    let sx = if shot_w > 0 {
-        window.width as f32 / shot_w as f32
-    } else {
-        1.0
-    };
-    let sy = if shot_h > 0 {
-        window.height as f32 / shot_h as f32
-    } else {
-        1.0
-    };
-    Point {
-        x: window.x + (x as f32 * sx).round() as i32,
-        y: window.y + (y as f32 * sy).round() as i32,
-    }
+    // ★ 判据只在 automation-core::yolo::shot_point_to_screen。
+    automation_core::shot_point_to_screen(x, y, window, shot_w, shot_h)
 }
 
 /// 截图像素 → 预览图像素（`preview_data_url` 可能把宽压到 [`PREVIEW_MAX_WIDTH`]）。
@@ -2175,7 +2163,9 @@ pub fn with_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R
         delete_icon,
         delete_icon_variant,
         click_icon,
-        cursor_trace::draw_cursor_circle
+        cursor_trace::draw_cursor_circle,
+        yolo_remote::yolo_detect_target_window, ghostbox_session::ghostbox_move_to,
+        ghostbox_session::ghostbox_reset_device
     ])
 }
 
