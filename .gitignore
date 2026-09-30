@@ -13,8 +13,6 @@
 # ---------- Node / 前端依赖与产物 ----------
 node_modules/
 **/node_modules/
-dist/
-**/dist/
 dist-ssr/
 # `vite build --outDir dist-verify` 的产物：沙箱的批量删除保护会拦住 Vite
 # 清空 dist 的动作（见项目记忆第 8 条），所以验证打包时改用这个全新目录。
