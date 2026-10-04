@@ -310,9 +310,6 @@ fn navigation_defaults_come_from_the_core_constants_and_are_off() {
 }
 
 /// 造一条标定记录。窗口取一个固定值——这些用例不关心它，只要求"标过"。
-///
-/// 从闭包提成自由函数，是因为现在有三处基线（`base_config` /
-/// `search_base_config` / 单个用例）都要用它；写成闭包就会在每个函数里各来一份。
 fn mark(rect: [f32; 4]) -> calibration::AreaMark {
     calibration::AreaMark {
         rect,
@@ -321,321 +318,100 @@ fn mark(rect: [f32; 4]) -> calibration::AreaMark {
     }
 }
 
-/// 装配用例的基线配置：**列表扫描式**，并勾好聊天历史图标。
+/// 装配用例的基线配置：任意产品工作流均可，不依赖标定/图标。
 ///
-/// 为什么要显式选：`RuntimeConfig::default()` 现在是**搜索式**，而搜索式
-/// 要求先标好搜索框 / 下拉 / 资料页三块。列表扫描式不需要那些，但**总是**
-/// 要聊天历史导航模板——没勾的话装配会卡在「没有配置聊天历史图标」上。
+/// YOLO 路径下 `required_marks` 为空、装配不再载入导航模板，所以基线
+/// 不再预埋 `send_button` 区域或 `chat_history_nav_templates`。
 fn base_config() -> RuntimeConfig {
-    let mut config = RuntimeConfig {
-        workflow: Workflow::ContactsSearchSend,
-        chat_history_nav_templates: vec!["聊天".into()],
-        ..RuntimeConfig::default()
-    };
-    // 「发送按钮」两条工作流**都**要用（要不要它的判据是 `stop_before_send`，
-    // 不是工作流，见 `runtime/requirements.rs`），所以基线里就该标上。
-    // 不标的话，一堆与发送无关的用例（比如校验导航区比例）会先被这条挡住，
-    // 报出来的错跟它们要测的东西毫无关系。
-    config.area_marks.insert("send_button".into(), mark([0.86, 0.90, 0.12, 0.07]));
-    config
-}
-
-/// 搜索式基线：三块区域都标好了，用来测 `navigate_before_search` + 联系人导航。
-fn search_base_config() -> RuntimeConfig {
-    let mut config = RuntimeConfig {
+    RuntimeConfig {
         workflow: Workflow::ChatListSend,
-        ..base_config()
-    };
-    config.area_marks.insert("main_search".into(), mark([0.10, 0.02, 0.60, 0.05]));
-    config.area_marks.insert("search_dropdown".into(), mark([0.10, 0.07, 0.60, 0.50]));
-    config.area_marks.insert("contact_profile".into(), mark([0.72, 0.05, 0.27, 0.90]));
-    config
-}
-
-/// 打开开关却没配图标 ⇒ **装配期**就拒绝，而不是留一条跑到一半才失败的记录。
-#[test]
-fn turning_on_navigation_without_a_template_is_refused() {
-    let icons = temp_icons_dir("no-template");
-    let config = RuntimeConfig {
-        navigate_before_search: true,
-        ..search_base_config()
-    };
-    let err = assemble_with_icons(&config, &icons)
-        .err()
-        .expect("没有图标时必须拒绝装配");
-    // 报错要点名**缺的是哪个图标**：图标库里通常有四五个目录，
-    // 不说清就等于让人自己去猜该配哪一个。
-    assert!(err.contains("通讯录") || err.contains("联系人") || err.contains("用于联系人导航"), "{err}");
-    assert!(err.contains("图标库"), "要告诉人下一步去哪配：{err}");
-
-    // 只填空白也算没配——不然会变成"名字叫空字符串"这种更难查的错。
-    let config = RuntimeConfig {
-        navigate_before_search: true,
-        nav_icon_templates: vec!["   ".into(), String::new()],
-        ..search_base_config()
-    };
-    assert!(assemble_with_icons(&config, &icons).is_err());
-
-    // 名字写了个库里没有的：也要在装配期说清楚，而不是等到匹配的时候。
-    let config = RuntimeConfig {
-        navigate_before_search: true,
-        nav_icon_templates: vec!["聊天".into()],
-        ..search_base_config()
-    };
-    let err = assemble_with_icons(&config, &icons).err().expect("名字对不上要拒绝");
-    assert!(err.contains("聊天"), "{err}");
-}
-
-/// 列表扫描式没勾聊天历史图标 ⇒ 装配期拒绝（不受 navigate_before_search 控制）。
-#[test]
-fn the_list_workflow_refuses_without_chat_history_templates() {
-    let icons = temp_icons_dir("no-chat-history");
-    let config = RuntimeConfig {
-        workflow: Workflow::ContactsSearchSend,
-        chat_history_nav_templates: Vec::new(),
-        ..base_config()
-    };
-    let err = assemble_with_icons(&config, &icons)
-        .err()
-        .expect("没勾聊天历史图标时必须拒绝");
-    assert!(err.contains("对话历史") || err.contains("用于对话历史导航"), "{err}");
-}
-
-/// 一个名字底下的**全部**变体都要被带进运行器。
-///
-/// 这是"选中 / 未选中 / 带气泡"能同时生效的前提：只载入第一张的话，
-/// 界面停在选中态时照样匹配不上，而失败现象和"模板没配"一模一样。
-#[test]
-fn every_variant_of_an_icon_reaches_the_runner() {
-    let icons = temp_icons_dir("variants");
-    write_icon(&icons, "聊天", 3, 20, 18);
-    let config = RuntimeConfig {
-        chat_history_nav_templates: vec!["聊天".into(), "  ".into()],
-        ..base_config()
-    };
-
-    let runner = assemble_with_icons(&config, &icons).expect("应当装配成功");
-    let templates = &runner.config().nav_icon_templates;
-    assert_eq!(templates.len(), 3, "三张变体都要载入，空白项忽略");
-    assert_eq!(
-        templates.iter().map(|t| t.label.clone()).collect::<Vec<_>>(),
-        ["聊天/1.png", "聊天/2.png", "聊天/3.png"],
-        "label 取相对图标库目录的路径：失败信息里要能一眼看出是哪个图标的哪一张"
-    );
-    for template in templates {
-        assert_eq!((template.width, template.height), (20, 18));
+        ..RuntimeConfig::default()
     }
 }
 
-/// 模板本身不可用时也要在装配期报错。
-///
-/// 关键在"什么时候报"：留到运行期的话，症状是"匹配分数很低"，
-/// 而人只会去怀疑阈值，不会想到"这张图根本不是图标"。
+/// YOLO 产品工作流装配时**不**要求界面标定、区域框选或导航图标模板。
 #[test]
-fn an_unusable_template_is_refused_at_assembly_time() {
-    let icons = temp_icons_dir("unusable");
-    write_icon(&icons, "太大", 1, 300, 40);
-    let config = RuntimeConfig {
+fn yolo_workflows_assemble_without_calibrations_marks_or_nav_icons() {
+    let icons = temp_icons_dir("yolo-no-calib");
+    for workflow in [Workflow::ChatListSend, Workflow::ContactsSearchSend] {
+        let config = RuntimeConfig {
+            workflow,
+            calibrations: Vec::new(),
+            calibrated_window: None,
+            area_marks: calibration::AreaMarks::new(),
+            nav_icon_templates: Vec::new(),
+            chat_history_nav_templates: Vec::new(),
+            ..RuntimeConfig::default()
+        };
+        let runner = assemble_with_icons(&config, &icons)
+            .unwrap_or_else(|err| panic!("{workflow:?} 无标定也应装配成功：{err}"));
+        assert!(runner.config().calibrated_window.is_none());
+        assert!(runner.config().calibration_alts.is_empty());
+        assert_eq!(runner.config().workflow, workflow);
+        assert!(runner.config().nav_icon_templates.is_empty());
+    }
+}
+
+/// 即便配置里还留着旧窗口标定，交给运行器的几何也必须被清空——
+/// 否则 `ensure_calibrated_size` 会按旧标注尺寸强行改窗。
+#[test]
+fn build_runner_clears_calibrated_geometry_even_when_config_has_snapshots() {
+    let icons = temp_icons_dir("clear-geometry");
+    let mut config = RuntimeConfig {
         workflow: Workflow::ContactsSearchSend,
-        chat_history_nav_templates: vec!["太大".into()],
-        ..base_config()
-    };
-    let err = assemble_with_icons(&config, &icons).err().expect("过大的模板必须被拒绝");
-    assert!(err.contains("太大"), "报错要说清是尺寸问题：{err}");
-
-    // 三张里有一张坏的 ⇒ 整个图标不能用。留着它会在运行时表现为"某个状态匹配不上"。
-    let icons = temp_icons_dir("unusable-one-of-three");
-    write_icon(&icons, "聊天", 3, 20, 18);
-    std::fs::write(icons.join("聊天").join("2.png"), b"not a png").unwrap();
-    let config = RuntimeConfig {
-        workflow: Workflow::ContactsSearchSend,
-        chat_history_nav_templates: vec!["聊天".into()],
-        ..base_config()
-    };
-    let err = assemble_with_icons(&config, &icons).err().expect("坏的那张必须被拒绝");
-    assert!(err.contains("聊天/2.png"), "要说清是哪个图标的哪一张：{err}");
-}
-
-/// 搜索区比例非法 / 阈值越界，同样在装配期拦下。
-#[test]
-fn an_illegal_nav_strip_or_threshold_is_refused() {
-    let icons = temp_icons_dir("illegal");
-    write_icon(&icons, "聊天", 1, 20, 18);
-
-    let config = RuntimeConfig {
-        nav_strip: [0.0, 0.0, 1.5, 1.0],
-        ..base_config()
-    };
-    let err = assemble_with_icons(&config, &icons).err().expect("比例越界必须被拒绝");
-    assert!(err.contains("导航图标搜索区"), "{err}");
-
-    let config = RuntimeConfig {
-        nav_icon_min_score: 1.4,
-        ..base_config()
-    };
-    let err = assemble_with_icons(&config, &icons).err().expect("阈值越界必须被拒绝");
-    assert!(err.contains("0–1"), "{err}");
-}
-
-/// 搜索式关掉「查找前先导航」时，不该去读联系人导航图标——
-/// 名字写错了、搜索区非法，都不该拦住任务。
-///
-/// 搜索式**一律**先切联系人，所以会读 `nav_icon_templates`；
-/// 但坏掉的「对话历史」名单不应挡住搜索式装配（那一组只给列表扫描用）。
-#[test]
-fn search_workflow_ignores_broken_chat_history_nav_list() {
-    let icons = temp_icons_dir("search-ignore-chat");
-    write_icon(&icons, "通讯录", 1, 20, 18);
-    let config = RuntimeConfig {
-        navigate_before_search: false,
-        nav_icon_templates: vec!["通讯录".into()],
-        chat_history_nav_templates: vec!["根本不存在的图标".into()],
-        ..search_base_config()
-    };
-    let runner = assemble_with_icons(&config, &icons).expect("搜索式不读对话历史那一组");
-    assert!(!runner.config().nav_icon_templates.is_empty());
-    assert_eq!(runner.config().nav_target_label, "通讯录");
-}
-
-// ── 工作流：该要求哪些标定区域 ──────────────────────────────────
-
-/// 搜索式缺区域 ⇒ 装配期拒绝，并且**说清缺的是哪几块**。
-///
-/// 为什么要按工作流分别要求：搜索式要的三块（搜索框 / 下拉 / 资料页）
-/// 列表扫描式一块都不用。一概全要等于让人去标三块永远走不到的区域；
-/// 一概不要则会让搜索式走到一半才转人工，而那时任务已经登记进列表了。
-///
-/// ★ 加上「发送按钮」就成了四块——它**不是**按工作流要求的，
-/// 而是按「这次到底发不发消息」（`stop_before_send`）。两种要求在这里合并成
-/// 同一份清单，所以缺的块数与缺哪几块都在同一条错误信息里。
-#[test]
-fn the_search_workflow_refuses_to_start_without_its_regions() {
-    let icons = temp_icons_dir("search-regions");
-    let config = RuntimeConfig {
-        workflow: Workflow::ChatListSend,
+        calibrated_window: Some(WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale_factor: 1.0,
+        }),
         ..RuntimeConfig::default()
     };
-    let err = assemble_with_icons(&config, &icons)
-        .err()
-        .expect("搜索式缺四块区域时必须拒绝装配");
+    // 塞一份快照，模拟「界面标定」页曾经保存过。
+    config.ensure_calibrations_migrated();
+    assert!(!config.calibrations.is_empty(), "前提：配置里有标定快照");
 
-    // 报错要说清"哪条工作流、缺哪几块"，并且用界面上的说法（label）而不是 key：
-    // 只报 `main_search` 的话，人得自己把它翻译成标定页里的某一项。
-    assert!(err.contains("搜索式查找联系人"), "{err}");
-    for label in ["搜索框区", "下拉列表区域", "联系人资料区域", "发送按钮"] {
-        assert!(err.contains(label), "缺哪块要说清（{label}）：{err}");
-    }
-    assert!(err.contains("界面标定"), "要告诉人下一步去哪标：{err}");
-    assert!(err.contains("4 块"), "要说清缺了几块：{err}");
-}
-
-/// 勾了「只填不发」就不该再要求「发送按钮」——**那条路根本不发**。
-///
-/// 反过来（不勾）时列表扫描式也要它：发送那一段代码两条工作流共用，
-/// 「要不要发送按钮」的判据是 `stop_before_send`，不是工作流。
-#[test]
-fn the_send_button_mark_is_required_only_when_the_task_will_really_send() {
-    let icons = temp_icons_dir("send-button-optional");
-    // 这条用例关心的是「发送按钮」，所以别的门槛都要先满足：
-    // 不写这个图标的话，装配会被"名字在图标库里不存在"挡住。
-    write_icon(&icons, "聊天", 1, 20, 18);
-
-    // 只填不发：列表扫描式缺这块也应当装配成功。
-    let mut quiet = RuntimeConfig { stop_before_send: true, ..base_config() };
-    quiet.area_marks.remove("send_button");
+    let runner = assemble_with_icons(&config, &icons).expect("有旧标定也不该挡住装配");
     assert!(
-        assemble_with_icons(&quiet, &icons).is_ok(),
-        "勾了「只填不发」就不该拿发送按钮当门槛"
+        runner.config().calibrated_window.is_none(),
+        "运行器不得携带标定窗口"
     );
-
-    // 同样这条工作流，不勾就必须拦下——它的判据是「发不发」而不是走哪条路。
-    let mut loud = base_config();
-    loud.area_marks.remove("send_button");
-    let err = assemble_with_icons(&loud, &icons)
-        .err()
-        .expect("会走到发送，缺发送按钮就应当拒绝装配");
-    assert!(err.contains("发送按钮"), "{err}");
+    assert!(
+        runner.config().calibration_alts.is_empty(),
+        "运行器不得携带备选标定"
+    );
 }
 
-/// 反过来：三块标好了就能装配，而且它们**真的**被带进了运行器。
-///
-/// 只验"不报错"是不够的——`mark_region` 写错了键（比如把 `main_search`
-/// 写成 `regions.main_search`）时装配照样成功，只是运行器里是 `None`，
-/// 症状是"跑到那一步才转人工"。所以这里逐项核对。
+/// 区域若已标，`to_runner_config` 仍应原样带上（标定页数据还在）；
+/// 只是装配门槛不再要求它们。
 #[test]
-fn the_search_regions_reach_the_runner_after_they_are_marked() {
-    let icons = temp_icons_dir("search-regions-ok");
-    write_icon(&icons, "通讯录", 1, 20, 18);
-    let mut config = RuntimeConfig {
-        workflow: Workflow::ChatListSend,
-        nav_icon_templates: vec!["通讯录".into()],
-        ..base_config()
-    };
+fn marked_regions_still_map_into_to_runner_config() {
+    let mut config = base_config();
     config.area_marks.insert("main_search".into(), mark([0.10, 0.02, 0.60, 0.05]));
     config.area_marks.insert("search_dropdown".into(), mark([0.10, 0.07, 0.60, 0.50]));
     config.area_marks.insert("contact_profile".into(), mark([0.72, 0.05, 0.27, 0.90]));
+    config.area_marks.insert("send_button".into(), mark([0.86, 0.90, 0.12, 0.07]));
 
-    let runner = assemble_with_icons(&config, &icons).expect("三块都标了应当装配成功");
-    let runner_config = runner.config();
-    assert!(runner_config.main_search.is_some(), "搜索框区没被带进运行器");
-    assert!(runner_config.search_dropdown.is_some(), "下拉区域没被带进运行器");
-    assert!(runner_config.contact_profile.is_some(), "资料区域没被带进运行器");
-    // 没标的那一项（导航区只用来算位置先验的中心）**必须仍是 `None`**：
-    // 给一个猜出来的中心，症状是"先验把命中往一个错的方向拉"。
-    assert!(runner_config.nav_bar.is_none(), "没标的区域不该凭空出现");
+    let runner = config.to_runner_config();
+    assert!(runner.main_search.is_some());
+    assert!(runner.search_dropdown.is_some());
+    assert!(runner.contact_profile.is_some());
+    assert!(runner.send_button.is_some());
+    assert!(runner.nav_bar.is_none(), "没标的区域不该凭空出现");
 }
 
-/// 列表扫描式**不**需要搜索式那三块——这是"按工作流分别要求"的另一半。
-///
-/// 没有这条，上面那条用例可以被"一概全要"糊弄过去，而代价是
-/// 每个只想跑列表式的人都被逼着去标三块用不上的区域。
-#[test]
-fn the_list_workflow_does_not_need_the_search_regions() {
-    let icons = temp_icons_dir("list-no-search-regions");
-    write_icon(&icons, "聊天", 1, 20, 18);
-    let config = RuntimeConfig {
-        workflow: Workflow::ContactsSearchSend,
-        chat_history_nav_templates: vec!["聊天".into()],
-        ..base_config()
-    };
-    let runner = assemble_with_icons(&config, &icons).expect("列表式不该要求搜索式的区域");
-    assert!(runner.config().main_search.is_none());
-    assert_eq!(runner.config().nav_target_label, "聊天");
-    assert!(!runner.config().nav_icon_templates.is_empty());
-}
-
-/// ★ 回归用例：**判据是运行参数，不是配置里的那个默认值**。
-///
-/// 2026-09-19 的 bug —— 界面上把工作流切成别的，跑的还是配置里那条：
-/// 连跑三条任务，三条 `task-*.log` 里记的全是 `SearchContact`。
-/// 修法是把工作流变成运行参数（[`RunChoice`]），这条用例钉的就是
-/// "装配期到底读的是哪一个"。
-///
-/// 手法：配置里放**搜索式**（默认值，且默认配置一块新增区域都没标 ⇒ 装配必拒），
-/// 运行参数放**列表扫描式**（一块都不需要 ⇒ 应当装配成功）。
-/// 装配成功即证明它读的是运行参数；一旦有人把它改回去读配置，这里立刻红。
+/// ★ 回归：工作流是运行参数，不是配置里的默认值。
 #[test]
 fn the_run_choice_decides_the_workflow_not_the_config() {
     let icons = temp_icons_dir("run-choice-wins");
-    // 基线里那一块**与工作流无关**的「发送按钮」照旧标着：它由 `stop_before_send`
-    // 决定（见 `runtime/requirements.rs`）。这样配置装配不起来的原因就只剩
-    // 「搜索式那三块没标」，前提才咬得住。
     let config = RuntimeConfig {
         workflow: Workflow::ChatListSend,
-        ..base_config()
+        ..RuntimeConfig::default()
     };
-    // 前提：这份配置按它自己的 `workflow` 装配不起来（缺三块区域）。
-    // 前提不成立的话，下面那条断言什么都证明不了。
-    assert!(
-        assemble_with_icons(&config, &icons).is_err(),
-        "前提：默认配置按搜索式装配应当被拒（缺三块区域）"
-    );
-
-    write_icon(&icons, "聊天", 1, 20, 18);
     let choice = RunChoice {
         mode: config.mode,
         workflow: Workflow::ContactsSearchSend,
-        // 列表式不读这一项（它用 chat_history_nav_templates）——填空串。
         nav_target: String::new(),
     };
     let runner = build_runner(
@@ -646,36 +422,18 @@ fn the_run_choice_decides_the_workflow_not_the_config() {
         Arc::new(MemoryAudit::new()),
         Arc::new(MemorySendLedger::new()),
     )
-    .expect("运行参数是列表式时，不该按配置里的搜索式去要求那三块区域");
-
-    // 不只看"装配没报错"：运行器里带的那条路也必须是运行参数给的那条，
-    // 否则会出现"装配按 A 检查、真正跑的是 B"。
+    .expect("运行参数是通讯录搜索式时应当装配成功");
     assert_eq!(
         runner.config().workflow,
         Workflow::ContactsSearchSend,
         "运行器里那条路必须来自运行参数"
     );
-    // 列表式总是带上聊天历史模板（不是联系人导航那一组）。
-    assert!(!runner.config().nav_icon_templates.is_empty());
-    assert_eq!(runner.config().nav_target_label, "聊天");
 }
 
-/// ★ 回归用例：**模式也是运行参数**，不是配置里的那个默认值。
-///
-/// 与工作流那条同一个坑（界面上切成别的、跑的还是配置里那个），但后果更重：
-/// 模式不只是"换一组端口"，它还决定**要不要带标定窗口**、以及**审计里记哪个平台**。
-/// 两个方向都要钉住：
-///
-/// - 请求说**真实**、配置是演练 ⇒ 必须按真实校验：没有标定尺寸就拒；
-/// - 请求说**演练**、配置是真实 ⇒ 必须按演练跑：不要求标定尺寸，
-///   而且核心层拿到的标定窗口必须是 `None`、平台必须是 `dry-run`。
-///
-/// 后一个方向更危险——以为在演练、其实在真实客户端上操作，
-/// 而审计里还记着 `dry-run`，事后根本查不出来。
+/// ★ 回归：模式也是运行参数；YOLO 路径下真实模式**不再**要求窗口标定。
 #[test]
 fn the_run_choice_decides_the_mode_not_the_config() {
     let icons = temp_icons_dir("run-choice-mode");
-    write_icon(&icons, "聊天", 1, 20, 18);
     let runner_of = |config: &RuntimeConfig, choice: RunChoice| {
         build_runner(
             config,
@@ -687,30 +445,33 @@ fn the_run_choice_decides_the_mode_not_the_config() {
         )
     };
 
-    // ── 方向一：配置是演练、请求要真实 ──────────────────────────────
+    // ── 方向一：配置是演练、请求要真实、没有任何标定 ──────────────
     let dry_config = RuntimeConfig {
         mode: RuntimeMode::DryRun,
         calibrated_window: None,
-        workflow: Workflow::ContactsSearchSend,
-        chat_history_nav_templates: vec!["聊天".into()],
-        ..base_config()
+        calibrations: Vec::new(),
+        workflow: Workflow::ChatListSend,
+        ..RuntimeConfig::default()
     };
-    // 不用 `expect_err`：`WorkflowRunner` 没有实现 `Debug`，报不出成功那个值。
-    let err = match runner_of(
+    let live_runner = runner_of(
         &dry_config,
         RunChoice {
             mode: RuntimeMode::Live,
-            workflow: Workflow::ContactsSearchSend,
+            workflow: Workflow::ChatListSend,
             nav_target: String::new(),
         },
-    ) {
-        Err(err) => err,
-        Ok(_) => panic!("请求要真实模式时，没有标定尺寸必须被拒——否则说明它读的是配置里的演练"),
-    };
-    assert!(
-        err.contains("记录窗口尺寸"),
-        "拒绝理由要指向那条记录（否则操作者不知道该做什么）：{err}"
+    )
+    .expect("请求要真实模式时，无标定也应装配成功（YOLO 路径）");
+    assert_ne!(
+        live_runner.config().platform_label,
+        "dry-run",
+        "审计平台必须跟着运行参数走，不能仍是 dry-run"
     );
+    assert!(
+        live_runner.config().calibrated_window.is_none(),
+        "YOLO 真实模式也不得携带标定窗口"
+    );
+    assert!(live_runner.config().calibration_alts.is_empty());
 
     // ── 方向二：配置是真实（且记了标定尺寸）、请求要演练 ────────────
     let live_config = RuntimeConfig {
@@ -723,8 +484,7 @@ fn the_run_choice_decides_the_mode_not_the_config() {
             scale_factor: 1.0,
         }),
         workflow: Workflow::ContactsSearchSend,
-        chat_history_nav_templates: vec!["聊天".into()],
-        ..base_config()
+        ..RuntimeConfig::default()
     };
     let runner = runner_of(
         &live_config,
@@ -734,10 +494,7 @@ fn the_run_choice_decides_the_mode_not_the_config() {
             nav_target: String::new(),
         },
     )
-    .expect("请求是演练模式时，不该按配置里的真实模式去要求标定尺寸");
-
-    // 不只看"装配没报错"：交出去的那份必须真的是演练语义，
-    // 否则会出现"按演练装配、真正跑的是真实"。
+    .expect("请求是演练模式时应当装配成功");
     assert_eq!(
         runner.config().platform_label,
         "dry-run",
@@ -749,114 +506,54 @@ fn the_run_choice_decides_the_mode_not_the_config() {
     );
 }
 
-/// 「只做导航」点的那个图标由**图标库里的目录名**指定，目录下的全部图都要载入。
-///
-/// 这条路曾经是"两个写死的目标各配一组模板"，于是图标库里四五个图标在下拉里
-/// 根本选不出来（想测「收藏夹」都没得选）。现在目标就是图标库里的名字，
-/// 这里把三件事钉住：**目录下的图全都参与匹配**、**名字不存在要拒**、
-/// **一个名字都没选也要拒**（不兜底挑一个——那会变成"点到了别的地方"）。
+/// 靶标文字留空不再挡住装配：YOLO 路径用检测类 / 流程内 OCR，
+/// 这些字符串的默认值已在 `RunnerConfig`；空串顶多影响旧的文字匹配旁路。
 #[test]
-fn navigate_only_loads_every_variant_of_the_chosen_icon() {
-    let icons = temp_icons_dir("navigate-only");
-    write_icon(&icons, "聊天历史", 2, 20, 18);
-    write_icon(&icons, "联系人", 1, 20, 18);
-
-    // 选「聊天历史」：它底下的 2 张变体都要载入。
-    // 同时刻意把配置里那组「用于联系人导航」填上——它**不该**被读到，
-    // 所以下面"载入了 2 张"这个数就已经证明了没走错来源（那一组只有 1 张）。
-    let config = RuntimeConfig {
-        workflow: Workflow::ChatListSend,
-        nav_target: "聊天历史".into(),
-        nav_icon_templates: vec!["联系人".into()],
-        ..RuntimeConfig::default()
-    };
-    let runner = assemble_with_icons(&config, &icons).expect("导航就是任务本身，不受开关约束");
-    let runner_config = runner.config();
-    assert_eq!(runner_config.nav_icon_templates.len(), 2, "两张变体都要载入");
-    assert_eq!(
-        runner_config.nav_target_label, "聊天历史",
-        "日志与失败信息里要出现的是那个目录名"
-    );
-
-    // 名字在图标库里不存在 ⇒ 装配期就拒绝（不是跑到一半才"匹配不上"）。
-    let config = RuntimeConfig {
-        workflow: Workflow::ChatListSend,
-        nav_target: "不存在的图标".into(),
-        ..RuntimeConfig::default()
-    };
-    let err = assemble_with_icons(&config, &icons)
-        .err()
-        .expect("名字不存在必须拒绝，否则会在运行期表现为一次分数很低的匹配");
-    assert!(err.contains("没有叫「不存在的图标」的图标"), "{err}");
-
-    // 一个名字都没选 ⇒ 同样拒绝。**不兜底**：随手挑一个图标去点，
-    // 症状会是"任务照常跑完，只是点到了别的地方"。
-    let config = RuntimeConfig {
-        workflow: Workflow::ChatListSend,
-        nav_target: "  ".into(),
-        navigate_before_search: false,
-        ..RuntimeConfig::default()
-    };
-    let err = assemble_with_icons(&config, &icons)
-        .err()
-        .expect("没选图标必须拒绝：导航就是这条工作流的全部内容");
-    assert!(err.contains("要指定点哪一个图标"), "{err}");
-}
-
-/// 靶标文字留空 ⇒ 装配期拒绝。
-///
-/// 空串在「包含」判断里**匹配一切**：空的分组标题会让下拉里的第一行被当成
-/// 「联系人」组的标题，于是后面整段判据全部错位。而这**不会报错**——
-/// 只会表现为"点到了不相干的一行"。属于"配置写错了"，所以在装配期拦。
-#[test]
-fn blank_target_texts_are_refused() {
-    let icons = temp_icons_dir("blank-text");
-    write_icon(&icons, "聊天", 1, 20, 18);
+fn blank_target_texts_no_longer_block_assembly() {
+    let icons = temp_icons_dir("blank-text-ok");
     let mut config = base_config();
     config.profile_chat_entry_text = "  ".into();
-    let err = assemble_with_icons(&config, &icons).err().expect("空文字必须被拒绝");
-    assert!(err.contains("不能留空"), "{err}");
-    assert!(err.contains("profile_chat_entry_text"), "要说清是哪一个字段：{err}");
-
-    let mut config = base_config();
     config.search_contact_group_label = String::new();
-    let err = assemble_with_icons(&config, &icons).err().expect("空标题必须被拒绝");
-    assert!(err.contains("search_contact_group_label"), "{err}");
+    config.send_button_text = String::new();
+    assemble_with_icons(&config, &icons).expect("空靶标文字不应再拒绝装配");
 }
 
-/// 默认值必须自洽：默认那条工作流（搜索式）要的三块区域，默认配置里**没有**。
-///
-/// 这不是缺陷，是如实反映现状——那些区域只有对着真实窗口框一次才知道在哪儿。
-/// 钉住它，是为了让"给它们补一个猜出来的默认值"这种改法在改的当场就失败：
-/// 猜出来的默认值不会让任何东西报错，只会让任务点到一个错的地方。
+/// 非法滚动落点不再在装配期拒绝：YOLO 主路径不靠它定位；
+/// `to_runner_config` 仍原样透传，由核心层在真用到时再报。
 #[test]
-fn the_default_workflow_is_search_and_its_regions_have_no_defaults() {
+fn an_out_of_range_scroll_anchor_no_longer_blocks_assembly() {
+    let icons = temp_icons_dir("bad-anchor-ok");
+    let config = RuntimeConfig {
+        scroll_anchor: ScrollAnchorConfig { x: 1.5, y: -0.2 },
+        ..base_config()
+    };
+    assemble_with_icons(&config, &icons).expect("非法 scroll_anchor 不应再拒绝装配");
+}
+
+/// 默认工作流是会话列表发送；新增区域默认都没标（不猜坐标）。
+#[test]
+fn the_default_workflow_regions_have_no_defaults() {
     let config = RuntimeConfig::default();
     assert_eq!(config.workflow, Workflow::ChatListSend);
     assert!(
         config.nav_target.is_empty(),
-        "默认没选过图标——不兜底挑一个，那会变成「点到了别的地方」"
+        "默认没选过图标——不兜底挑一个"
     );
     assert!(config.area_marks.is_empty(), "默认一个新增区域都没标");
     assert_eq!(config.icon_prior_score_tolerance, DEFAULT_ICON_PRIOR_SCORE_TOLERANCE);
     assert_eq!(config.typing_interval_ms, 30);
 
-    // 转成运行器之后仍然是 `None`——**不兜底**。
     let runner = config.to_runner_config();
     assert!(runner.main_search.is_none());
     assert!(runner.search_dropdown.is_none());
     assert!(runner.contact_profile.is_none());
     assert!(runner.nav_bar.is_none());
-    // 这两个是常量派生的，不是"标定出来的"，所以一定有值。
     assert_eq!(runner.profile_chat_entry_text, DEFAULT_PROFILE_CHAT_ENTRY_TEXT);
     assert_eq!(runner.search_contact_group_label, DEFAULT_SEARCH_CONTACT_GROUP_LABEL);
     assert_eq!(runner.profile_scroll_anchor, DEFAULT_PROFILE_SCROLL_ANCHOR);
 }
 
 /// 资料页的滚动落点是**核心层的常量**，不是这一层另写的一份。
-///
-/// 与 `scroll_anchor` 不同，它**不开放配置**：资料页是一整块可滚动内容，
-/// 正中一定落在内容上，没有需要避开的列。多一个旋钮就多一处会被设错的地方。
 #[test]
 fn the_profile_scroll_anchor_comes_from_the_core_constant() {
     let runner = RuntimeConfig::default().to_runner_config();
@@ -865,43 +562,27 @@ fn the_profile_scroll_anchor_comes_from_the_core_constant() {
     assert!(runner.profile_scroll_anchor.validate().is_ok());
 }
 
-/// 位置先验的容差配成负数 ⇒ 装配期拒绝。
-///
-/// 负容差在核心层等于"没有任何候选够得着最高分减负数"，
-/// 也就是先验永远不生效——而它**不报错**，只是悄悄地什么都不做。
+/// 产品工作流的 `required_marks` 必须是空表（与装配门槛一致）。
 #[test]
-fn a_negative_prior_tolerance_is_refused() {
-    let icons = temp_icons_dir("negative-tolerance");
-    write_icon(&icons, "聊天", 1, 20, 18);
-    let config = RuntimeConfig {
-        icon_prior_score_tolerance: -0.1,
-        ..base_config()
-    };
-    let err = assemble_with_icons(&config, &icons).err().expect("负容差必须被拒绝");
-    assert!(err.contains("位置先验"), "{err}");
-
-    // 0 是**合法**的：它表示"关掉先验"，是一个明确的配置意图。
-    let config = RuntimeConfig {
-        icon_prior_score_tolerance: 0.0,
-        ..base_config()
-    };
-    assert!(assemble_with_icons(&config, &icons).is_ok(), "0 = 关掉先验，不是错误");
+fn product_workflows_require_no_calibration_marks() {
+    let config = RuntimeConfig::default();
+    for workflow in Workflow::ALL {
+        let req = workflow_requirements(&config)
+            .into_iter()
+            .find(|item| item.workflow == workflow)
+            .expect("每条工作流都要有一份要求");
+        assert!(
+            req.required.is_empty(),
+            "{workflow:?} 不应再要求标定区域，实际 {:?}",
+            req.required
+        );
+    }
 }
 
 /// ★ 任务输入按工作流校验，而**判据只有一处**（`workflow_inputs`）。
-///
-/// 2026-09-20 实测的现象：选了「只做导航」+ 通讯录，点「开始任务」**什么都不发生**
-/// ——`data/` 下连 `task-*.log` 都没生成。原因是命令层无条件要求联系人与正文非空，
-/// 而界面上那两个框（对这条路毫无意义）空着时按钮根本点不动、也不说为什么。
-///
-/// 这条用例钉两件事：
-/// ① 每条工作流的答案本身（只做导航：都不用；另外两条：都要）；
-/// ② `workflow_requirements` 下发的与 `workflow_inputs` 说的是同一份
-///    —— 界面按前者渲染、命令层按后者拒绝，两者分叉就又回到"点不动/白填"。
 #[test]
 fn task_inputs_are_decided_by_the_workflow() {
     for (workflow, contact, message) in [
-        (Workflow::ChatListSend, false, false),
         (Workflow::ChatListSend, true, true),
         (Workflow::ContactsSearchSend, true, true),
     ] {

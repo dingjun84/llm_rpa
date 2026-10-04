@@ -197,7 +197,7 @@ pub fn write_start_header(
     );
     log_line!(log_path, &format!("窗口类名   : {}", config.window_class));
     log_line!(log_path, &format!("目标程序   : {:?}", config.wecom_exe));
-    log_line!(log_path, &format!("OCR 程序   : {:?}", config.ocr_command));
+    log_line!(log_path, &format!("OCR 服务   : {}/ocr", config.yolo_api_base.trim_end_matches('/')));
     log_line!(log_path, &format!("标定尺寸   : {:?}", config.calibrated_window));
     log_line!(
         log_path,

@@ -6,9 +6,10 @@
 //! 4. 右侧资料页 OCR「发消息」并点击（无 YOLO 类）
 //! 5. 进入聊天后同 Flow A：input_bar → 输入 → send_button
 
-use crate::ports::{AutomationError, Point, Rect};
+use crate::diagnostics::{Decision, Verdict};
+use crate::ports::{AutomationError, Point, Rect, TextBox};
 use crate::state::TaskState;
-use crate::yolo::{best_by_class, class};
+use crate::yolo::{all_by_class, best_by_class, class};
 
 use super::Run;
 
@@ -56,6 +57,10 @@ impl Run<'_> {
             std::thread::sleep(self.cfg().scroll_settle_timeout);
         }
 
+        // 强制落一帧「搜索下拉结果」：把当前 CONTACT_ITEM（及同屏其它 class）画进过程回放，
+        // 再进入滚动查找——否则失败时只能看到空 evidence，看不出下拉里到底检出了什么。
+        self.yolo_report_search_dropdown_results()?;
+
         let matched = self.yolo_scroll_find_contact(class::CONTACT_ITEM)?;
         self.advance(
             TaskState::VerifyingCandidate,
@@ -92,6 +97,58 @@ impl Run<'_> {
 
         self.advance(TaskState::PreparingMessage, None)?;
         self.yolo_type_and_send(window, &shot, &dets)
+    }
+
+
+    /// 输入关键词并停稳后：整窗 YOLO 一次，步骤名固定为「搜索下拉结果」。
+    ///
+    /// 决策里列出全部 `contact_item`（通过 = 检出）；若一个都没有则 `passed=false`，
+    /// 过程回放默认会停在这一步——这正是「下拉里没点到人」时首先要看的画面。
+    fn yolo_report_search_dropdown_results(&mut self) -> Result<(), AutomationError> {
+        let (_window, _shot, dets) = self.yolo_detect_window("搜索下拉结果")?;
+        let items = all_by_class(&dets, class::CONTACT_ITEM);
+        let candidates: Vec<Verdict> = items
+            .iter()
+            .map(|d| {
+                let tb = TextBox {
+                    text: format!("{} {:.2}", d.class_name, d.conf),
+                    bounds: d.bounds_rect(),
+                    confidence: d.conf,
+                };
+                Verdict::passed(&tb, "检出 contact_item")
+            })
+            .collect();
+        let passed = !candidates.is_empty();
+        let outcome = if passed {
+            format!(
+                "检出 {} 个 contact_item（同屏总检出 {}）",
+                candidates.len(),
+                dets.len()
+            )
+        } else {
+            format!(
+                "未检出 contact_item（同屏总检出 {}；请核对 YOLO class / 搜索是否已过滤出结果）",
+                dets.len()
+            )
+        };
+        self.evidence.push(format!("搜索下拉结果：{outcome}"));
+        self.report_decision(
+            "搜索下拉结果",
+            Decision {
+                step: String::new(),
+                question: format!(
+                    "搜索「{}」后，下拉/列表里有哪些 contact_item？",
+                    self.task.external_contact_name.trim()
+                ),
+                rule: "YOLO class=`contact_item`（本步只记录检出，不做姓名 OCR）".into(),
+                outcome,
+                passed,
+                min_confidence: self.cfg().yolo_conf,
+                replay: None,
+                candidates,
+            },
+        );
+        Ok(())
     }
 
     /// 在窗口右半侧 OCR 找「发消息」并点击。

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::{AutomationError, Point, Rect, Screenshot};
+use crate::ports::{AutomationError, Point, Rect, Screenshot, TextBox};
 
 /// YOLO 类别名（与 `yolo26/API.md` / `CLASS_NAMES_CANONICAL` 对齐）。
 pub mod class {
@@ -55,6 +55,25 @@ impl YoloDetection {
             height: (y2 - y1).max(1),
         }
     }
+}
+
+
+/// 把 YOLO 检测框转成 [`TextBox`]，供过程诊断 / TaskReplay 复用文字框叠加层。
+///
+/// ## 为什么复用 TextBox 而不是另开 overlay 类型
+///
+/// `Observation::text_boxes` 与 `annotate_step` 已经约定「本帧图像坐标 + 右侧文字栏」。
+/// YOLO 框的 `xyxy` 本来就是原图像素，与这条约定一致；`text` 写成 `class conf`，
+/// 复盘时一眼能对上检出类别与置信度，前端也不必为 YOLO 单独改渲染。
+pub fn detections_as_text_boxes(dets: &[YoloDetection]) -> Vec<TextBox> {
+    dets
+        .iter()
+        .map(|d| TextBox {
+            text: format!("{} {:.2}", d.class_name, d.conf),
+            bounds: d.bounds_rect(),
+            confidence: d.conf,
+        })
+        .collect()
 }
 
 /// 远程 / 本地 YOLO 检测端口。实现方负责编码 PNG 与 HTTP；核心层只吃结果。
@@ -159,5 +178,29 @@ impl YoloDetector for UnconfiguredYolo {
         Err(AutomationError::Platform(
             "未配置 YOLO 检测器：真实模式需要远程 /predict 适配器。".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn det(class_name: &str, conf: f32, xyxy: [f32; 4]) -> YoloDetection {
+        YoloDetection {
+            class_id: 0,
+            class_name: class_name.into(),
+            conf,
+            center: [(xyxy[0] + xyxy[2]) / 2.0, (xyxy[1] + xyxy[3]) / 2.0],
+            xyxy,
+        }
+    }
+
+    #[test]
+    fn detections_as_text_boxes_label_and_bounds() {
+        let boxes = detections_as_text_boxes(&[det("contact_item", 0.91, [10.0, 20.0, 110.0, 60.0])]);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].text, "contact_item 0.91");
+        assert!((boxes[0].confidence - 0.91).abs() < f32::EPSILON);
+        assert_eq!(boxes[0].bounds, Rect { x: 10, y: 20, width: 100, height: 40 });
     }
 }

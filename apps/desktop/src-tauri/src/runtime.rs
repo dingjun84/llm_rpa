@@ -4,7 +4,7 @@
 //!
 //! - **演练模式**（`DryRun`）：全部使用 `platform-mock` 的替身端口，
 //!   不接触真实桌面、不启动企业微信、不产生任何输入事件。用于演示与自检。
-//! - **真实模式**（`Live`）：使用 `platform-windows` / `platform-macos` 与本地 OCR 进程。
+//! - **真实模式**（`Live`）：使用 `platform-windows` / `platform-macos` 与远程 OCR（和 YOLO 同一服务地址）。
 //!   所有敏感参数都必须由使用者在界面上显式配置。
 
 use std::sync::Arc;
@@ -143,9 +143,7 @@ pub struct RuntimeConfig {
     /// 可执行文件期望的 SHA-256；留空表示跳过校验。
     pub wecom_exe_sha256: Option<String>,
     pub window_class: String,
-    /// 本地 OCR 程序路径；留空表示未配置。
-    pub ocr_command: Option<String>,
-    pub ocr_args: Vec<String>,
+    /// 单次远程 OCR 请求超时。OCR 与图标检测共用 `yolo_api_base`。
     pub ocr_timeout_ms: u64,
     /// 单步超时的**下限**（秒）。
     ///
@@ -382,8 +380,6 @@ impl Default for RuntimeConfig {
             wecom_exe: None,
             wecom_exe_sha256: None,
             window_class: "WeWorkWindow".to_string(),
-            ocr_command: None,
-            ocr_args: Vec::new(),
             ocr_timeout_ms: 10_000,
             // 比 OCR 超时（10 秒）宽 2 倍，给慢机器留余量；
             // 真正的下限由 effective_step_timeout 推导，不靠这个值兜底。
@@ -396,7 +392,7 @@ impl Default for RuntimeConfig {
             max_scroll_attempts: 20,
             scroll_notches_per_step: 3,
             scroll_anchor: ScrollAnchorConfig::default(),
-            // 默认没有标定尺寸：真实模式必须先在界面上点「记录窗口尺寸」。
+            // 默认没有标定尺寸。YOLO 产品路径不依赖它；标定页仍可单独记录。
             calibrated_window: None,
             calibrations: Vec::new(),
             // 两轮：一轮从当前位置扫到底，一轮回顶重扫。
@@ -605,18 +601,12 @@ fn build_matcher(relaxed: bool) -> Arc<dyn automation_core::ContactMatcher> {
     }
 }
 
-/// 真实模式：装配当前操作系统的平台适配层与本地 OCR。
+/// 真实模式：装配当前操作系统的平台适配层。OCR 走远程 `/ocr`，地址与 YOLO 相同。
 fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
-    use vision::{ExternalOcr, UnconfiguredOcr};
-
-    let ocr: Arc<dyn LocalOcr> = match config.ocr_command.as_ref() {
-        Some(command) if !command.trim().is_empty() => Arc::new(
-            ExternalOcr::new(command.trim())
-                .with_args(config.ocr_args.clone())
-                .with_timeout(Duration::from_millis(config.ocr_timeout_ms.max(500))),
-        ),
-        _ => Arc::new(UnconfiguredOcr),
-    };
+    let ocr: Arc<dyn LocalOcr> = Arc::new(crate::ocr_http::HttpOcr::new(
+        &config.yolo_api_base,
+        Duration::from_millis(config.ocr_timeout_ms.max(500)),
+    ));
 
     #[cfg(windows)]
     let platform: Arc<dyn automation_core::DesktopPlatform> = {
@@ -850,13 +840,20 @@ impl Default for RunChoice {
 
 /// 组装一个可运行的 [`WorkflowRunner`]。
 ///
-/// `icons_dir` 是**图标库目录**（由调用方按 [`RuntimeConfig::icons_dir`] 解析好）。
-/// 之所以从外面传进来而不是在这里算：算它需要"配置没写时的兜底目录"，
-/// 那是应用状态才知道的事（见 `AppState::icons_dir`）。
+/// `icons_dir` 是历史参数（图标库目录）。当前产品工作流（`ChatListSend` /
+/// `ContactsSearchSend`）用远程 YOLO + OCR 定位 UI，**不再**载入导航图标模板；
+/// 保留该参数是为了不改调用方签名。配置没写时的兜底目录仍由 `AppState::icons_dir` 解析。
 ///
 /// `choice` 是**本次任务**要跑的那条路（运行参数，来自任务请求，见 [`RunChoice`]）。
-/// 它决定跑演练还是真实、用哪几块标定区域、要不要点导航图标；**不写回配置**。
+/// 它决定跑演练还是真实、走哪条工作流；**不写回配置**。
 /// 注意它带来的模式**会覆盖** `config.mode`——配置里那个只是"这台机器的默认值"。
+///
+/// ## 真实模式不再依赖「界面标定」
+///
+/// 产品路径的 UI 定位全部走远程 YOLO + OCR，不读区域框选 / 窗口尺寸标定。
+/// 因此装配期**不**要求 `calibrations`、不 `pick_calibration` / `apply_snapshot`，
+/// 并显式清空交给核心层的 `calibrated_window` / `calibration_alts`，避免
+/// `enter_client` 按旧标注尺寸强制改窗。标定页本身保留，只是任务启动不再依赖它。
 pub fn build_runner(
     config: &RuntimeConfig,
     choice: &RunChoice,
@@ -869,50 +866,22 @@ pub fn build_runner(
     //
     // 放在所有校验之前，是因为下面每一处"模式相关"的判断，问的都是
     // "**这一次**跑的是演练还是真实"：
-    // - 真实模式没有标定尺寸就拒绝开跑；
     // - 挑替身端口还是真实端口；
-    // - 审计里记 `dry-run` 还是当前系统；
-    // - 要不要把标定窗口交给核心层（演练模式没有"真实窗口尺寸"这回事）。
+    // - 审计里记 `dry-run` 还是当前系统。
     //
-    // 这四处**只该有一个判据**。所以不在这里逐条 `if`，而是把模式本身换掉，
-    // 让它们照旧读 `config.mode` —— 之后再加第五处也不会漏。
+    // 这两处**只该有一个判据**。所以不在这里逐条 `if`，而是把模式本身换掉，
+    // 让它们照旧读 `config.mode` —— 之后再加第三处也不会漏。
     //
     // ⚠️ 只改**内存里的副本**：不写回 `state.config`、不落盘。这正是
     // 「界面上选的那个模式，不点保存也生效」的落点。
     let mut config = config.clone();
     config.mode = choice.mode;
 
-    // 真实模式下没有标定尺寸就拒绝开跑。客户端由操作者手动启动，程序没法从窗口外面
-    // 分辨"这是不是我标定过的那个窗口、是不是那个尺寸"，只能靠这条记录。
-    // 少了它，"按标定尺寸工作"就只是一句口号：尺寸变了区域会整体偏移，而点击
-    // 落偏的后果是点到别的地方——宁可停在原地让人把窗口恢复回去。
-    if config.mode == RuntimeMode::Live {
-        config.ensure_calibrations_migrated();
-        if config.calibrations.is_empty() {
-            return Err(
-                "真实模式必须先在「界面标定」页记录至少一份窗口标定并保存：                 先点「记录窗口尺寸」，再框区域。任务按当前显示器缩放挑选对应那份标定；                 缩放对不上会直接拒绝，绝不用错缩放的区域去点。"
-                    .to_string(),
-            );
-        }
-    }
-
-    // 滚动落点也得是个合法比例。核心层同样会拦（而且是在**第一次滚动之前**就拦），
-    // 这里再拦一道的理由跟上面那条一样：在核心层报错时任务已经登记进列表了，
-    // 会留下一条注定失败的记录，让人以为任务真的跑过。
-    let anchor = config.scroll_anchor;
-    if !anchor.is_valid() {
-        return Err(format!(
-            "滚动落点必须在 0–1 之间（当前 {:.2} / {:.2}）：\
-             它是鼠标停在联系人候选区内的位置比例，超出范围会落到区域外面，\
-             滚轮就滚不动那个列表了。",
-            anchor.x, anchor.y
-        ));
-    }
-
     // ── 所选工作流必须的标定区域 ────────────────────────────────
     //
-    // 和上面两条同一个道理：**放在装配期**。装配失败**不会在任务列表里
-    // 留下记录**，装配成功才会登记。所以能提前判的一律提前判。
+    // 当前产品工作流的 `required_marks` 为空（YOLO 定位），这里通常直接通过。
+    // 仍保留这道闸：若将来某条工作流重新声明必需区域，装配失败**不会**在
+    // 任务列表里留下记录。
     let missing = missing_marks(&config, choice);
     if !missing.is_empty() {
         return Err(format!(
@@ -926,60 +895,10 @@ pub fn build_runner(
         ));
     }
 
-    // ── 靶标文字不能是空的 ──────────────────────────────────────
-    //
-    // 空串在"包含"判断里**匹配一切**：空的分组标题会让下拉里的第一行
-    // 被当成「联系人」组的标题，于是后面整段判据全部错位——而任务照样跑完。
-    // 这属于"配置写错了"而不是"界面上没有"，所以在装配期拦。
-    for (value, label, key) in [
-        (
-            &config.profile_chat_entry_text,
-            "资料页进入聊天的入口文字",
-            "profile_chat_entry_text",
-        ),
-        (
-            &config.search_contact_group_label,
-            "搜索下拉里联系人分组的标题",
-            "search_contact_group_label",
-        ),
-        (
-            &config.send_button_text,
-            "发送按钮上的文字",
-            "send_button_text",
-        ),
-    ] {
-        if value.trim().is_empty() {
-            return Err(format!(
-                "「{label}」（{key}）不能留空：空文字在「包含」判断里会匹配到任何一行，\
-                 结果不是「找不到」而是找错。填上客户端上实际显示的那几个字。"
-            ));
-        }
-    }
-
     let ports = match config.mode {
         RuntimeMode::DryRun => dry_run_ports(&config, task),
         RuntimeMode::Live => live_ports(&config)?,
     };
-
-    // 真实模式：按**当前**显示器缩放挑一份标定，覆盖工作副本后再交给核心层。
-    // 演练模式没有真窗口，继续用配置里正在编辑的那一份（或默认值）。
-    if config.mode == RuntimeMode::Live {
-        // 装配期还没 focus，必须用「定位目标窗 → 所在屏缩放」，与「记录窗口尺寸」同源。
-        let (_rect, metrics) = ports
-            .platform
-            .measure_target_window()
-            .map_err(|err| format!("读取目标窗口所在显示器缩放失败：{err}"))?;
-        eprintln!(
-            "[build_runner] measure_target_window: scale={:.2}, window={}x{}",
-            metrics.scale_factor, _rect.width, _rect.height
-        );
-        let snap = config.pick_calibration(metrics.scale_factor)?.clone();
-        eprintln!(
-            "[build_runner] picked calibration: scale={:.2}, window={}x{}",
-            snap.scale_factor, snap.window.width, snap.window.height
-        );
-        config.apply_snapshot(&snap);
-    }
 
     let mut runner_config = config.to_runner_config();
 
@@ -990,9 +909,14 @@ pub fn build_runner(
     // 不回写 `state.config`、也不落盘——这正是「选工作流不要保存」的落点。
     //
     // ⚠️ 模式不在这里覆盖：它在本函数**开头**就换掉了 `config.mode`，
-    // 所以 `to_runner_config()` 出来的 `platform_label` / `calibrated_window`
-    // 已经是本次的那一份。再覆盖一遍等于把判据写成两处。
+    // 所以 `to_runner_config()` 出来的 `platform_label` 已经是本次的那一份。
     runner_config.workflow = choice.workflow;
+
+    // YOLO 产品路径：定位不依赖标注几何。即便配置里还留着旧的窗口标定 /
+    // 多份缩放快照，也绝不能交给核心层——否则 `ensure_calibrated_size` 会
+    // 按旧尺寸强行改窗。演练模式本来就是 `None`；这里对两种模式统一清空。
+    runner_config.calibrated_window = None;
+    runner_config.calibration_alts.clear();
 
     // YOLO 工作流用远程检测点导航图标，不再装配模板匹配导航。
     // 保留 nav_* 字段以兼容旧配置反序列化；新路径不读它们。

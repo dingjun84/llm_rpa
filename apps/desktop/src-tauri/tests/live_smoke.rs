@@ -144,7 +144,7 @@ fn write_scratch_file() -> PathBuf {
     path
 }
 
-fn live_config(ocr: &Path) -> RuntimeConfig {
+fn live_config() -> RuntimeConfig {
     RuntimeConfig {
         mode: RuntimeMode::Live,
         window_class: TARGET_CLASS.to_string(),
@@ -152,7 +152,6 @@ fn live_config(ocr: &Path) -> RuntimeConfig {
         // 这里刻意留空：`wecom_exe` 现在的用途是**校验窗口归属**——
         // 一旦填了它，定位就会要求窗口必须属于该程序，而本用例的靶标是记事本。
         wecom_exe: None,
-        ocr_command: Some(ocr.to_string_lossy().into_owned()),
         min_confidence: 0.85,
         regions: RegionConfig {
             contact_panel: TEXT_AREA,
@@ -279,7 +278,7 @@ fn live_run_against_a_stand_in_window() {
         .expect("启动记事本失败");
     let _guard = ChildGuard(notepad);
 
-    let config = with_measured_geometry(live_config(&ocr_path));
+    let config = with_measured_geometry(live_config());
     let rect = wait_for_window(Duration::from_secs(20));
     println!(
         "已定位目标窗口：{}x{} @({},{})\n",
@@ -356,7 +355,7 @@ fn live_run_refuses_to_send_when_the_contact_is_absent() {
         .expect("启动记事本失败");
     let _guard = ChildGuard(notepad);
 
-    let config = live_config(&ocr_path);
+    let config = live_config();
     wait_for_window(Duration::from_secs(20));
 
     let task = SendTask {

@@ -296,7 +296,6 @@ fn live_wechat_finds_contact_by_scrolling_and_types_without_sending() {
     // 该程序。本用例要验的是滚动查找与输入这条链路，所以留空，不去和标定文件里
     // 可能写着的目标程序较劲。
     config.wecom_exe = None;
-    config.ocr_command = Some(ocr_path.to_string_lossy().into_owned());
     config.wecom_exe_sha256 = None;
 
     let contact = std::env::var("RPA_LIVE_CONTACT").unwrap_or_else(|_| DEFAULT_CONTACT.to_string());
@@ -453,7 +452,6 @@ fn live_wechat_refuses_when_the_contact_cannot_be_found() {
     config.stop_before_send = true;
     // 同正例：客户端由操作者手动启动，`wecom_exe` 现在只用于校验窗口归属，留空。
     config.wecom_exe = None;
-    config.ocr_command = Some(ocr_path.to_string_lossy().into_owned());
     config.wecom_exe_sha256 = None;
 
     let desktop = desktop_for(&config);
@@ -578,7 +576,6 @@ fn live_wechat_navigates_to_a_view() {
     // 客户端由操作者手动启动；`wecom_exe` 现在的用途是校验窗口归属，这里留空。
     config.wecom_exe = None;
     config.wecom_exe_sha256 = None;
-    config.ocr_command = Some(ocr_path.to_string_lossy().into_owned());
 
     // 导航目标就是**图标库里的目录名**（`data/icons/` 下一级目录）。
     // 它同时指定了"点哪个图标"和"拿哪个目录的图当模板"——现在是同一件事，

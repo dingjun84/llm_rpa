@@ -29,7 +29,7 @@ export function AdvancedParamsSection({ draft, onPatch }: Props) {
         <span className="field-label">超时（毫秒 / 秒）</span>
         <div className="calibration-inputs">
           <label>
-            <span>单次 OCR 上限</span>
+            <span>单次 OCR 请求上限</span>
             <input
               type="number"
               min={500}
@@ -54,7 +54,8 @@ export function AdvancedParamsSection({ draft, onPatch }: Props) {
           </label>
         </div>
         <span className="field-hint">
-          机器慢或窗口大时把「单次 OCR 上限」调大即可——单步超时会自动跟着放宽
+          远程 OCR 和图标检测用同一个服务地址。机器慢时把「单次 OCR 请求上限」调大即可——
+          单步超时会自动跟着放宽
           （取<code>单步下限</code>与<code>OCR 上限 + 5 秒</code>中的较大者），
           不会出现「调大了 OCR 超时却被单步超时提前掐断」的情况。
         </span>

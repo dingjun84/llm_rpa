@@ -10,8 +10,9 @@ interface Props {
 }
 
 /**
- * 「目标窗口」这一组：可执行文件路径与哈希、启动客户端、窗口类名、
- * 本地 OCR 程序路径（窗口尺寸改在「界面标定」页按缩放分别记录）。
+ * 「目标窗口」这一组：可执行文件路径与哈希、启动客户端、窗口类名
+ * （窗口尺寸改在「界面标定」页按缩放分别记录）。
+ * OCR 不再单独配置，和远程图标检测共用服务地址。
  *
  * ## 为什么单独成文件
  *
@@ -57,7 +58,7 @@ export function TargetWindowSection({ draft, onPatch, busy }: Props) {
       </div>
       <p className="field-hint">
         指认窗口已挪到「界面标定」页（按鼠标下最上层窗取，不必先获焦）。
-        这里只保留路径、类名、启动与 OCR——改完仍要点「保存配置」。
+        这里只保留路径、类名和启动。OCR 走图标检测同一个服务地址，不在这里配。改完仍要点「保存配置」。
       </p>
 
       <label className="field">
@@ -123,20 +124,6 @@ export function TargetWindowSection({ draft, onPatch, busy }: Props) {
         任务开跑时按当前缩放自动挑选对应那份——缩放对不上会直接拒绝，不会拿错份去点。
       </p>
 
-      <label className="field">
-        <span className="field-label">本地 OCR 程序路径</span>
-        <input
-          type="text"
-          value={draft.ocr_command ?? ""}
-          placeholder="留空表示未配置，任务会停在人工处理"
-          onChange={(event) => update("ocr_command", event.target.value || null)}
-        />
-        <span className="field-hint">
-          OCR 程序从标准输入读取 PNG，向标准输出写 JSON 数组；不允许联网。
-          仓库里自带 <code>tools/winocr</code>（用 Windows 内置离线 OCR），
-          构建后填 <code>&lt;仓库&gt;/target/debug/winocr.exe</code> 即可。
-        </span>
-      </label>
     </section>
   );
 }

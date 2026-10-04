@@ -251,8 +251,7 @@ export interface RuntimeConfig {
   wecom_exe: string | null;
   wecom_exe_sha256: string | null;
   window_class: string;
-  ocr_command: string | null;
-  ocr_args: string[];
+  /** 单次远程 OCR 请求超时。地址与图标检测的 `yolo_api_base` 相同。 */
   ocr_timeout_ms: number;
   /**
    * 单步超时的下限（秒）。

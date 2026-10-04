@@ -3,23 +3,30 @@
 //! ★ 坐标换算只用 [`crate::yolo::shot_point_to_screen`]；
 //! ★ 按 class 挑框只用 [`crate::yolo::best_by_class`] / [`crate::yolo::all_by_class`]；
 //! ★ 姓名是否接受仍问 [`ContactMatcher`]（判据不另开一处）。
+//! ★ 每次 YOLO 检出都经 [`crate::yolo::detections_as_text_boxes`] 交给诊断，
+//!   过程回放才能画出与 OCR 步骤同款的叠加框（不必改前端）。
 
+use crate::diagnostics::{Decision, MatchTrail, ReplayInput, Verdict};
 use crate::ports::{AutomationError, Point, Rect, Screenshot, TextBox};
 use crate::yolo::{
-    self, all_by_class, best_by_class, item_tall_enough_for_two_lines, name_match_score,
-    shot_point_to_screen, YoloDetection, DEFAULT_MIN_ITEM_HEIGHT_PX,
+    self, all_by_class, best_by_class, detections_as_text_boxes, item_tall_enough_for_two_lines,
+    name_match_score, shot_point_to_screen, YoloDetection, DEFAULT_MIN_ITEM_HEIGHT_PX,
 };
 
+use super::decision::name_match_decision;
 use super::Run;
 
 impl Run<'_> {
     /// 截整窗 → YOLO 检测。返回窗口矩形、截图、检测列表。
+    ///
+    /// 诊断侧会落一张带 YOLO 框的标注图：`text` = `class conf`，bounds 为本帧图像坐标。
+    /// 故意**不**走 [`Self::capture_frame`]（那会先报一条空框观察），避免过程回放多一步空图。
     pub(super) fn yolo_detect_window(
         &mut self,
         step: &str,
     ) -> Result<(Rect, Screenshot, Vec<YoloDetection>), AutomationError> {
         let window = self.window.ok_or(AutomationError::ClientNotReady)?;
-        let shot = self.capture_frame(window, step)?;
+        let shot = self.with_retry(step, || self.runner.ports.platform.capture(window))?;
         let conf = self.cfg().yolo_conf;
         let dets = self
             .runner
@@ -32,6 +39,8 @@ impl Run<'_> {
                 )),
                 other => other,
             })?;
+        let overlays = detections_as_text_boxes(&dets);
+        self.report(step, window, &shot, &overlays, None, None);
         self.evidence.push(format!(
             "{step}：YOLO 检出 {} 个（conf≥{conf:.2}，图 {}×{}）",
             dets.len(),
@@ -42,6 +51,8 @@ impl Run<'_> {
     }
 
     /// 把检测中心换算成屏幕坐标并 `guarded_click`（Windows 上应由 GhostBox 实现）。
+    ///
+    /// 同时落一条「看图 + 判定」：标注图只圈被点的那一框，决策写清 class / conf / 屏幕 xy。
     pub(super) fn yolo_click_detection(
         &mut self,
         window: Rect,
@@ -56,6 +67,38 @@ impl Run<'_> {
             "点击{what}：{} conf={:.2} → 屏幕 ({}, {})",
             det.class_name, det.conf, target.x, target.y
         ));
+        let click_step = format!("点击{what}");
+        let overlay = TextBox {
+            text: format!("{} {:.2}", det.class_name, det.conf),
+            bounds: det.bounds_rect(),
+            confidence: det.conf,
+        };
+        self.report(&click_step, window, shot, &[overlay.clone()], None, None);
+        self.report_decision(
+            &click_step,
+            Decision {
+                step: String::new(),
+                question: format!("要点击哪个检测框（{what}）？"),
+                rule: format!(
+                    "YOLO class=`{}` 中心 → shot_point_to_screen → guarded_click",
+                    det.class_name
+                ),
+                outcome: format!(
+                    "点击 {} conf={:.2} → 屏幕 ({}, {})",
+                    det.class_name, det.conf, target.x, target.y
+                ),
+                passed: true,
+                min_confidence: det.conf,
+                replay: None,
+                candidates: vec![Verdict::passed(
+                    &overlay,
+                    format!(
+                        "选中目标 class={} conf={:.2} center=({}, {})",
+                        det.class_name, det.conf, target.x, target.y
+                    ),
+                )],
+            },
+        );
         self.ensure_not_frozen(&format!("已取消点击{what}"))?;
         self.runner
             .ports
@@ -136,6 +179,8 @@ impl Run<'_> {
     ///
     /// 策略：跳过高度不够两行的裁切条目；姓名匹配优先首行中**更靠前**出现的；
     /// 是否接受目标名仍问 matcher（与全库其它姓名判据同源）。
+    ///
+    /// 每个候选的通过 / 淘汰都会经 [`Self::report_decision`] 落盘，过程回放右侧候选表可核对。
     pub(super) fn yolo_find_name_in_items(
         &mut self,
         window: Rect,
@@ -147,6 +192,25 @@ impl Run<'_> {
     ) -> Result<Option<YoloDetection>, AutomationError> {
         let items = all_by_class(dets, item_class);
         if items.is_empty() {
+            self.report_decision(
+                step,
+                Decision {
+                    step: String::new(),
+                    question: format!(
+                        "「{item_class}」里哪一条是目标联系人「{}」？",
+                        expected_name.trim()
+                    ),
+                    rule: format!("YOLO class=`{item_class}` 首行 OCR + ContactMatcher"),
+                    outcome: format!("本帧未检出任何「{item_class}」"),
+                    passed: false,
+                    min_confidence: self.cfg().min_confidence,
+                    replay: Some(ReplayInput::NameMatch {
+                        expected_name: expected_name.to_string(),
+                        relaxed: true,
+                    }),
+                    candidates: Vec::new(),
+                },
+            );
             return Ok(None);
         }
         let min_h = {
@@ -159,18 +223,30 @@ impl Run<'_> {
             (DEFAULT_MIN_ITEM_HEIGHT_PX as f32 * scale).round() as i32
         };
 
-        let mut best: Option<(YoloDetection, usize, f32)> = None;
+        let mut best: Option<(YoloDetection, usize, f32, TextBox)> = None;
+        let mut runners_up: Vec<TextBox> = Vec::new();
+        let mut verdicts: Vec<Verdict> = Vec::new();
         for det in items {
+            let det_box = TextBox {
+                text: format!("{} {:.2}", det.class_name, det.conf),
+                bounds: det.bounds_rect(),
+                confidence: det.conf,
+            };
             let bounds = det.bounds_rect();
             if !item_tall_enough_for_two_lines(bounds, min_h) {
                 self.evidence.push(format!(
                     "{step}：跳过半截条目（高 {}px < {min_h}）",
                     bounds.height
                 ));
+                verdicts.push(Verdict::rejected(
+                    &det_box,
+                    format!("半截条目 高 {}px < {min_h}", bounds.height),
+                ));
                 continue;
             }
             let boxes = self.yolo_ocr_bbox(window, shot, det, step)?;
             let Some(first) = Self::yolo_first_line_text(&boxes) else {
+                verdicts.push(Verdict::rejected(&det_box, "bbox 内无 OCR 文字"));
                 continue;
             };
             if self.cfg().log_ocr_candidates {
@@ -180,7 +256,7 @@ impl Run<'_> {
                     first.confidence
                 ));
             }
-            // 构造一个 TextBox 问 matcher（bounds 仅占位）。
+            // 构造一个 TextBox 问 matcher（bounds 用 OCR 首行框，便于回放对齐文字）。
             let candidate = TextBox {
                 text: first.text.clone(),
                 bounds: first.bounds,
@@ -195,6 +271,10 @@ impl Run<'_> {
                 // 放宽：若配置用 contains 匹配器，accepts 已覆盖；
                 // 若严格匹配失败，再试「首行包含目标名」（与产品「首行姓名」约定一致）。
                 if name_match_score(&first.text, expected_name).is_none() {
+                    verdicts.push(Verdict::rejected(
+                        &candidate,
+                        format!("不匹配「{}」", expected_name.trim()),
+                    ));
                     continue;
                 }
             }
@@ -203,15 +283,63 @@ impl Run<'_> {
                 .unwrap_or((usize::MAX, 0.0));
             let replace = match &best {
                 None => true,
-                Some((_, best_idx, best_conf)) => {
+                Some((_, best_idx, best_conf, _)) => {
                     score.0 < *best_idx || (score.0 == *best_idx && score.1 > *best_conf)
                 }
             };
             if replace {
-                best = Some((det.clone(), score.0, score.1.max(first.confidence)));
+                if let Some((_, _, _, prev)) = best.take() {
+                    runners_up.push(prev);
+                }
+                best = Some((
+                    det.clone(),
+                    score.0,
+                    score.1.max(first.confidence),
+                    candidate,
+                ));
+            } else {
+                runners_up.push(candidate);
             }
         }
-        Ok(best.map(|(d, _, _)| d))
+        for prev in &runners_up {
+            verdicts.push(Verdict::rejected(
+                prev,
+                "匹配成立但不是本屏最佳命中",
+            ));
+        }
+        if let Some((_, idx, conf, ref tb)) = &best {
+            verdicts.push(Verdict::passed(
+                tb,
+                format!(
+                    "首行「{}」匹配「{}」（idx={idx} conf={conf:.2}）",
+                    tb.text.trim(),
+                    expected_name.trim(),
+                ),
+            ));
+        }
+
+        let match_result: Result<TextBox, AutomationError> = match &best {
+            Some((_, _, _, tb)) => Ok(tb.clone()),
+            None => Err(AutomationError::NeedsHumanReview(format!(
+                "本帧「{item_class}」中未匹配到「{}」",
+                expected_name.trim()
+            ))),
+        };
+        let trail = MatchTrail {
+            rule: "YOLO 条目首行 OCR + ContactMatcher / name_match_score",
+            relaxed: true,
+            candidates: verdicts,
+        };
+        self.report_decision(
+            step,
+            name_match_decision(
+                &trail,
+                expected_name,
+                self.cfg().min_confidence,
+                &match_result,
+            ),
+        );
+        Ok(best.map(|(d, _, _, _)| d))
     }
 
     /// 列表区中心作为滚轮落点：取全部 item 的包围盒中心；没有则窗口水平 35%、垂直居中。

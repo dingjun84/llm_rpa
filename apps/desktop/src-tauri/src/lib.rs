@@ -29,6 +29,7 @@ pub mod icon_library;
 pub mod legacy_data;
 pub mod yolo_remote;
 pub mod yolo_http;
+pub mod ocr_http;
 pub mod ghostbox_mouse;
 pub mod runtime;
 pub mod startup_log;
