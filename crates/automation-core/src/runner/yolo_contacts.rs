@@ -61,7 +61,8 @@ impl Run<'_> {
         // 再进入滚动查找——否则失败时只能看到空 evidence，看不出下拉里到底检出了什么。
         self.yolo_report_search_dropdown_results()?;
 
-        let matched = self.yolo_scroll_find_contact(class::CONTACT_ITEM)?;
+        let (_found_window, _found_shot, matched) =
+            self.yolo_scroll_find_contact(class::CONTACT_ITEM)?;
         self.advance(
             TaskState::VerifyingCandidate,
             Some(format!("命中联系人条目 conf={:.2}", matched.conf)),
@@ -153,7 +154,8 @@ impl Run<'_> {
 
     /// 在窗口右半侧 OCR 找「发消息」并点击。
     pub(super) fn yolo_click_send_message_on_profile(&mut self) -> Result<(), AutomationError> {
-        let window = self.window.ok_or(AutomationError::ClientNotReady)?;
+        // 点通讯录后窗口可能已经变宽，截右栏前重读当前矩形。
+        let window = self.ensure_calibrated()?;
         // 右栏：大约窗口右 55%（企微三栏布局）。
         let region = Rect {
             x: window.x + (window.width as f32 * 0.45).round() as i32,

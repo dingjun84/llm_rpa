@@ -29,36 +29,15 @@ impl Run<'_> {
         }
 
         self.advance(TaskState::SearchingContact, Some("在会话列表中查找".into()))?;
-        let matched = self.yolo_scroll_find_contact(class::CONVERSATION_ITEM)?;
+        // 列表查找里的首行 OCR 已经对上名字。命中后直接点这一帧的 conversation_item，
+        // 不再对每个会话框做「点击前确认会话名」。坐标用产生命中的那一帧。
+        let (window, shot, matched) = self.yolo_scroll_find_contact(class::CONVERSATION_ITEM)?;
 
         self.advance(
             TaskState::VerifyingCandidate,
             Some(format!("命中会话条目 conf={:.2}", matched.conf)),
         )?;
-
-        {
-            let (window, shot, _) = self.yolo_detect_window("点击会话前复检")?;
-            // 用刚找到的条目坐标：复检帧里按同 class 最高分近似同一行。
-            // 更稳的做法是保存 matched 的 xyxy；这里直接点 matched（相对上一帧）。
-            // 若布局已变，下面的聊天页确认会拦住。
-            let _ = (window, shot);
-        }
-        {
-            let (window, shot, dets) = self.yolo_detect_window("点击会话")?;
-            // 优先用上一轮 matched 的 class_name 在新帧里再找同名联系人；
-            // 找不到则点 conf 最高的 conversation_item 中再次 OCR 匹配。
-            let click_target = self
-                .yolo_find_name_in_items(
-                    window,
-                    &shot,
-                    &dets,
-                    class::CONVERSATION_ITEM,
-                    &self.task.external_contact_name,
-                    "点击前确认会话名",
-                )?
-                .unwrap_or(matched);
-            self.yolo_click_detection(window, &shot, &click_target, "会话条目")?;
-        }
+        self.yolo_click_detection(window, &shot, &matched, "会话条目")?;
 
         self.advance(TaskState::VerifyingChatHeader, Some("确认已进入聊天".into()))?;
         let (window, shot, dets) = self.yolo_detect_window("聊天页确认")?;
@@ -77,7 +56,7 @@ impl Run<'_> {
     pub(super) fn yolo_scroll_find_contact(
         &mut self,
         item_class: &str,
-    ) -> Result<crate::yolo::YoloDetection, AutomationError> {
+    ) -> Result<(crate::ports::Rect, crate::ports::Screenshot, crate::yolo::YoloDetection), AutomationError> {
         let name = self.task.external_contact_name.clone();
         let max = self.cfg().max_scroll_attempts;
         for attempt in 0..=max {
@@ -91,7 +70,8 @@ impl Run<'_> {
                 &name,
                 "列表 OCR",
             )? {
-                return Ok(hit);
+                // 把产生命中的那一帧一并交还，调用方用同一帧的截图尺寸做点击换算。
+                return Ok((window, shot, hit));
             }
             if attempt == max {
                 break;

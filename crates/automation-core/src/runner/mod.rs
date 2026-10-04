@@ -900,32 +900,17 @@ impl<'a> Run<'a> {
 
 
 
-    /// 点击前守卫：重新确认前台窗口与显示器指标仍与标定一致。
-    fn ensure_calibrated(&self) -> Result<Rect, AutomationError> {
-        let expected = self.window.ok_or(AutomationError::ClientNotReady)?;
+    /// 点击/检测前确认前台仍是目标企业微信，并把**当前**窗口矩形写回 [`Self::window`]。
+    ///
+    /// 宽高、位置、显示器分辨率/缩放不再与任务开始时比对。点通讯录后窗口会从
+    /// 三栏变成四栏并变宽；定位走图像识别，不依赖固定区域，变大变小或挪一点
+    /// 不应再以 `SCREEN_CHANGED` 中断。前台不是目标窗口时，`focus_wecom` /
+    /// 平台层 `verify_guard` 仍会拒绝输入。
+    fn ensure_calibrated(&mut self) -> Result<Rect, AutomationError> {
         let current = self.runner.ports.platform.focus_wecom()?;
-        // 尺寸必须一致；位置允许几个点抖动（置前/动画），否则任务永远走不到点击，
-        // 操作者只会看到「鼠标完全没动」。
-        if current.width != expected.width || current.height != expected.height {
-            return Err(AutomationError::ScreenChanged);
-        }
-        const POS_SLOP: i32 = 4;
-        if (current.x - expected.x).abs() > POS_SLOP
-            || (current.y - expected.y).abs() > POS_SLOP
-        {
-            return Err(AutomationError::ScreenChanged);
-        }
         let metrics = self.runner.ports.platform.screen_metrics()?;
-        if let Some(prev) = self.metrics {
-            if prev.width != metrics.width || prev.height != metrics.height {
-                return Err(AutomationError::ScreenChanged);
-            }
-            if (prev.scale_factor - metrics.scale_factor).abs() > 0.01 {
-                return Err(AutomationError::ScreenChanged);
-            }
-        }
-        // 必须把**当前**矩形交给 guarded_click：回传旧 expected 时，
-        // 校验会在移动之后因 1px 抖动再次失败。
+        self.window = Some(current);
+        self.metrics = Some(metrics);
         Ok(current)
     }
 

@@ -557,46 +557,36 @@ fn nothing_waits_for_a_human_between_preparing_and_sending() {
 // ── 窗口与标定守卫 ──────────────────────────────────────────────────────
 
 #[test]
-fn window_replaced_before_the_click_is_detected() {
-    let scenario = MockScenario::happy(CONTACT, MESSAGE);
+fn window_move_or_resize_does_not_reject_input() {
+    use automation_core::DesktopPlatform;
+    // 窗口变宽/挪动不再是 SCREEN_CHANGED。传入的矩形可以和当前窗口不一致。
     let desktop = MockDesktop::new();
-    // 第一次 focus 用于标定，第二次 focus（点击前守卫）返回另一个窗口。
-    desktop.script_windows([
-        platform_mock::DEFAULT_WINDOW,
-        automation_core::Rect { x: 300, y: 200, width: 900, height: 600 },
-    ]);
-    let fixture = Fixture::build(
-        &scenario,
-        desktop,
-        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
-    );
-
-    let outcome = fixture.run(&fixture.task());
-
-    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
-    assert_eq!(outcome.failure.as_ref().unwrap().code, "SCREEN_CHANGED");
-    assert_eq!(fixture.desktop.send_count(), 0);
+    desktop.set_window(automation_core::Rect { x: 300, y: 200, width: 1600, height: 900 });
+    desktop
+        .guarded_click(automation_core::Point { x: 320, y: 240 }, platform_mock::DEFAULT_WINDOW)
+        .expect("变宽或挪动不应拒绝点击");
+    desktop
+        .type_text("hi", platform_mock::DEFAULT_WINDOW)
+        .expect("变宽或挪动不应拒绝输入");
+    desktop
+        .scroll(automation_core::Point { x: 320, y: 240 }, 1, platform_mock::DEFAULT_WINDOW)
+        .expect("变宽或挪动不应拒绝滚动");
+    assert_eq!(desktop.send_count(), 0, "这次点击不在发送按钮上");
 }
 
 #[test]
-fn display_scale_change_is_detected_before_input() {
-    let scenario = MockScenario::happy(CONTACT, MESSAGE);
+fn input_rejected_when_foreground_is_not_the_target_window() {
+    use automation_core::DesktopPlatform;
     let desktop = MockDesktop::new();
-    desktop.script_metrics([
-        platform_mock::DEFAULT_METRICS,
-        automation_core::ScreenMetrics { width: 1920, height: 1080, scale_factor: 1.5 },
-    ]);
-    let fixture = Fixture::build(
-        &scenario,
-        desktop,
-        RunnerConfig { retry_backoff: Duration::ZERO, ..list_config() },
-    );
-
-    let outcome = fixture.run(&fixture.task());
-
-    assert_eq!(outcome.state, TaskState::NeedsHumanReview);
-    assert_eq!(outcome.failure.as_ref().unwrap().code, "SCREEN_CHANGED");
-    assert_eq!(fixture.desktop.send_count(), 0);
+    desktop.script_foreground_not_target();
+    let click = desktop
+        .guarded_click(automation_core::Point { x: 1, y: 1 }, platform_mock::DEFAULT_WINDOW)
+        .unwrap_err();
+    assert_eq!(click.code(), "CLIENT_NOT_READY");
+    assert_ne!(click.code(), "SCREEN_CHANGED");
+    let typed = desktop.type_text("x", platform_mock::DEFAULT_WINDOW).unwrap_err();
+    assert_eq!(typed.code(), "CLIENT_NOT_READY");
+    assert_eq!(desktop.send_count(), 0, "前台不是目标窗口时不能发出去");
 }
 
 // ── 送达核验 ────────────────────────────────────────────────────────────

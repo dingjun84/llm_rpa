@@ -138,16 +138,13 @@ impl MacOSDesktop {
             .ok_or(AutomationError::ClientNotReady)
     }
 
-    fn verify_guard(&self, expected_window: Rect) -> Result<WindowRef, AutomationError> {
+    fn verify_guard(&self, _expected_window: Rect) -> Result<WindowRef, AutomationError> {
         let w = self.current_target()?;
         match macosapi::foreground_window() {
             Some(fg) if fg.owner_pid == w.owner_pid => {}
             _ => return Err(AutomationError::ClientNotReady),
         }
-        let current = macosapi::window_rect(w).map_err(AutomationError::Platform)?;
-        if current != expected_window {
-            return Err(AutomationError::ScreenChanged);
-        }
+        // 尺寸/位置不一致不再算失败（窗口从三栏变四栏会变宽）。
         Ok(w)
     }
 

@@ -25,7 +25,8 @@ impl Run<'_> {
         &mut self,
         step: &str,
     ) -> Result<(Rect, Screenshot, Vec<YoloDetection>), AutomationError> {
-        let window = self.window.ok_or(AutomationError::ClientNotReady)?;
+        // 每次检测前重读当前窗口。任务开始时冻住的矩形在窗口变宽后会截偏。
+        let window = self.ensure_calibrated()?;
         let shot = self.with_retry(step, || self.runner.ports.platform.capture(window))?;
         let conf = self.cfg().yolo_conf;
         let dets = self

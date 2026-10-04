@@ -68,6 +68,8 @@ pub struct MockDesktop {
     /// "有没有去调"和"调成了没有"是两条不同的判据，结果值在 `window()` 里。
     pub resizes: Mutex<Vec<(i32, i32)>>,
     pub focus_calls: AtomicU32,
+    /// 前台是不是目标窗口。尺寸变化不再拒绝输入；前台被别的窗口抢走仍拒绝。
+    foreground_is_target: AtomicBool,
 }
 
 impl Default for MockDesktop {
@@ -100,6 +102,7 @@ impl MockDesktop {
             scrolls: Mutex::new(Vec::new()),
             resizes: Mutex::new(Vec::new()),
             focus_calls: AtomicU32::new(0),
+            foreground_is_target: AtomicBool::new(true),
         }
     }
 
@@ -225,6 +228,20 @@ impl MockDesktop {
             .sum()
     }
 
+    /// 模拟前台已经不是目标企业微信。之后的点击/滚动/输入都会被拒绝。
+    pub fn script_foreground_not_target(&self) {
+        self.foreground_is_target.store(false, Ordering::SeqCst);
+    }
+
+    /// 尺寸和位置不再拒绝输入；前台不是目标窗口则拒绝，避免点到别的程序。
+    fn ensure_foreground_is_target(&self, _expected_window: Rect) -> Result<(), AutomationError> {
+        if self.foreground_is_target.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(AutomationError::ClientNotReady)
+        }
+    }
+
     /// 指纹由"界面此刻长什么样"决定：区域 + 视图偏移 + 界面版本号。
     fn fingerprint_of(&self, region: Rect) -> String {
         if self.stable_fingerprint.load(Ordering::SeqCst) {
@@ -325,10 +342,7 @@ impl DesktopPlatform for MockDesktop {
         if let Some(fault) = self.faults.lock().unwrap().click.take() {
             return Err(fault.into_error());
         }
-        // 与真实实现保持一致：前台窗口与预期不符时拒绝输入。
-        if expected_window != self.window() {
-            return Err(AutomationError::ScreenChanged);
-        }
+        self.ensure_foreground_is_target(expected_window)?;
         self.record("click");
         self.clicks.lock().unwrap().push(target);
         // 点中发送按钮 ⇒ 消息发出去。这是替身要模拟的那条因果，
@@ -372,10 +386,7 @@ fn scroll(
         notches: i32,
         expected_window: Rect,
     ) -> Result<(), AutomationError> {
-        // 与真实实现保持一致：前台窗口与预期不符时拒绝输入。
-        if expected_window != self.window() {
-            return Err(AutomationError::ScreenChanged);
-        }
+        self.ensure_foreground_is_target(expected_window)?;
         self.record("scroll");
         self.scrolls.lock().unwrap().push((at, notches));
         // 列表两端是**钳制**的：滚到顶或底之后继续滚，画面不会有任何变化。
@@ -391,9 +402,7 @@ fn scroll(
         if let Some(fault) = self.faults.lock().unwrap().paste.take() {
             return Err(fault.into_error());
         }
-        if expected_window != self.window() {
-            return Err(AutomationError::ScreenChanged);
-        }
+        self.ensure_foreground_is_target(expected_window)?;
         self.record("paste");
         self.pasted.lock().unwrap().push(text.to_string());
         Ok(())
@@ -403,9 +412,7 @@ fn scroll(
         if let Some(fault) = self.faults.lock().unwrap().type_text.take() {
             return Err(fault.into_error());
         }
-        if expected_window != self.window() {
-            return Err(AutomationError::ScreenChanged);
-        }
+        self.ensure_foreground_is_target(expected_window)?;
         self.record("type");
         self.typed.lock().unwrap().push(text.to_string());
         Ok(())
@@ -415,9 +422,7 @@ fn scroll(
         if let Some(fault) = self.faults.lock().unwrap().clear.take() {
             return Err(fault.into_error());
         }
-        if expected_window != self.window() {
-            return Err(AutomationError::ScreenChanged);
-        }
+        self.ensure_foreground_is_target(expected_window)?;
         self.record("clear");
         Ok(())
     }

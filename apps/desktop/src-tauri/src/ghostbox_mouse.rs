@@ -107,10 +107,9 @@ impl DesktopPlatform for GhostboxMouseDesktop {
     fn guarded_click(&self, target: Point, expected_window: Rect) -> Result<(), AutomationError> {
         // 先让内层做窗口守卫（聚焦/校验），再改用 GhostBox 真正点下去。
         // 内层 guarded_click 会走 OS 鼠标；这里拆成：校验用 focus + 量窗，点击用 HID。
-        let current = self.inner.focus_wecom()?;
-        if current.width != expected_window.width || current.height != expected_window.height {
-            return Err(AutomationError::ScreenChanged);
-        }
+        // 先确认能把目标窗口置于前台。宽高不再与调用方传入的矩形比对。
+        let _current = self.inner.focus_wecom()?;
+        let _ = expected_window;
         #[cfg(windows)]
         {
             ghost_move_to(target)?;

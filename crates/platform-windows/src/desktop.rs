@@ -177,15 +177,14 @@ impl WindowsDesktop {
         }
     }
 
-    /// 点击前的守卫：前台窗口必须是目标窗口，且窗口边界与标定一致。
-    fn verify_guard(&self, expected_window: Rect) -> Result<HWND, AutomationError> {
+    /// 点击前的守卫：前台必须是目标窗口。
+    ///
+    /// 尺寸和位置不再比对。窗口变宽、变高或挪动几个像素不算失败；
+    /// 前台换成别的窗口则拒绝输入，避免点到别的程序。
+    fn verify_guard(&self, _expected_window: Rect) -> Result<HWND, AutomationError> {
         let hwnd = self.current_target()?;
         if !winapi::same_window(winapi::foreground_window(), hwnd) {
             return Err(AutomationError::ClientNotReady);
-        }
-        let current = winapi::window_rect(hwnd).map_err(AutomationError::Platform)?;
-        if current != expected_window {
-            return Err(AutomationError::ScreenChanged);
         }
         Ok(hwnd)
     }

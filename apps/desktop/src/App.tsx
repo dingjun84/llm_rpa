@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import * as api from "./api";
-import { CalibrationPanel, type CachedPreview } from "./components/CalibrationPanel";
 import { CursorMotionPanel } from "./components/CursorMotionPanel";
 import { IconsPage } from "./components/IconsPage";
 import { regionsAreValid } from "./components/RegionCalibration";
@@ -22,7 +21,7 @@ import {
   type WorkflowRequirement,
 } from "./types";
 
-type Tab = "tasks" | "calibration" | "icons" | "trace" | "replay";
+type Tab = "tasks" | "icons" | "trace" | "replay";
 
 export function App() {
   const [tasks, setTasks] = useState<TaskView[]>([]);
@@ -80,37 +79,6 @@ export function App() {
   const patchRunChoice = useCallback((next: Partial<RunChoice>) => {
     setRunChoice((current) => (current ? { ...current, ...next } : current));
   }, []);
-
-  /**
-   * 标定页的截图缓存：场景 id → 那次截图。
-   *
-   * ★ 为什么放在**这里**、而不是标定页自己持有：切到「任务」或「图标库」
-   * 页签时标定页会被卸载，它自己的 state 全没了。截图要重截一次，
-   * 代价是重新把客户端摆成那个界面——用户明确抱怨过这件事。
-   * 跟 `draft` 同一个道理：活得比页签久的状态，就该由 App 持有。
-   *
-   * ★ 只活在进程内、**不落盘**：截图里有联系人姓名和聊天内容。
-   */
-  const [calibrationPreviews, setCalibrationPreviews] = useState<
-    Record<string, CachedPreview>
-  >({});
-
-  const cachePreview = useCallback((sceneId: string, entry: CachedPreview) => {
-    setCalibrationPreviews((current) => ({ ...current, [sceneId]: entry }));
-  }, []);
-
-  /**
-   * 标定页正停在哪个场景、哪一项。
-   *
-   * ★ 跟截图缓存同一个理由：标定页切页签会被卸载，`sceneId` 留在它自己
-   * 身上就会被重置成第一个场景。用户切去「任务」看一眼再回来，
-   * 会发现自己刚才在标的是「历史对话」，界面却跳回了「主界面」，
-   * 而那张截图看起来就"不见了"——其实一直在缓存里。
-   *
-   * `null` = 还没定，由标定页读到计划后落到第一个场景上。
-   */
-  const [calibrationSceneId, setCalibrationSceneId] = useState<string | null>(null);
-  const [calibrationActiveKey, setCalibrationActiveKey] = useState<string | null>(null);
 
   const upsert = useCallback((task: TaskView) => {
     setTasks((current) => {
@@ -410,13 +378,6 @@ export function App() {
         </button>
         <button
           type="button"
-          className={tab === "calibration" ? "tab is-active" : "tab"}
-          onClick={() => setTab("calibration")}
-        >
-          界面标定
-        </button>
-        <button
-          type="button"
           className={tab === "icons" ? "tab is-active" : "tab"}
           onClick={() => setTab("icons")}
         >
@@ -567,35 +528,6 @@ export function App() {
               refreshError={refreshError}
               dataDir={info?.data_dir ?? null}
             />
-          </div>
-        </main>
-      )}
-
-      {tab === "calibration" && (
-        <main className="app-grid is-single">
-          <div className="column">
-            {info && draft ? (
-              <CalibrationPanel
-                info={info}
-                draft={draft}
-                onPatch={patch}
-                onSave={handleSaveConfig}
-                dirty={dirty}
-                canSave={canSave}
-                busy={running}
-                previews={calibrationPreviews}
-                onCachePreview={cachePreview}
-                sceneId={calibrationSceneId}
-                onSceneId={setCalibrationSceneId}
-                activeKey={calibrationActiveKey}
-                onActiveKey={setCalibrationActiveKey}
-              />
-            ) : (
-              <section className="panel">
-                <h2>界面标定</h2>
-                <p className="muted-line">正在读取运行配置…</p>
-              </section>
-            )}
           </div>
         </main>
       )}
