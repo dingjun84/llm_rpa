@@ -2,7 +2,7 @@
 //!
 //! 1. 点 `nav_chat_icon`
 //! 2. 在 `conversation_item` 里 OCR 首行找联系人（可滚动重试）
-//! 3. 点中进入聊天，确认 `input_bar`/`send_button`
+//! 3. 点中进入聊天，确认 `message_input`/`send_button`
 //! 4. 点输入框 → 逐字输入 → 点发送
 
 use crate::ports::AutomationError;
@@ -43,7 +43,7 @@ impl Run<'_> {
         let (window, shot, dets) = self.yolo_detect_window("聊天页确认")?;
         if best_input_or_send(&dets).is_none() {
             return Err(AutomationError::NeedsHumanReview(
-                "点击会话后未检出 input_bar / send_button，可能未打开聊天或界面被遮挡。"
+                "点击会话后未检出 message_input / send_button，可能未打开聊天或界面被遮挡。"
                     .into(),
             ));
         }

@@ -395,7 +395,10 @@ impl Run<'_> {
         self.wait_for_settle(window)
     }
 
-    /// 点 input_bar（或 message_input）→ 逐字输入 → 视配置点 send_button。
+    /// 点 `message_input`（文字区）→ 逐字输入 → 视配置点 send_button。
+    ///
+    /// `input_bar` 是文字区上方那排表情/图片工具条，中心落在图标上，不能用来聚焦输入。
+    /// 两个发送流程（会话列表、通讯录搜索）都走这里。
     ///
     /// 调用前须已处于 [`TaskState::PreparingMessage`]。
     pub(super) fn yolo_type_and_send(
@@ -407,14 +410,12 @@ impl Run<'_> {
         use crate::audit::MessageDigest;
         use crate::state::TaskState;
 
-        let input = best_by_class(dets, yolo::class::INPUT_BAR)
-            .or_else(|| best_by_class(dets, yolo::class::MESSAGE_INPUT))
-            .ok_or_else(|| {
-                AutomationError::NeedsHumanReview(
-                    "聊天页未检出 input_bar / message_input，无法聚焦输入框。                     请确认已打开与目标的会话且输入区未被遮挡。"
-                        .into(),
-                )
-            })?;
+        let input = best_by_class(dets, yolo::class::MESSAGE_INPUT).ok_or_else(|| {
+            AutomationError::NeedsHumanReview(
+                "聊天页未检出 message_input，无法聚焦输入框。请确认已打开与目标的会话且文字输入区未被遮挡。"
+                    .into(),
+            )
+        })?;
         self.yolo_click_detection(window, shot, input, "输入框")?;
 
         let text = self.task.text.clone();
