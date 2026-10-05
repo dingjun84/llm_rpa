@@ -259,9 +259,12 @@ pub const DEFAULT_PROFILE_SCROLL_ANCHOR: RelativePoint = RelativePoint::new(0.5,
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Workflow {
-    /// 会话列表找人并发送（Flow A）：`nav_chat_icon` → `conversation_item` → 输入 → 发送。
+    /// 会话列表找人并发送（Flow A）：`nav_chat_icon` → `list_item`（会话行）→ 输入 → 发送。
     ChatListSend,
-    /// 通讯录搜索找人并发送（Flow B）：`nav_contacts_icon` → 搜索 → `contact_item` → 「发消息」→ 输入 → 发送。
+    /// 通讯录搜索找人并发送（Flow B）：`nav_contacts_icon` → 搜索 → `list_item`（联系人行）→ 「发消息」→ 输入 → 发送。
+    ///
+    /// 两条流程里的列表行在 13 类模型中同为 `list_item`（14 类旧模型的 conversation_item /
+    /// contact_item 作别名接受），是会话还是联系人由本工作流导航到的页面决定（`yolo::ListPage`）。
     ContactsSearchSend,
 }
 

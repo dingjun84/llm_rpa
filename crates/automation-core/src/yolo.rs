@@ -7,16 +7,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::ports::{AutomationError, Point, Rect, Screenshot, TextBox};
 
-/// YOLO 类别名（与 `yolo26/API.md` / `CLASS_NAMES_CANONICAL` 对齐；当前权威为 14 类）。
+/// YOLO 类别名（与 `yolo26/API.md` / `CLASS_NAMES_CANONICAL` 对齐；当前权威为 13 类 c13）。
+///
+/// c13 把旧 14 类的 `conversation_item`（会话行）和 `contact_item`（联系人行）合并成
+/// [`LIST_ITEM`]：两者外观几乎一样，模型分不清。是会话还是联系人由 runner 所在页面
+/// （[`super::ListPage`]）决定，不再看 class 名。旧名字只作为别名保留，见 [`super::is_list_item`]。
 pub mod class {
     pub const SELF_AVATAR: &str = "self_avatar";
     pub const NAV_CHAT_ICON: &str = "nav_chat_icon";
     pub const NAV_CONTACTS_ICON: &str = "nav_contacts_icon";
     pub const SEARCH_BAR: &str = "search_bar";
+    /// 列表中的一行：会话列表行 / 通讯录行 / 搜索结果行（c13 id 4）。
+    pub const LIST_ITEM: &str = "list_item";
+    /// 旧 14 类权重的通讯录行；按 class 匹配时等同 [`LIST_ITEM`]。新代码请用 `LIST_ITEM`。
     pub const CONTACT_ITEM: &str = "contact_item";
     /// 已从 14 类模型移除；仅作旧权重兼容，新流程用 [`estimate_message_input_region`]。
     pub const MESSAGE_INPUT: &str = "message_input";
     pub const SEND_BUTTON: &str = "send_button";
+    /// 旧 14 类权重的会话行；按 class 匹配时等同 [`LIST_ITEM`]。新代码请用 `LIST_ITEM`。
     pub const CONVERSATION_ITEM: &str = "conversation_item";
     pub const INCOMING_BUBBLE: &str = "incoming_bubble";
     pub const OUTGOING_BUBBLE: &str = "outgoing_bubble";
@@ -25,6 +33,55 @@ pub mod class {
     pub const GROUP_CHAT: &str = "group_chat";
     pub const CONTACT_SEND_MESSAGE: &str = "contact_send_message";
     pub const NAV_GROUPS_ICON: &str = "nav_groups_icon";
+
+    /// 都表示「列表中的一行」的类别名：13 类新权重的 `list_item` + 14 类旧权重的两个名字。
+    pub const LIST_ITEM_ALIASES: [&str; 3] = [LIST_ITEM, CONVERSATION_ITEM, CONTACT_ITEM];
+}
+
+/// 检测出的 class 名是不是「列表中的一行」（`list_item` / `conversation_item` / `contact_item`）。
+///
+/// ★ 列表行别名只在这里判断。新旧权重（13 类 / 14 类）都靠它通用，调用方不要自己比字符串。
+pub fn is_list_item(class_name: &str) -> bool {
+    class::LIST_ITEM_ALIASES.contains(&class_name)
+}
+
+/// 检测出的 `actual` 是否满足想要的 `wanted`：名字相同，或二者都是列表行别名。
+///
+/// [`best_by_class`] / [`all_by_class`] 都走这里，所以传 `class::LIST_ITEM`（或旧的
+/// `CONVERSATION_ITEM` / `CONTACT_ITEM`）都会同时命中三种列表行。
+pub fn class_matches(actual: &str, wanted: &str) -> bool {
+    actual == wanted || (is_list_item(actual) && is_list_item(wanted))
+}
+
+/// 列表行所在的页面。c13 里会话行与联系人行同为 `list_item`，**语义只由 runner 走到的页面决定**：
+///
+/// - [`ListPage::ChatList`]：工作流 `chat_list_send`，刚点过 `nav_chat_icon` → 中间栏是会话列表；
+/// - [`ListPage::ContactsSearchResults`]：工作流 `contacts_search_send`，刚点过 `nav_contacts_icon`
+///   并在 `search_bar` 里输入了联系人名 → 中间栏是搜索结果（联系人行）。
+///
+/// 不再用 class 名（旧 `conversation_item` / `contact_item`）去猜当前在哪个页面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPage {
+    ChatList,
+    ContactsSearchResults,
+}
+
+impl ListPage {
+    /// 页面名，用于证据 / 决策文案。
+    pub fn label(self) -> &'static str {
+        match self {
+            ListPage::ChatList => "会话列表",
+            ListPage::ContactsSearchResults => "通讯录搜索结果",
+        }
+    }
+
+    /// 本页一行是什么，用于证据 / 决策文案。
+    pub fn item_label(self) -> &'static str {
+        match self {
+            ListPage::ChatList => "会话条目",
+            ListPage::ContactsSearchResults => "联系人条目",
+        }
+    }
 }
 
 /// 单条检测（坐标相对**原图**像素，与 API `detections[]` 一致）。
@@ -223,13 +280,14 @@ pub fn shot_point_to_screen(
 }
 
 /// 在同 class 的检测里取 **conf 最高**的一条。并列取先出现的（API 已按 conf 降序）。
+/// 列表行三种名字互为别名（见 [`class_matches`]）。
 pub fn best_by_class<'a>(
     detections: &'a [YoloDetection],
     class_name: &str,
 ) -> Option<&'a YoloDetection> {
     detections
         .iter()
-        .filter(|d| d.class_name == class_name)
+        .filter(|d| class_matches(&d.class_name, class_name))
         .max_by(|a, b| {
             a.conf
                 .partial_cmp(&b.conf)
@@ -237,14 +295,14 @@ pub fn best_by_class<'a>(
         })
 }
 
-/// 同 class 全部检测，按 conf 降序。
+/// 同 class 全部检测，按 conf 降序。列表行三种名字互为别名（见 [`class_matches`]）。
 pub fn all_by_class<'a>(
     detections: &'a [YoloDetection],
     class_name: &str,
 ) -> Vec<&'a YoloDetection> {
     let mut items: Vec<_> = detections
         .iter()
-        .filter(|d| d.class_name == class_name)
+        .filter(|d| class_matches(&d.class_name, class_name))
         .collect();
     items.sort_by(|a, b| {
         b.conf
@@ -307,11 +365,62 @@ mod tests {
 
     #[test]
     fn detections_as_text_boxes_label_and_bounds() {
-        let boxes = detections_as_text_boxes(&[det("contact_item", 0.91, [10.0, 20.0, 110.0, 60.0])]);
+        let boxes = detections_as_text_boxes(&[det("list_item", 0.91, [10.0, 20.0, 110.0, 60.0])]);
         assert_eq!(boxes.len(), 1);
-        assert_eq!(boxes[0].text, "contact_item 0.91");
+        assert_eq!(boxes[0].text, "list_item 0.91");
         assert!((boxes[0].confidence - 0.91).abs() < f32::EPSILON);
         assert_eq!(boxes[0].bounds, Rect { x: 10, y: 20, width: 100, height: 40 });
+    }
+
+    #[test]
+    fn is_list_item_accepts_all_aliases() {
+        assert!(is_list_item("list_item"));
+        assert!(is_list_item("conversation_item"));
+        assert!(is_list_item("contact_item"));
+        assert!(is_list_item(class::LIST_ITEM));
+        assert!(!is_list_item("search_bar"));
+        assert!(!is_list_item("single_chat"));
+        assert!(!is_list_item("List_Item"));
+        assert!(!is_list_item(""));
+    }
+
+    #[test]
+    fn class_matches_aliases_only_for_list_items() {
+        assert!(class_matches("conversation_item", class::LIST_ITEM));
+        assert!(class_matches("contact_item", class::LIST_ITEM));
+        assert!(class_matches("list_item", class::CONVERSATION_ITEM));
+        assert!(class_matches("contact_item", class::CONVERSATION_ITEM));
+        assert!(class_matches("send_button", class::SEND_BUTTON));
+        assert!(!class_matches("send_button", class::LIST_ITEM));
+        assert!(!class_matches("list_item", class::SEARCH_BAR));
+    }
+
+    #[test]
+    fn all_by_class_list_item_merges_old_and_new_names() {
+        // 旧 14 类权重在同一屏可能同时给出 conversation_item 和 contact_item；新权重给 list_item。
+        let dets = [
+            det("contact_item", 0.35, [0.0, 100.0, 200.0, 150.0]),
+            det("search_bar", 0.95, [0.0, 0.0, 200.0, 30.0]),
+            det("conversation_item", 0.80, [0.0, 40.0, 200.0, 100.0]),
+            det("list_item", 0.60, [0.0, 150.0, 200.0, 200.0]),
+        ];
+        let items = all_by_class(&dets, class::LIST_ITEM);
+        let names: Vec<&str> = items.iter().map(|d| d.class_name.as_str()).collect();
+        assert_eq!(names, ["conversation_item", "list_item", "contact_item"]);
+        // 旧常量也走别名：传 CONTACT_ITEM 照样拿到会话行。
+        assert_eq!(all_by_class(&dets, class::CONTACT_ITEM).len(), 3);
+        let best = best_by_class(&dets, class::LIST_ITEM).expect("best");
+        assert_eq!(best.class_name, "conversation_item");
+        assert_eq!(best_by_class(&dets, class::SEARCH_BAR).map(|d| d.class_name.as_str()), Some("search_bar"));
+        assert!(best_by_class(&dets[1..2], class::LIST_ITEM).is_none());
+    }
+
+    #[test]
+    fn list_page_labels() {
+        assert_eq!(ListPage::ChatList.item_label(), "会话条目");
+        assert_eq!(ListPage::ContactsSearchResults.item_label(), "联系人条目");
+        assert_eq!(ListPage::ChatList.label(), "会话列表");
+        assert_eq!(ListPage::ContactsSearchResults.label(), "通讯录搜索结果");
     }
 
     #[test]

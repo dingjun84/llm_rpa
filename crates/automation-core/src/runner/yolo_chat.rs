@@ -1,13 +1,14 @@
 //! 工作流 `chat_list_send`：会话列表找人并发送（Flow A）。
 //!
 //! 1. 点 `nav_chat_icon`
-//! 2. 在 `conversation_item` 里 OCR 首行找联系人（可滚动重试）
+//! 2. 在 `list_item`（旧权重 `conversation_item`）里 OCR 首行找联系人（可滚动重试）。
+//!    此时刚点过 `nav_chat_icon`，所以这些行就是会话行：语义来自 [`ListPage::ChatList`]，不看 class 名。
 //! 3. 点中进入聊天，确认 `input_bar`/`send_button`（或遗留 `message_input`）
 //! 4. 估计输入区并点击 → 逐字输入 → 点发送
 
 use crate::ports::AutomationError;
 use crate::state::TaskState;
-use crate::yolo::class;
+use crate::yolo::{class, ListPage};
 
 use super::Run;
 
@@ -29,9 +30,9 @@ impl Run<'_> {
         }
 
         self.advance(TaskState::SearchingContact, Some("在会话列表中查找".into()))?;
-        // 列表查找里的首行 OCR 已经对上名字。命中后直接点这一帧的 conversation_item，
+        // 列表查找里的首行 OCR 已经对上名字。命中后直接点这一帧的 list_item（会话行），
         // 不再对每个会话框做「点击前确认会话名」。坐标用产生命中的那一帧。
-        let (window, shot, matched) = self.yolo_scroll_find_contact(class::CONVERSATION_ITEM)?;
+        let (window, shot, matched) = self.yolo_scroll_find_contact(ListPage::ChatList)?;
 
         self.advance(
             TaskState::VerifyingCandidate,
@@ -52,10 +53,13 @@ impl Run<'_> {
         self.yolo_type_and_send(window, &shot, &dets)
     }
 
-    /// 滚动会话/通讯录列表直到找到联系人或超过上限。
+    /// 滚动会话列表 / 通讯录搜索结果直到找到联系人或超过上限。
+    ///
+    /// 两种页面的行都是 `list_item`（[`crate::yolo::is_list_item`] 兼容旧 14 类名字），
+    /// `page` 是调用方刚导航到的页面，只决定语义与文案。
     pub(super) fn yolo_scroll_find_contact(
         &mut self,
-        item_class: &str,
+        page: ListPage,
     ) -> Result<(crate::ports::Rect, crate::ports::Screenshot, crate::yolo::YoloDetection), AutomationError> {
         let name = self.task.external_contact_name.clone();
         let max = self.cfg().max_scroll_attempts;
@@ -66,7 +70,7 @@ impl Run<'_> {
                 window,
                 &shot,
                 &dets,
-                item_class,
+                page,
                 &name,
                 "列表 OCR",
             )? {
@@ -76,11 +80,12 @@ impl Run<'_> {
             if attempt == max {
                 break;
             }
-            self.yolo_scroll_list(window, &shot, &dets, item_class)?;
+            self.yolo_scroll_list(window, &shot, &dets)?;
         }
         Err(AutomationError::NeedsHumanReview(format!(
-            "在「{item_class}」列表中滚了 {max} 次仍未找到「{name}」。\
-             请确认联系人在列表中、名称与 OCR 一致，或增大 max_scroll_attempts。"
+            "在{}中滚了 {max} 次仍未找到「{name}」。\
+             请确认联系人在列表中、名称与 OCR 一致，或增大 max_scroll_attempts。",
+            page.label()
         )))
     }
 }

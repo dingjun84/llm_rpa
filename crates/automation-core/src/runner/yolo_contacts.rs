@@ -2,14 +2,16 @@
 //!
 //! 1. 点 `nav_contacts_icon`
 //! 2. 点 `search_bar`，逐字输入联系人名
-//! 3. 在 `contact_item` 里 OCR 找人并点击
+//! 3. 在搜索结果的 `list_item`（旧权重 `contact_item` / `conversation_item` 同样接受）里 OCR 找人并点击。
+//!    此时刚点过 `nav_contacts_icon` 并输入了关键词，所以这些行就是联系人行：
+//!    语义来自 [`ListPage::ContactsSearchResults`]，不看 class 名。
 //! 4. 右侧资料页 OCR「发消息」并点击（无 YOLO 类；落点同 YOLO 点击：文字框中心半区随机点）
 //! 5. 进入聊天后同 Flow A：估计输入区 → 输入 → send_button
 
 use crate::diagnostics::{Decision, Verdict};
 use crate::ports::{AutomationError, Point, Rect, TextBox};
 use crate::state::TaskState;
-use crate::yolo::{all_by_class, best_by_class, class, random_point_in_central_half};
+use crate::yolo::{all_by_class, best_by_class, class, random_point_in_central_half, ListPage};
 
 use super::Run;
 
@@ -57,12 +59,12 @@ impl Run<'_> {
             std::thread::sleep(self.cfg().scroll_settle_timeout);
         }
 
-        // 强制落一帧「搜索下拉结果」：把当前 CONTACT_ITEM（及同屏其它 class）画进过程回放，
+        // 强制落一帧「搜索下拉结果」：把当前 list_item（及同屏其它 class）画进过程回放，
         // 再进入滚动查找——否则失败时只能看到空 evidence，看不出下拉里到底检出了什么。
         self.yolo_report_search_dropdown_results()?;
 
         let (_found_window, _found_shot, matched) =
-            self.yolo_scroll_find_contact(class::CONTACT_ITEM)?;
+            self.yolo_scroll_find_contact(ListPage::ContactsSearchResults)?;
         self.advance(
             TaskState::VerifyingCandidate,
             Some(format!("命中联系人条目 conf={:.2}", matched.conf)),
@@ -74,7 +76,7 @@ impl Run<'_> {
                     window,
                     &shot,
                     &dets,
-                    class::CONTACT_ITEM,
+                    ListPage::ContactsSearchResults,
                     &self.task.external_contact_name,
                     "点击前确认联系人名",
                 )?
@@ -103,11 +105,11 @@ impl Run<'_> {
 
     /// 输入关键词并停稳后：整窗 YOLO 一次，步骤名固定为「搜索下拉结果」。
     ///
-    /// 决策里列出全部 `contact_item`（通过 = 检出）；若一个都没有则 `passed=false`，
+    /// 决策里列出全部 `list_item`（旧权重的 `contact_item` / `conversation_item` 同样算；通过 = 检出）；若一个都没有则 `passed=false`，
     /// 过程回放默认会停在这一步——这正是「下拉里没点到人」时首先要看的画面。
     fn yolo_report_search_dropdown_results(&mut self) -> Result<(), AutomationError> {
         let (_window, _shot, dets) = self.yolo_detect_window("搜索下拉结果")?;
-        let items = all_by_class(&dets, class::CONTACT_ITEM);
+        let items = all_by_class(&dets, class::LIST_ITEM);
         let candidates: Vec<Verdict> = items
             .iter()
             .map(|d| {
@@ -116,19 +118,19 @@ impl Run<'_> {
                     bounds: d.bounds_rect(),
                     confidence: d.conf,
                 };
-                Verdict::passed(&tb, "检出 contact_item")
+                Verdict::passed(&tb, "检出联系人条目（list_item）")
             })
             .collect();
         let passed = !candidates.is_empty();
         let outcome = if passed {
             format!(
-                "检出 {} 个 contact_item（同屏总检出 {}）",
+                "检出 {} 个联系人条目 list_item（同屏总检出 {}）",
                 candidates.len(),
                 dets.len()
             )
         } else {
             format!(
-                "未检出 contact_item（同屏总检出 {}；请核对 YOLO class / 搜索是否已过滤出结果）",
+                "未检出联系人条目 list_item（同屏总检出 {}；请核对 YOLO class / 搜索是否已过滤出结果）",
                 dets.len()
             )
         };
@@ -138,10 +140,10 @@ impl Run<'_> {
             Decision {
                 step: String::new(),
                 question: format!(
-                    "搜索「{}」后，下拉/列表里有哪些 contact_item？",
+                    "搜索「{}」后，下拉/列表里有哪些联系人条目？",
                     self.task.external_contact_name.trim()
                 ),
-                rule: "YOLO class=`contact_item`（本步只记录检出，不做姓名 OCR）".into(),
+                rule: "YOLO class=`list_item`（兼容 contact_item / conversation_item；本步只记录检出，不做姓名 OCR）".into(),
                 outcome,
                 passed,
                 min_confidence: self.cfg().yolo_conf,

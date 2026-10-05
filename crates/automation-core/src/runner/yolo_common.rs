@@ -11,8 +11,8 @@ use crate::diagnostics::{Decision, MatchTrail, ReplayInput, Verdict};
 use crate::ports::{AutomationError, Point, Rect, Screenshot, TextBox};
 use crate::yolo::{
     self, all_by_class, best_by_class, detections_as_text_boxes, estimate_message_input_region,
-    item_tall_enough_for_two_lines, name_match_score, shot_point_to_screen, YoloDetection,
-    DEFAULT_MIN_ITEM_HEIGHT_PX,
+    item_tall_enough_for_two_lines, name_match_score, shot_point_to_screen, ListPage,
+    YoloDetection, DEFAULT_MIN_ITEM_HEIGHT_PX,
 };
 
 use super::decision::name_match_decision;
@@ -121,7 +121,9 @@ impl Run<'_> {
         boxes.iter().min_by_key(|b| (b.bounds.y, b.bounds.x))
     }
 
-    /// 在 conversation_item / contact_item 里用首行 OCR 找联系人。
+    /// 在 `list_item`（旧权重的 `conversation_item` / `contact_item` 同样接受）里用首行 OCR 找联系人。
+    ///
+    /// 是会话行还是联系人行不看 class 名，由 `page`（runner 刚导航到的页面）决定，只影响文案。
     ///
     /// 策略：跳过高度不够两行的裁切条目；姓名匹配优先首行中**更靠前**出现的；
     /// 是否接受目标名仍问 matcher（与全库其它姓名判据同源）。
@@ -132,22 +134,24 @@ impl Run<'_> {
         window: Rect,
         shot: &Screenshot,
         dets: &[YoloDetection],
-        item_class: &str,
+        page: ListPage,
         expected_name: &str,
         step: &str,
     ) -> Result<Option<YoloDetection>, AutomationError> {
-        let items = all_by_class(dets, item_class);
+        let items = all_by_class(dets, yolo::class::LIST_ITEM);
+        let item_label = page.item_label();
         if items.is_empty() {
             self.report_decision(
                 step,
                 Decision {
                     step: String::new(),
                     question: format!(
-                        "「{item_class}」里哪一条是目标联系人「{}」？",
+                        "{}里哪一条{item_label}是目标联系人「{}」？",
+                        page.label(),
                         expected_name.trim()
                     ),
-                    rule: format!("YOLO class=`{item_class}` 首行 OCR + ContactMatcher"),
-                    outcome: format!("本帧未检出任何「{item_class}」"),
+                    rule: "YOLO class=`list_item`（兼容 conversation_item / contact_item）首行 OCR + ContactMatcher".into(),
+                    outcome: format!("本帧未检出任何{item_label}（list_item）"),
                     passed: false,
                     min_confidence: self.cfg().min_confidence,
                     replay: Some(ReplayInput::NameMatch {
@@ -267,7 +271,8 @@ impl Run<'_> {
         let match_result: Result<TextBox, AutomationError> = match &best {
             Some((_, _, _, tb)) => Ok(tb.clone()),
             None => Err(AutomationError::NeedsHumanReview(format!(
-                "本帧「{item_class}」中未匹配到「{}」",
+                "本帧{}的{item_label}中未匹配到「{}」",
+                page.label(),
                 expected_name.trim()
             ))),
         };
@@ -288,14 +293,13 @@ impl Run<'_> {
         Ok(best.map(|(d, _, _, _)| d))
     }
 
-    /// 列表区中心作为滚轮落点：取全部 item 的包围盒中心；没有则窗口水平 35%、垂直居中。
+    /// 列表区中心作为滚轮落点：取全部 list_item 的包围盒中心；没有则窗口水平 35%、垂直居中。
     pub(super) fn yolo_list_scroll_point(
         window: Rect,
         shot: &Screenshot,
         dets: &[YoloDetection],
-        item_class: &str,
     ) -> Point {
-        let items = all_by_class(dets, item_class);
+        let items = all_by_class(dets, yolo::class::LIST_ITEM);
         if items.is_empty() {
             return Point {
                 x: window.x + (window.width as f32 * 0.35).round() as i32,
@@ -324,9 +328,8 @@ impl Run<'_> {
         window: Rect,
         shot: &Screenshot,
         dets: &[YoloDetection],
-        item_class: &str,
     ) -> Result<(), AutomationError> {
-        let at = Self::yolo_list_scroll_point(window, shot, dets, item_class);
+        let at = Self::yolo_list_scroll_point(window, shot, dets);
         let expected = self.ensure_calibrated()?;
         let notches = self.cfg().scroll_notches_per_step;
         self.evidence.push(format!(
