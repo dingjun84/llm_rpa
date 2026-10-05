@@ -612,6 +612,9 @@ impl Run<'_> {
 
     /// 弹出层点文字：预算内反复枚举 peer + OCR，直到出现 `needle` 再按 Prefer 点击。
     /// 覆盖步骤 7（菜单「转发」）、8（「创建聊天」）、11（「创建并发送」）。
+    ///
+    /// 超时预算只累计「等界面」时间（`sleep(interval)`），不含 `list_peer` /
+    /// `capture_and_recognize` 的墙钟；等 OCR 返回后再判断是否超时。
     pub(super) fn forward_click_in_peer(
         &mut self,
         step: u32,
@@ -621,8 +624,8 @@ impl Run<'_> {
     ) -> Result<(), AutomationError> {
         let budget = PEER_POLL_BUDGET;
         let interval = HEADER_POLL_INTERVAL;
-        let started = Instant::now();
-        let deadline = started + budget;
+        let wall_started = Instant::now();
+        let mut waited = std::time::Duration::ZERO;
         let mut attempts = 0u32;
         let mut ocr_attempts = 0u32;
         let mut last_peers;
@@ -653,8 +656,9 @@ impl Run<'_> {
                     Self::forward_prefer_hit(&mut hits, prefer);
                     let hit = hits[0];
                     self.evidence.push(format!(
-                        "步骤{step}：弹层轮询「{needle}」→ 成功（等待 {}ms，尝试 {attempts} 次、OCR {ocr_attempts} 次（最少 {} 次）；预算 {}ms 间隔 {}ms；窗 class=`{}` title=`{}` id=`{}`）",
-                        started.elapsed().as_millis(),
+                        "步骤{step}：弹层轮询「{needle}」→ 成功（等待 {}ms，墙钟 {}ms，尝试 {attempts} 次、OCR {ocr_attempts} 次（最少 {} 次）；预算 {}ms 间隔 {}ms；窗 class=`{}` title=`{}` id=`{}`）",
+                        waited.as_millis(),
+                        wall_started.elapsed().as_millis(),
                         MIN_OCR_ATTEMPTS,
                         budget.as_millis(),
                         interval.as_millis(),
@@ -665,9 +669,9 @@ impl Run<'_> {
                     return self.forward_click_screen_box(step, needle, Some(&peer), hit);
                 }
             }
-            let budget_exhausted = Instant::now() + interval >= deadline;
+            // OCR / list_peer 耗时不计入预算；等本次 OCR 返回后再判断。
             // 优先凑满真正 OCR；从未有窗时退而保证完整尝试循环 ≥ MIN。
-            if budget_exhausted {
+            if waited >= budget {
                 if ocr_attempts >= MIN_OCR_ATTEMPTS
                     || (!did_ocr && attempts >= MIN_OCR_ATTEMPTS)
                 {
@@ -675,10 +679,12 @@ impl Run<'_> {
                 }
             }
             std::thread::sleep(interval);
+            waited += interval;
         }
         Err(AutomationError::NeedsHumanReview(format!(
-            "步骤{step}失败：等待 {}ms（尝试 {attempts} 次、OCR {ocr_attempts} 次，最少 {} 次）未见弹层「{needle}」。最后顶层窗：{}",
-            started.elapsed().as_millis(),
+            "步骤{step}失败：等待 {}ms（墙钟 {}ms；尝试 {attempts} 次、OCR {ocr_attempts} 次，最少 {} 次）未见弹层「{needle}」。最后顶层窗：{}",
+            waited.as_millis(),
+            wall_started.elapsed().as_millis(),
             MIN_OCR_ATTEMPTS,
             last_peers,
         )))
