@@ -56,13 +56,13 @@ impl Run<'_> {
 
         self.advance(TaskState::SearchingContact, Some("转发：搜索文件传输助手".into()))?;
 
-        // ── 2. OCR 第一个「搜索」并点击 ──
-        self.step_begin(2, "OCR 第一个「搜索」= 搜索框")?;
-        let search_box = self.forward_ocr_first_label(LABEL_SEARCH, None)?;
+        // ── 2. 轮询 OCR 第一个「搜索」并点击（导航切页可能未完成）──
+        self.step_begin(2, "轮询 OCR 第一个「搜索」= 搜索框")?;
+        let search_box = self.forward_ocr_first_label_polled(2, LABEL_SEARCH, "搜索框")?;
         self.forward_click_screen_box(2, "搜索框", None, search_box)?;
 
         // ── 3. 输入文件传输助手；在搜索框下方找该文字并点 ──
-        self.step_begin(3, "输入文件传输助手并点下方结果")?;
+        self.step_begin(3, "输入文件传输助手并轮询下方结果")?;
         {
             let expected = self.ensure_calibrated()?;
             let _ = self.runner.ports.platform.clear_text_field(expected);
@@ -73,11 +73,9 @@ impl Run<'_> {
                 .platform
                 .type_text(&file_helper, expected)?;
             self.check_deadline("输入文件传输助手")?;
-            timed!(self, "停稳 sleep·输入后", {
-                std::thread::sleep(self.cfg().scroll_settle_timeout);
-            });
         }
-        let helper_hit = self.forward_ocr_below(file_helper.as_str(), search_box)?;
+        let helper_hit =
+            self.forward_ocr_below_polled(3, file_helper.as_str(), search_box)?;
         self.forward_click_screen_box(3, "文件传输助手结果行", None, helper_hit)?;
 
         self.advance(
@@ -101,14 +99,11 @@ impl Run<'_> {
         // ── 6. 含 message_text 的 bubble 上右击 ──
         self.step_begin(6, "右击目标气泡")?;
         self.forward_right_click_bubble(&message_text)?;
-        timed!(self, "停稳 sleep·右击后", {
-            std::thread::sleep(self.cfg().scroll_settle_timeout);
-        });
 
         self.advance(TaskState::PreparingMessage, Some("转发：准备弹出层操作".into()))?;
 
-        // ── 7. 上层菜单窗点「转发」 ──
-        self.step_begin(7, "菜单点「转发」")?;
+        // ── 7. 轮询菜单窗出现且 OCR「转发」再点 ──
+        self.step_begin(7, "轮询菜单点「转发」")?;
         self.forward_click_in_peer(
             7,
             LABEL_FORWARD,
@@ -121,12 +116,9 @@ impl Run<'_> {
             },
             Prefer::FirstTopLeft,
         )?;
-        timed!(self, "停稳 sleep·点转发后", {
-            std::thread::sleep(self.cfg().scroll_settle_timeout);
-        });
 
-        // ── 8. 转发窗第一个「创建聊天」 ──
-        self.step_begin(8, "转发窗点「创建聊天」")?;
+        // ── 8. 轮询转发窗「创建聊天」 ──
+        self.step_begin(8, "轮询转发窗点「创建聊天」")?;
         self.forward_click_in_peer(
             8,
             LABEL_CREATE_CHAT,
@@ -137,18 +129,16 @@ impl Run<'_> {
             },
             Prefer::FirstTopLeft,
         )?;
-        timed!(self, "停稳 sleep·点创建聊天后", {
-            std::thread::sleep(self.cfg().scroll_settle_timeout);
-        });
 
-        // ── 9. 最上层窗搜索框输入 contact_query ──
-        self.step_begin(9, "转发窗搜索联系人")?;
-        let peer = self.forward_pick_peer(|w| {
+        // ── 9. 轮询最上层窗「搜索」再输入 contact_query ──
+        self.step_begin(9, "轮询转发窗搜索联系人")?;
+        let peer_pred = |w: &PeerTopWindow| {
             w.title.contains("选择联系人")
                 || w.class_name.contains("SelectForward")
                 || (!w.is_main && w.rect.width >= 300 && w.rect.height >= 300)
-        })?;
-        let search_in_peer = self.forward_ocr_first_in_rect(LABEL_SEARCH, peer.rect)?;
+        };
+        let (peer, search_in_peer) =
+            self.forward_ocr_first_in_peer_polled(9, LABEL_SEARCH, peer_pred)?;
         self.forward_click_screen_box(9, "转发窗搜索框", Some(&peer), search_in_peer)?;
         {
             // 弹出层：用主窗矩形做守卫（同进程允许）；不清空失败也不致命。
@@ -161,21 +151,20 @@ impl Run<'_> {
                 .platform
                 .type_text(&contact_query, expected)?;
             self.check_deadline("输入转发联系人")?;
-            timed!(self, "停稳 sleep·输入联系人后", {
-                std::thread::sleep(self.cfg().scroll_settle_timeout);
-            });
         }
 
-        // ── 10. 搜索框下第一个最大包含匹配行 ──
-        self.step_begin(10, "点搜索结果联系人行")?;
-        let row = self.forward_ocr_best_below(&contact_query, search_in_peer, peer.rect)?;
+        // ── 10. 轮询搜索框下第一个最大包含匹配行 ──
+        self.step_begin(10, "轮询点搜索结果联系人行")?;
+        let row = self.forward_ocr_best_below_polled(
+            10,
+            &contact_query,
+            search_in_peer,
+            peer.rect,
+        )?;
         self.forward_click_screen_box(10, "联系人匹配行", Some(&peer), row)?;
-        timed!(self, "停稳 sleep·点联系人行后", {
-            std::thread::sleep(self.cfg().scroll_settle_timeout);
-        });
 
-        // ── 11. 最靠右下「创建并发送」 ──
-        self.step_begin(11, "点「创建并发送」")?;
+        // ── 11. 轮询最靠右下「创建并发送」 ──
+        self.step_begin(11, "轮询点「创建并发送」")?;
         self.forward_click_in_peer(
             11,
             LABEL_CREATE_SEND,

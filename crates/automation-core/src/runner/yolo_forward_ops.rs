@@ -6,7 +6,9 @@ use crate::yolo::{
     all_by_class, class, random_point_in_central_half, shot_point_to_screen,
 };
 
-use super::ocr_poll::{HEADER_POLL_BUDGET, HEADER_POLL_INTERVAL};
+use std::time::Instant;
+
+use super::ocr_poll::{HEADER_POLL_BUDGET, HEADER_POLL_INTERVAL, PEER_POLL_BUDGET};
 use super::Run;
 
 impl Run<'_> {
@@ -39,72 +41,189 @@ impl Run<'_> {
         }))
     }
 
-    pub(super) fn forward_ocr_first_in_rect(&mut self, needle: &str, region: Rect) -> Result<Rect, AutomationError> {
-        self.forward_ocr_first_label(needle, Some(region))
+    /// 点完导航后页面可能还没切过来：整窗上 `ocr_until_contains` 轮询，
+    /// 再取阅读序第一个含 `needle` 的框（屏幕坐标）。证据对齐步骤4风格。
+    pub(super) fn forward_ocr_first_label_polled(
+        &mut self,
+        step: u32,
+        needle: &str,
+        what: &str,
+    ) -> Result<Rect, AutomationError> {
+        let window = self.ensure_calibrated()?;
+        let poll = timed!(
+            self,
+            &format!("ocr_until_contains 轮询·「{needle}」"),
+            self.ocr_until_contains(
+                window,
+                &format!("转发·{step}·「{needle}」"),
+                needle,
+                HEADER_POLL_BUDGET,
+                HEADER_POLL_INTERVAL,
+            )
+        )?;
+        self.evidence.push(format!(
+            "步骤{step}：整窗轮询「{needle}」→ {}（等待 {}ms，OCR {} 次，\
+             停稳截帧 {} 次，最后一次读前{}停稳；预算 {}ms 间隔 {}ms）",
+            if poll.found { "成功" } else { "未找到" },
+            poll.waited.as_millis(),
+            poll.ocr_attempts,
+            poll.settle_frames,
+            if poll.settled { "已" } else { "未" },
+            HEADER_POLL_BUDGET.as_millis(),
+            HEADER_POLL_INTERVAL.as_millis(),
+        ));
+        if !poll.found {
+            return Err(AutomationError::NeedsHumanReview(format!(
+                "步骤{step}失败：点击导航后 {}ms 内（OCR {} 次，最后一次读前{}停稳）未见「{needle}」（{what}），\
+                 可能消息页尚未切过来。",
+                poll.waited.as_millis(),
+                poll.ocr_attempts,
+                if poll.settled { "已" } else { "未" },
+            )));
+        }
+        let mut hits: Vec<&TextBox> = poll
+            .boxes
+            .iter()
+            .filter(|b| b.text.contains(needle))
+            .collect();
+        hits.sort_by_key(|b| (b.bounds.y, b.bounds.x));
+        let hit = hits.first().ok_or_else(|| {
+            AutomationError::NeedsHumanReview(format!(
+                "步骤{step}失败：轮询声称找到「{needle}」但 boxes 中无匹配框。"
+            ))
+        })?;
+        Ok(hit.bounds.to_screen(Point {
+            x: window.x,
+            y: window.y,
+        }))
     }
 
-    /// 在 `anchor` 下方（y 更大）找包含 `needle` 的文字框。
-    pub(super) fn forward_ocr_below(&mut self, needle: &str, anchor: Rect) -> Result<Rect, AutomationError> {
+    /// 输入后结果行可能晚到：整窗轮询直到 `anchor` 下方出现含 `needle` 的框。
+    pub(super) fn forward_ocr_below_polled(
+        &mut self,
+        step: u32,
+        needle: &str,
+        anchor: Rect,
+    ) -> Result<Rect, AutomationError> {
         let window = self.ensure_calibrated()?;
-        let (shot, boxes) = timed!(
-            self,
-            &format!("OCR 单次·下方「{needle}」"),
-            self.capture_and_recognize(window, &format!("转发·下方「{needle}」"))
-        )?;
-        let _ = shot;
+        let budget = HEADER_POLL_BUDGET;
+        let interval = HEADER_POLL_INTERVAL;
+        let started = Instant::now();
+        let deadline = started + budget;
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            self.check_cancel()?;
+            let (_shot, boxes) = self.capture_and_recognize(
+                window,
+                &format!("转发·{step}·下方「{needle}」"),
+            )?;
+            if let Some(hit) = Self::forward_filter_below(&boxes, window, needle, anchor) {
+                self.evidence.push(format!(
+                    "步骤{step}：整窗轮询下方「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次；预算 {}ms 间隔 {}ms）",
+                    started.elapsed().as_millis(),
+                    budget.as_millis(),
+                    interval.as_millis(),
+                ));
+                return Ok(hit);
+            }
+            if Instant::now() + interval >= deadline {
+                break;
+            }
+            std::thread::sleep(interval);
+        }
+        Err(AutomationError::NeedsHumanReview(format!(
+            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次）搜索框下方未见「{needle}」。",
+            started.elapsed().as_millis(),
+        )))
+    }
+
+    /// 从 OCR 框里筛 `anchor` 下方含 `needle` 的第一个（阅读序）。
+    fn forward_filter_below(
+        boxes: &[TextBox],
+        origin: Rect,
+        needle: &str,
+        anchor: Rect,
+    ) -> Option<Rect> {
         let mut hits: Vec<Rect> = boxes
             .iter()
             .filter(|b| b.text.contains(needle))
             .map(|b| {
                 b.bounds.to_screen(Point {
-                    x: window.x,
-                    y: window.y,
+                    x: origin.x,
+                    y: origin.y,
                 })
             })
             .filter(|r| r.y > anchor.y + anchor.height / 2)
             .collect();
         hits.sort_by_key(|r| (r.y, r.x));
-        hits.into_iter().next().ok_or_else(|| {
-            AutomationError::NeedsHumanReview(format!(
-                "搜索框下方未找到「{needle}」。请确认搜索结果已弹出。"
-            ))
-        })
+        hits.into_iter().next()
     }
 
-    pub(super) fn forward_ocr_best_below(
+    /// 输入联系人后结果行可能晚到：在 `region` 上轮询直到 `anchor` 下方出现最大匹配。
+    pub(super) fn forward_ocr_best_below_polled(
         &mut self,
+        step: u32,
         needle: &str,
         anchor: Rect,
         region: Rect,
     ) -> Result<Rect, AutomationError> {
-        let (shot, boxes) = timed!(
-            self,
-            &format!("OCR 单次·匹配「{needle}」"),
-            self.capture_and_recognize(region, &format!("转发·匹配「{needle}」"))
-        )?;
-        let _ = shot;
+        let budget = PEER_POLL_BUDGET;
+        let interval = HEADER_POLL_INTERVAL;
+        let started = Instant::now();
+        let deadline = started + budget;
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            self.check_cancel()?;
+            let (_shot, boxes) = self.capture_and_recognize(
+                region,
+                &format!("转发·{step}·匹配「{needle}」"),
+            )?;
+            if let Some(hit) = Self::forward_filter_best_below(&boxes, region, needle, anchor) {
+                self.evidence.push(format!(
+                    "步骤{step}：弹层轮询下方匹配「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次；预算 {}ms 间隔 {}ms）",
+                    started.elapsed().as_millis(),
+                    budget.as_millis(),
+                    interval.as_millis(),
+                ));
+                return Ok(hit);
+            }
+            if Instant::now() + interval >= deadline {
+                break;
+            }
+            std::thread::sleep(interval);
+        }
+        Err(AutomationError::NeedsHumanReview(format!(
+            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次）搜索框下未见包含「{needle}」的匹配行。",
+            started.elapsed().as_millis(),
+        )))
+    }
+
+    /// 第一个最大包含匹配：面积降序，再阅读序；且须在 `anchor` 下方。
+    fn forward_filter_best_below(
+        boxes: &[TextBox],
+        origin: Rect,
+        needle: &str,
+        anchor: Rect,
+    ) -> Option<Rect> {
         let mut hits: Vec<(usize, Rect)> = boxes
             .iter()
             .filter(|b| b.text.contains(needle))
             .map(|b| {
                 let screen = b.bounds.to_screen(Point {
-                    x: region.x,
-                    y: region.y,
+                    x: origin.x,
+                    y: origin.y,
                 });
-                (b.bounds.width.max(0) as usize * b.bounds.height.max(0) as usize, screen)
+                (
+                    b.bounds.width.max(0) as usize * b.bounds.height.max(0) as usize,
+                    screen,
+                )
             })
             .filter(|(_, r)| r.y > anchor.y + anchor.height / 2)
             .collect();
-        // 第一个最大包含匹配：先按面积降序，再按阅读序
         hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.y.cmp(&b.1.y)).then(a.1.x.cmp(&b.1.x)));
-        hits.into_iter()
-            .next()
-            .map(|(_, r)| r)
-            .ok_or_else(|| {
-                AutomationError::NeedsHumanReview(format!(
-                    "搜索框下未找到包含「{needle}」的匹配行。"
-                ))
-            })
+        hits.into_iter().next().map(|(_, r)| r)
     }
 
     pub(super) fn forward_click_screen_box(
@@ -373,34 +492,47 @@ impl Run<'_> {
         self.check_deadline("右击气泡")
     }
 
-    pub(super) fn forward_pick_peer(
-        &mut self,
-        pred: impl Fn(&PeerTopWindow) -> bool,
-    ) -> Result<PeerTopWindow, AutomationError> {
-        let peers = self.runner.ports.platform.list_peer_top_windows()?;
-        self.evidence.push(format!(
-            "同进程顶层窗 {} 个：{}",
-            peers.len(),
-            peers
-                .iter()
-                .map(|p| format!(
+    fn summarize_peers(peers: &[PeerTopWindow]) -> String {
+        if peers.is_empty() {
+            return "(无)".into();
+        }
+        peers
+            .iter()
+            .map(|p| {
+                format!(
                     "[id={} class=`{}` title=`{}` {}x{} main={}]",
                     p.id, p.class_name, p.title, p.rect.width, p.rect.height, p.is_main
-                ))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
-        peers
-            .into_iter()
-            .filter(|p| pred(p))
-            .max_by_key(|p| (p.rect.width as i64) * (p.rect.height as i64))
-            .ok_or_else(|| {
-                AutomationError::NeedsHumanReview(
-                    "未找到符合条件的同进程弹出窗（菜单/转发对话框）。".into(),
                 )
             })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
+    /// 静默枚举并按 pred 选最大窗（轮询中间不写 evidence，避免刷屏）。
+    fn forward_try_pick_peer(
+        &mut self,
+        pred: &impl Fn(&PeerTopWindow) -> bool,
+    ) -> Result<(Vec<PeerTopWindow>, Option<PeerTopWindow>), AutomationError> {
+        let peers = self.runner.ports.platform.list_peer_top_windows()?;
+        let picked = peers
+            .iter()
+            .filter(|p| pred(p))
+            .max_by_key(|p| (p.rect.width as i64) * (p.rect.height as i64))
+            .cloned();
+        Ok((peers, picked))
+    }
+
+    fn forward_prefer_hit(hits: &mut [Rect], prefer: Prefer) {
+        match prefer {
+            Prefer::FirstTopLeft => hits.sort_by_key(|r| (r.y, r.x)),
+            Prefer::BottomRightMost => {
+                hits.sort_by_key(|r| (-(r.y + r.height), -(r.x + r.width)))
+            }
+        }
+    }
+
+    /// 弹出层点文字：预算内反复枚举 peer + OCR，直到出现 `needle` 再按 Prefer 点击。
+    /// 覆盖步骤 7（菜单「转发」）、8（「创建聊天」）、11（「创建并发送」）。
     pub(super) fn forward_click_in_peer(
         &mut self,
         step: u32,
@@ -408,35 +540,118 @@ impl Run<'_> {
         pred: impl Fn(&PeerTopWindow) -> bool,
         prefer: Prefer,
     ) -> Result<(), AutomationError> {
-        let peer = self.forward_pick_peer(pred)?;
-        let (shot, boxes) =
-            self.capture_and_recognize(peer.rect, &format!("转发·{step}·OCR「{needle}」"))?;
-        let _ = shot;
-        let mut hits: Vec<Rect> = boxes
-            .iter()
-            .filter(|b| b.text.contains(needle))
-            .map(|b| {
-                b.bounds.to_screen(Point {
-                    x: peer.rect.x,
-                    y: peer.rect.y,
-                })
-            })
-            .collect();
-        if hits.is_empty() {
-            return Err(AutomationError::NeedsHumanReview(format!(
-                "步骤{step}失败：在窗 class=`{}` title=`{}` id=`{}` 内未找到「{needle}」。",
-                peer.class_name, peer.title, peer.id
-            )));
+        let budget = PEER_POLL_BUDGET;
+        let interval = HEADER_POLL_INTERVAL;
+        let started = Instant::now();
+        let deadline = started + budget;
+        let mut attempts = 0u32;
+        let mut last_peers;
+        loop {
+            attempts += 1;
+            self.check_cancel()?;
+            let (peers, picked) = self.forward_try_pick_peer(&pred)?;
+            last_peers = Self::summarize_peers(&peers);
+            if let Some(peer) = picked {
+                let (_shot, boxes) = self.capture_and_recognize(
+                    peer.rect,
+                    &format!("转发·{step}·OCR「{needle}」"),
+                )?;
+                let mut hits: Vec<Rect> = boxes
+                    .iter()
+                    .filter(|b| b.text.contains(needle))
+                    .map(|b| {
+                        b.bounds.to_screen(Point {
+                            x: peer.rect.x,
+                            y: peer.rect.y,
+                        })
+                    })
+                    .collect();
+                if !hits.is_empty() {
+                    Self::forward_prefer_hit(&mut hits, prefer);
+                    let hit = hits[0];
+                    self.evidence.push(format!(
+                        "步骤{step}：弹层轮询「{needle}」→ 成功（等待 {}ms，尝试 {attempts} 次；预算 {}ms 间隔 {}ms；窗 class=`{}` title=`{}` id=`{}`）",
+                        started.elapsed().as_millis(),
+                        budget.as_millis(),
+                        interval.as_millis(),
+                        peer.class_name,
+                        peer.title,
+                        peer.id,
+                    ));
+                    return self.forward_click_screen_box(step, needle, Some(&peer), hit);
+                }
+            }
+            if Instant::now() + interval >= deadline {
+                break;
+            }
+            std::thread::sleep(interval);
         }
-        match prefer {
-            Prefer::FirstTopLeft => hits.sort_by_key(|r| (r.y, r.x)),
-            Prefer::BottomRightMost => hits.sort_by_key(|r| (-(r.y + r.height), -(r.x + r.width))),
+        Err(AutomationError::NeedsHumanReview(format!(
+            "步骤{step}失败：等待 {}ms（尝试 {attempts} 次）未见弹层「{needle}」。最后顶层窗：{}",
+            started.elapsed().as_millis(),
+            last_peers,
+        )))
+    }
+
+    /// 步骤9：轮询直到转发窗出现且 OCR 到「搜索」，返回 (peer, 搜索框屏幕矩形)。
+    pub(super) fn forward_ocr_first_in_peer_polled(
+        &mut self,
+        step: u32,
+        needle: &str,
+        pred: impl Fn(&PeerTopWindow) -> bool,
+    ) -> Result<(PeerTopWindow, Rect), AutomationError> {
+        let budget = PEER_POLL_BUDGET;
+        let interval = HEADER_POLL_INTERVAL;
+        let started = Instant::now();
+        let deadline = started + budget;
+        let mut attempts = 0u32;
+        let mut last_peers;
+        loop {
+            attempts += 1;
+            self.check_cancel()?;
+            let (peers, picked) = self.forward_try_pick_peer(&pred)?;
+            last_peers = Self::summarize_peers(&peers);
+            if let Some(peer) = picked {
+                let (_shot, boxes) = self.capture_and_recognize(
+                    peer.rect,
+                    &format!("转发·{step}·OCR「{needle}」"),
+                )?;
+                let mut hits: Vec<&TextBox> = boxes
+                    .iter()
+                    .filter(|b| b.text.contains(needle))
+                    .collect();
+                hits.sort_by_key(|b| (b.bounds.y, b.bounds.x));
+                if let Some(hit) = hits.first() {
+                    let screen = hit.bounds.to_screen(Point {
+                        x: peer.rect.x,
+                        y: peer.rect.y,
+                    });
+                    self.evidence.push(format!(
+                        "步骤{step}：弹层轮询「{needle}」→ 成功（等待 {}ms，尝试 {attempts} 次；预算 {}ms 间隔 {}ms；窗 class=`{}` title=`{}` id=`{}`）",
+                        started.elapsed().as_millis(),
+                        budget.as_millis(),
+                        interval.as_millis(),
+                        peer.class_name,
+                        peer.title,
+                        peer.id,
+                    ));
+                    return Ok((peer, screen));
+                }
+            }
+            if Instant::now() + interval >= deadline {
+                break;
+            }
+            std::thread::sleep(interval);
         }
-        let hit = hits[0];
-        self.forward_click_screen_box(step, needle, Some(&peer), hit)
+        Err(AutomationError::NeedsHumanReview(format!(
+            "步骤{step}失败：等待 {}ms（尝试 {attempts} 次）未见弹层「{needle}」。最后顶层窗：{}",
+            started.elapsed().as_millis(),
+            last_peers,
+        )))
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum Prefer {
     FirstTopLeft,
     BottomRightMost,

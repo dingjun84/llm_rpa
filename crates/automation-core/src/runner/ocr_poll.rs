@@ -23,6 +23,9 @@ use super::Run;
 pub(super) const HEADER_POLL_BUDGET: Duration = Duration::from_millis(1800);
 /// 轮询间隔：截一帧本身几十毫秒，再密只是重复截同一帧。
 pub(super) const HEADER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// 弹出层（菜单 / 转发对话框）出现偶发更慢：右击→菜单、点「转发」→选人窗等。
+/// evidence 会写明用的是本预算而非 HEADER_POLL_BUDGET。
+pub(super) const PEER_POLL_BUDGET: Duration = Duration::from_millis(2500);
 
 /// 一次轮询的结果与轨迹。
 pub(super) struct OcrPoll {
