@@ -4,7 +4,7 @@
 //! 2. 点 `search_bar`，逐字输入联系人名
 //! 3. 在 `contact_item` 里 OCR 找人并点击
 //! 4. 右侧资料页 OCR「发消息」并点击（无 YOLO 类）
-//! 5. 进入聊天后同 Flow A：message_input → 输入 → send_button
+//! 5. 进入聊天后同 Flow A：估计输入区 → 输入 → send_button
 
 use crate::diagnostics::{Decision, Verdict};
 use crate::ports::{AutomationError, Point, Rect, TextBox};
@@ -92,7 +92,7 @@ impl Run<'_> {
             && best_by_class(&dets, class::SEND_BUTTON).is_none()
         {
             return Err(AutomationError::NeedsHumanReview(
-                "点击「发消息」后未检出 message_input，请确认资料页入口点对了。".into(),
+                "点击「发消息」后未检出 input_bar / send_button（或遗留 message_input），请确认资料页入口点对了。".into(),
             ));
         }
 

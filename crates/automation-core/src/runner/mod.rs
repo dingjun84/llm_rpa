@@ -14,6 +14,7 @@
 mod decision;
 mod message;
 mod yolo_chat;
+mod yolo_click;
 mod yolo_common;
 mod yolo_contacts;
 // 旧 search/list/navigate 模块暂不编入（YOLO 工作流已替换）；文件仍在树中待删。

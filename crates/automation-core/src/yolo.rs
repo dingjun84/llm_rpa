@@ -7,19 +7,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::ports::{AutomationError, Point, Rect, Screenshot, TextBox};
 
-/// YOLO 类别名（与 `yolo26/API.md` / `CLASS_NAMES_CANONICAL` 对齐）。
+/// YOLO 类别名（与 `yolo26/API.md` / `CLASS_NAMES_CANONICAL` 对齐；当前权威为 14 类）。
 pub mod class {
     pub const SELF_AVATAR: &str = "self_avatar";
     pub const NAV_CHAT_ICON: &str = "nav_chat_icon";
     pub const NAV_CONTACTS_ICON: &str = "nav_contacts_icon";
     pub const SEARCH_BAR: &str = "search_bar";
     pub const CONTACT_ITEM: &str = "contact_item";
+    /// 已从 14 类模型移除；仅作旧权重兼容，新流程用 [`estimate_message_input_region`]。
     pub const MESSAGE_INPUT: &str = "message_input";
     pub const SEND_BUTTON: &str = "send_button";
     pub const CONVERSATION_ITEM: &str = "conversation_item";
     pub const INCOMING_BUBBLE: &str = "incoming_bubble";
     pub const OUTGOING_BUBBLE: &str = "outgoing_bubble";
     pub const INPUT_BAR: &str = "input_bar";
+    pub const SINGLE_CHAT: &str = "single_chat";
+    pub const GROUP_CHAT: &str = "group_chat";
+    pub const CONTACT_SEND_MESSAGE: &str = "contact_send_message";
+    pub const NAV_GROUPS_ICON: &str = "nav_groups_icon";
 }
 
 /// 单条检测（坐标相对**原图**像素，与 API `detections[]` 一致）。
@@ -57,6 +62,111 @@ impl YoloDetection {
     }
 }
 
+
+
+/// 在框的**中心半区**内均匀随机取一点：`x ∈ [cx±w/4]`，`y ∈ [cy±h/4]`。
+///
+/// 与 [`YoloDetection::center_point`] 同一坐标系（截图像素）；Retina 缩放仍走
+/// [`shot_point_to_screen`]。用 xorshift64* 线程局部 + 时间种子，避免给本 crate 加 `rand` 依赖。
+pub fn random_point_in_central_half(bounds: Rect) -> Point {
+    let w = bounds.width.max(1) as f32;
+    let h = bounds.height.max(1) as f32;
+    let cx = bounds.x as f32 + w / 2.0;
+    let cy = bounds.y as f32 + h / 2.0;
+    let half_w = w / 4.0;
+    let half_h = h / 4.0;
+    let u = next_unit_f32();
+    let v = next_unit_f32();
+    let x = cx - half_w + u * (2.0 * half_w);
+    let y = cy - half_h + v * (2.0 * half_h);
+    Point {
+        x: x.round() as i32,
+        y: y.round() as i32,
+    }
+}
+
+fn next_unit_f32() -> f32 {
+    use std::cell::Cell;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new(0);
+    }
+    STATE.with(|cell| {
+        let mut x = cell.get();
+        if x == 0 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0xA5A5_1234_C3D2_E1F0);
+            x = nanos ^ 0x9E37_79B9_7F4A_7C15;
+            if x == 0 {
+                x = 0xA5A5_1234_C3D2_E1F0;
+            }
+        }
+        // xorshift64*
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        cell.set(x);
+        // [0, 1)
+        ((x >> 11) as f32) / ((1u64 << 53) as f32)
+    })
+}
+
+/// 从 `input_bar` / `send_button` 估计文字输入区（原图像素）。
+///
+/// - top = input_bar 底边 + 小间隙
+/// - left = input_bar 左边（无 bar 时用 send 左边往左推一段）
+/// - right = send_button 左边 − 小间隙（无 send 时用 bar 右边）
+/// - bottom = send_button 底边（无 send 时 = top + 合理高度）
+///
+/// 二者都缺则返回 `None`（调用方可再试遗留 `message_input`）。
+pub fn estimate_message_input_region(detections: &[YoloDetection]) -> Option<Rect> {
+    const GAP: i32 = 4;
+    const FALLBACK_HEIGHT: i32 = 56;
+    const FALLBACK_WIDTH_FRAC_OF_SEND: i32 = 8; // send 左侧约 8×send 宽
+
+    let bar = best_by_class(detections, class::INPUT_BAR).map(|d| d.bounds_rect());
+    let send = best_by_class(detections, class::SEND_BUTTON).map(|d| d.bounds_rect());
+
+    match (bar, send) {
+        (None, None) => None,
+        (Some(bar), Some(send)) => {
+            let top = bar.y + bar.height + GAP;
+            let left = bar.x;
+            let right = (send.x - GAP).max(left + 1);
+            let bottom = send.y + send.height;
+            Some(Rect {
+                x: left,
+                y: top,
+                width: (right - left).max(1),
+                height: (bottom - top).max(1),
+            })
+        }
+        (Some(bar), None) => {
+            let top = bar.y + bar.height + GAP;
+            Some(Rect {
+                x: bar.x,
+                y: top,
+                width: bar.width.max(1),
+                height: FALLBACK_HEIGHT,
+            })
+        }
+        (None, Some(send)) => {
+            let width = (send.width.max(1) * FALLBACK_WIDTH_FRAC_OF_SEND).max(120);
+            let right = (send.x - GAP).max(1);
+            let left = (right - width).max(0);
+            let bottom = send.y + send.height;
+            let top = (send.y - FALLBACK_HEIGHT / 2).max(0);
+            Some(Rect {
+                x: left,
+                y: top,
+                width: (right - left).max(1),
+                height: (bottom - top).max(1),
+            })
+        }
+    }
+}
 
 /// 把 YOLO 检测框转成 [`TextBox`]，供过程诊断 / TaskReplay 复用文字框叠加层。
 ///
@@ -202,5 +312,29 @@ mod tests {
         assert_eq!(boxes[0].text, "contact_item 0.91");
         assert!((boxes[0].confidence - 0.91).abs() < f32::EPSILON);
         assert_eq!(boxes[0].bounds, Rect { x: 10, y: 20, width: 100, height: 40 });
+    }
+
+    #[test]
+    fn random_point_stays_in_central_half() {
+        let bounds = Rect { x: 100, y: 200, width: 80, height: 40 };
+        // central half: x in [120,160], y in [210,230]
+        for _ in 0..64 {
+            let p = random_point_in_central_half(bounds);
+            assert!((120..=160).contains(&p.x), "x={}", p.x);
+            assert!((210..=230).contains(&p.y), "y={}", p.y);
+        }
+    }
+
+    #[test]
+    fn estimate_input_region_from_bar_and_send() {
+        let dets = [
+            det("input_bar", 0.9, [100.0, 500.0, 500.0, 540.0]),
+            det("send_button", 0.9, [520.0, 560.0, 580.0, 600.0]),
+        ];
+        let r = estimate_message_input_region(&dets).expect("region");
+        assert_eq!(r.x, 100);
+        assert_eq!(r.y, 544); // 540 + 4
+        assert_eq!(r.width, 416); // 520-4 - 100
+        assert_eq!(r.height, 56); // 600 - 544
     }
 }

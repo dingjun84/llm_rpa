@@ -1,4 +1,5 @@
-//! YOLO 工作流共用步骤：整窗检测、点检测框、列表首行 OCR、滚动重试。
+//! YOLO 工作流共用步骤：整窗检测、列表首行 OCR、滚动重试、输入并发送。
+//! 点检测框 / 点估计区见 [`super::yolo_click`]。
 //!
 //! ★ 坐标换算只用 [`crate::yolo::shot_point_to_screen`]；
 //! ★ 按 class 挑框只用 [`crate::yolo::best_by_class`] / [`crate::yolo::all_by_class`]；
@@ -9,8 +10,9 @@
 use crate::diagnostics::{Decision, MatchTrail, ReplayInput, Verdict};
 use crate::ports::{AutomationError, Point, Rect, Screenshot, TextBox};
 use crate::yolo::{
-    self, all_by_class, best_by_class, detections_as_text_boxes, item_tall_enough_for_two_lines,
-    name_match_score, shot_point_to_screen, YoloDetection, DEFAULT_MIN_ITEM_HEIGHT_PX,
+    self, all_by_class, best_by_class, detections_as_text_boxes, estimate_message_input_region,
+    item_tall_enough_for_two_lines, name_match_score, shot_point_to_screen, YoloDetection,
+    DEFAULT_MIN_ITEM_HEIGHT_PX,
 };
 
 use super::decision::name_match_decision;
@@ -49,63 +51,6 @@ impl Run<'_> {
             shot.height
         ));
         Ok((window, shot, dets))
-    }
-
-    /// 把检测中心换算成屏幕坐标并 `guarded_click`（Windows 上应由 GhostBox 实现）。
-    ///
-    /// 同时落一条「看图 + 判定」：标注图只圈被点的那一框，决策写清 class / conf / 屏幕 xy。
-    pub(super) fn yolo_click_detection(
-        &mut self,
-        window: Rect,
-        shot: &Screenshot,
-        det: &YoloDetection,
-        what: &str,
-    ) -> Result<(), AutomationError> {
-        let expected_window = self.ensure_calibrated()?;
-        let c = det.center_point();
-        let target = shot_point_to_screen(c.x, c.y, window, shot.width, shot.height);
-        self.evidence.push(format!(
-            "点击{what}：{} conf={:.2} → 屏幕 ({}, {})",
-            det.class_name, det.conf, target.x, target.y
-        ));
-        let click_step = format!("点击{what}");
-        let overlay = TextBox {
-            text: format!("{} {:.2}", det.class_name, det.conf),
-            bounds: det.bounds_rect(),
-            confidence: det.conf,
-        };
-        self.report(&click_step, window, shot, &[overlay.clone()], None, None);
-        self.report_decision(
-            &click_step,
-            Decision {
-                step: String::new(),
-                question: format!("要点击哪个检测框（{what}）？"),
-                rule: format!(
-                    "YOLO class=`{}` 中心 → shot_point_to_screen → guarded_click",
-                    det.class_name
-                ),
-                outcome: format!(
-                    "点击 {} conf={:.2} → 屏幕 ({}, {})",
-                    det.class_name, det.conf, target.x, target.y
-                ),
-                passed: true,
-                min_confidence: det.conf,
-                replay: None,
-                candidates: vec![Verdict::passed(
-                    &overlay,
-                    format!(
-                        "选中目标 class={} conf={:.2} center=({}, {})",
-                        det.class_name, det.conf, target.x, target.y
-                    ),
-                )],
-            },
-        );
-        self.ensure_not_frozen(&format!("已取消点击{what}"))?;
-        self.runner
-            .ports
-            .platform
-            .guarded_click(target, expected_window)?;
-        self.check_deadline(&format!("点击{what}"))
     }
 
     /// 在检测列表里找 class，没有则转人工。
@@ -395,10 +340,10 @@ impl Run<'_> {
         self.wait_for_settle(window)
     }
 
-    /// 点 `message_input`（文字区）→ 逐字输入 → 视配置点 send_button。
+    /// 估计文字输入区并点击 → 逐字输入 → 视配置点 send_button。
     ///
-    /// `input_bar` 是文字区上方那排表情/图片工具条，中心落在图标上，不能用来聚焦输入。
-    /// 两个发送流程（会话列表、通讯录搜索）都走这里。
+    /// 14 类模型已去掉 `message_input`：输入区由 `input_bar` 底边与 `send_button` 左边围出。
+    /// 若仍检出遗留 `message_input`（旧权重），可作兜底。`input_bar` 本身是工具条，不能点中心。
     ///
     /// 调用前须已处于 [`TaskState::PreparingMessage`]。
     pub(super) fn yolo_type_and_send(
@@ -410,13 +355,17 @@ impl Run<'_> {
         use crate::audit::MessageDigest;
         use crate::state::TaskState;
 
-        let input = best_by_class(dets, yolo::class::MESSAGE_INPUT).ok_or_else(|| {
-            AutomationError::NeedsHumanReview(
-                "聊天页未检出 message_input，无法聚焦输入框。请确认已打开与目标的会话且文字输入区未被遮挡。"
+        let input_region = estimate_message_input_region(dets).or_else(|| {
+            best_by_class(dets, yolo::class::MESSAGE_INPUT).map(|d| d.bounds_rect())
+        });
+        let Some(input_region) = input_region else {
+            return Err(AutomationError::NeedsHumanReview(
+                "聊天页未检出 input_bar / send_button（亦无遗留 message_input），无法聚焦输入框。\
+                 请确认已打开与目标的会话且输入区未被遮挡。"
                     .into(),
-            )
-        })?;
-        self.yolo_click_detection(window, shot, input, "输入框")?;
+            ));
+        };
+        self.yolo_click_image_rect_jittered(window, shot, input_region, "输入框")?;
 
         let text = self.task.text.clone();
         let expected = self.ensure_calibrated()?;
