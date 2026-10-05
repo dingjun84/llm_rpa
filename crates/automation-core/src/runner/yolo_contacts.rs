@@ -3,13 +3,13 @@
 //! 1. 点 `nav_contacts_icon`
 //! 2. 点 `search_bar`，逐字输入联系人名
 //! 3. 在 `contact_item` 里 OCR 找人并点击
-//! 4. 右侧资料页 OCR「发消息」并点击（无 YOLO 类）
+//! 4. 右侧资料页 OCR「发消息」并点击（无 YOLO 类；落点同 YOLO 点击：文字框中心半区随机点）
 //! 5. 进入聊天后同 Flow A：估计输入区 → 输入 → send_button
 
 use crate::diagnostics::{Decision, Verdict};
 use crate::ports::{AutomationError, Point, Rect, TextBox};
 use crate::state::TaskState;
-use crate::yolo::{all_by_class, best_by_class, class};
+use crate::yolo::{all_by_class, best_by_class, class, random_point_in_central_half};
 
 use super::Run;
 
@@ -153,6 +153,10 @@ impl Run<'_> {
     }
 
     /// 在窗口右半侧 OCR 找「发消息」并点击。
+    ///
+    /// 落点与 YOLO 检测框点击同一规则：[`random_point_in_central_half`]（`cx±w/4, cy±h/4`），
+    /// 不点文字框精确中心。OCR 框已由 `capture_and_recognize` 换算成相对 `region` 的逻辑坐标，
+    /// 所以先 `to_screen` 再取点即可，无需再做 Retina 换算。
     pub(super) fn yolo_click_send_message_on_profile(&mut self) -> Result<(), AutomationError> {
         // 点通讯录后窗口可能已经变宽，截右栏前重读当前矩形。
         let window = self.ensure_calibrated()?;
@@ -186,12 +190,16 @@ impl Run<'_> {
             x: region.x,
             y: region.y,
         });
-        let target = screen.center();
+        let target = random_point_in_central_half(screen);
         self.evidence.push(format!(
-            "点击「{needle}」：屏幕 ({}, {}) 文字「{}」",
+            "点击「{needle}」：屏幕 ({}, {}) 文字「{}」 文字框 ({}, {}) {}x{}（中心半区随机点）",
             target.x,
             target.y,
-            hit.text.trim()
+            hit.text.trim(),
+            screen.x,
+            screen.y,
+            screen.width,
+            screen.height
         ));
         let expected = self.ensure_calibrated()?;
         self.ensure_not_frozen("已取消打开聊天")?;
