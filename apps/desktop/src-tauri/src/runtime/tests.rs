@@ -585,6 +585,7 @@ fn task_inputs_are_decided_by_the_workflow() {
     for (workflow, contact, message) in [
         (Workflow::ChatListSend, true, true),
         (Workflow::ContactsSearchSend, true, true),
+        (Workflow::ForwardToContact, true, true),
     ] {
         let inputs = workflow_inputs(workflow);
         assert_eq!(inputs.contact, contact, "{workflow:?} 的联系人要求");

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use automation_core::{
+    PeerTopWindow,
     AutomationError, DesktopPlatform, Point, Rect, ScreenMetrics, Screenshot,
 };
 
@@ -149,18 +150,22 @@ impl MacOSDesktop {
     }
 
     fn ensure_region_inside_window(&self, region: Rect) -> Result<(), AutomationError> {
-        let window =
-            macosapi::window_rect(self.current_target()?).map_err(AutomationError::Platform)?;
-        let inside = region.x >= window.x
-            && region.y >= window.y
-            && region.x + region.width <= window.x + window.width
-            && region.y + region.height <= window.y + window.height;
-        if !inside {
-            return Err(AutomationError::NeedsHumanReview(
-                "拒绝捕获目标窗口以外的屏幕区域".into(),
-            ));
+        let w = self.current_target()?;
+        let window = macosapi::window_rect(w).map_err(AutomationError::Platform)?;
+        if region_inside(region, window) {
+            return Ok(());
         }
-        Ok(())
+        for peer in macosapi::list_visible_windows() {
+            if peer.owner_pid != w.owner_pid {
+                continue;
+            }
+            if region_inside(region, peer.rect) {
+                return Ok(());
+            }
+        }
+        Err(AutomationError::NeedsHumanReview(
+            "拒绝捕获主窗/同进程顶层窗以外的屏幕区域".into(),
+        ))
     }
 
 
@@ -197,6 +202,13 @@ impl MacOSDesktop {
             ))),
         }
     }
+}
+
+fn region_inside(region: Rect, window: Rect) -> bool {
+    region.x >= window.x
+        && region.y >= window.y
+        && region.x + region.width <= window.x + window.width
+        && region.y + region.height <= window.y + window.height
 }
 
 impl DesktopPlatform for MacOSDesktop {
@@ -365,13 +377,44 @@ impl DesktopPlatform for MacOSDesktop {
 
     fn guarded_click(&self, target: Point, expected_window: Rect) -> Result<(), AutomationError> {
         self.require_accessibility()?;
-        // 先滑过去：原先把 verify_guard 放在移动前，窗口矩形稍有变化就直接返回，
-        // 操作者会看到「完全没动鼠标」，无法区分是坐标错还是守卫拦了。
         macosapi::move_cursor(target.x, target.y, self.config.pointer_speed_px_per_sec)
             .map_err(AutomationError::Platform)?;
         let w = self.verify_guard(expected_window)?;
         self.ensure_cursor_over_target(target, w)?;
         macosapi::left_click().map_err(AutomationError::Platform)
+    }
+
+    fn guarded_right_click(
+        &self,
+        target: Point,
+        expected_window: Rect,
+    ) -> Result<(), AutomationError> {
+        self.require_accessibility()?;
+        macosapi::move_cursor(target.x, target.y, self.config.pointer_speed_px_per_sec)
+            .map_err(AutomationError::Platform)?;
+        let w = self.verify_guard(expected_window)?;
+        self.ensure_cursor_over_target(target, w)?;
+        macosapi::right_click().map_err(AutomationError::Platform)
+    }
+
+    fn list_peer_top_windows(&self) -> Result<Vec<PeerTopWindow>, AutomationError> {
+        let w = self.current_target()?;
+        let main = macosapi::window_rect(w).map_err(AutomationError::Platform)?;
+        Ok(macosapi::list_visible_windows()
+            .into_iter()
+            .filter(|info| info.owner_pid == w.owner_pid && info.is_on_screen)
+            .map(|info| PeerTopWindow {
+                id: info.id.to_string(),
+                title: info.title,
+                class_name: String::new(),
+                rect: info.rect,
+                is_main: info.id == w.id
+                    || (info.rect.x == main.x
+                        && info.rect.y == main.y
+                        && info.rect.width == main.width
+                        && info.rect.height == main.height),
+            })
+            .collect())
     }
 
     fn move_pointer(&self, target: Point) -> Result<(), AutomationError> {

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use automation_core::{
+    PeerTopWindow,
     AutomationError, DesktopPlatform, Point, Rect, ScreenMetrics, Screenshot,
 };
 use windows::Win32::Foundation::HWND;
@@ -11,31 +12,9 @@ use windows::Win32::Foundation::HWND;
 use crate::config::{WindowMatcher, WindowsDesktopConfig};
 use crate::winapi::{self, WinResult};
 
-/// 轮询"剪贴板是否被取用"的间隔。
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// 没能观察到剪贴板被占用时，退化的保守等待时长。
 const CLIPBOARD_SETTLE_FALLBACK: Duration = Duration::from_millis(200);
-
-/// 「光标是否停到了要求的位置」允许的偏差（像素）。
-///
-/// 取 2 而不是 0：`SetCursorPos` 与 `GetCursorPos` 用的都是整数屏幕坐标，
-/// 正常情况下完全一致，这点容差只是吸收多显示器 / DPI 换算可能带来的取整差。
-///
-/// **刻意取得很小**——它的用途是"吸收取整"，不是"容忍移错了地方"：
-/// 真正的缺陷（光标压根没动、或落到了别的窗口上）偏差是几十上百像素，
-/// 这点容差拦不住，也不该拦。
 const CURSOR_LANDING_TOLERANCE_PX: i32 = 2;
-
-/// 「全选」与「删除」两次按键之间的间隔。
-///
-/// 取 120ms 而不是 0：全选是目标程序要**处理并应用**的一次动作（把选区建立起来），
-/// 随后的 Delete 才会删掉整段而不是一个字符。两次按键之间不留间隔时，
-/// 删除有可能赶在选区建立之前到达——症状是"只删掉一个字"，而残留的旧词
-/// 会让后面的联想结果跑偏，看不出是**清空没做干净**。
-///
-/// 这个值与本仓库诊断工具 `screen_probe clear-input` 手工验证时用的是同一个
-/// （点击 → 等 250ms → Ctrl+A → 等 120ms → Delete），在真实客户端上实测可用。
 const CLEAR_KEY_GAP: Duration = Duration::from_millis(120);
 
 /// 真实平台实现。
@@ -183,57 +162,32 @@ impl WindowsDesktop {
     /// 前台换成别的窗口则拒绝输入，避免点到别的程序。
     fn verify_guard(&self, _expected_window: Rect) -> Result<HWND, AutomationError> {
         let hwnd = self.current_target()?;
-        if !winapi::same_window(winapi::foreground_window(), hwnd) {
+        let fg = winapi::foreground_window();
+        if !winapi::same_window(fg, hwnd) && !winapi::same_process(fg, hwnd) {
             return Err(AutomationError::ClientNotReady);
         }
         Ok(hwnd)
     }
 
     fn ensure_region_inside_window(&self, region: Rect) -> Result<(), AutomationError> {
-        // ⚠️ 这里**不能**把 `self.target.lock()` 写在 `match` 的受检表达式里。
-        //
-        // Rust 会把 `match` 受检表达式里的临时值保留到**整个 match 结束**，
-        // 于是 `MutexGuard` 在进入分支时仍然存活；而分支里调用的
-        // `current_target()` 会再次锁同一把锁 —— `std::sync::Mutex` 不可重入，
-        // 结果就是**自己把自己锁死**：进程不占 CPU、不报错，永远不返回。
-        //
-        // 用 `current_target()` 统一做"是否已定位"的判断即可，
-        // 它在未定位时已经返回 `ClientNotReady`。
-        let window =
-            winapi::window_rect(self.current_target()?).map_err(AutomationError::Platform)?;
-        let inside = region.x >= window.x
-            && region.y >= window.y
-            && region.x + region.width <= window.x + window.width
-            && region.y + region.height <= window.y + window.height;
-        if !inside {
-            return Err(AutomationError::NeedsHumanReview(
-                "拒绝捕获企业微信窗口以外的屏幕区域".into(),
-            ));
+        // 用 current_target()（勿在 match 里持锁再重入，见历史死锁）。
+        let hwnd = self.current_target()?;
+        let window = winapi::window_rect(hwnd).map_err(AutomationError::Platform)?;
+        if region_inside(region, window) {
+            return Ok(());
         }
-        Ok(())
+        let pid = winapi::window_pid(hwnd);
+        for peer in winapi::list_visible_windows_of_pid(pid) {
+            if region_inside(region, peer.rect) {
+                return Ok(());
+            }
+        }
+        Err(AutomationError::NeedsHumanReview(
+            "拒绝捕获主窗/同进程顶层窗以外的屏幕区域".into(),
+        ))
     }
 
-    /// 确认光标**真的**停在了目标窗口上，然后才允许发滚轮。
-    ///
-    /// ## 为什么非查不可
-    ///
-    /// 滚轮事件送给的是**光标实际所在**的那个窗口，不是"我们想滚的那个窗口"。
-    /// 而 `SetCursorPos` 存在**返回成功、光标却没动**的情况（前台窗口属于更高
-    /// 完整性的进程、UIPI 限制等）。此时后面那次 `scroll_wheel` 会滚到光标
-    /// 实际停着的地方。
-    ///
-    /// 现场表现是最难查的一类：**「列表确实滚了，但鼠标从头到尾没动过」**——
-    /// 因为光标本来就压在列表上，于是"滚对了"掩盖了"根本没移过去"。
-    /// 换一台机器、换一个光标起始位置，同一个缺陷立刻变成"滚了别人的窗口"。
-    ///
-    /// ## 两道判据，缺一不可
-    ///
-    /// - **位置**：`GetCursorPos` 读回来的坐标必须与要求的一致
-    ///   （容差 [`CURSOR_LANDING_TOLERANCE_PX`]）；
-    /// - **归属**：光标下那个顶层窗口必须就是目标窗口。位置对了但压着别的窗口
-    ///   （被弹窗盖住、被遮挡）同样会滚错对象——只查坐标查不出这一种。
-    ///
-    /// 查不过就**报错，不重试**：这是"先验证再动作"，不是"多试几次总能成功"。
+    /// 确认光标停在目标（或同进程）窗口上。
     fn ensure_cursor_over_target(&self, at: Point, hwnd: HWND) -> Result<(), AutomationError> {
         let (x, y) = winapi::cursor_position().map_err(AutomationError::Platform)?;
         if (x - at.x).abs() > CURSOR_LANDING_TOLERANCE_PX
@@ -247,17 +201,26 @@ impl WindowsDesktop {
             )));
         }
         match winapi::window_from_point(x, y) {
-            Some(found) if winapi::same_window(found, hwnd) => Ok(()),
+            Some(found)
+                if winapi::same_window(found, hwnd) || winapi::same_process(found, hwnd) =>
+            {
+                Ok(())
+            }
             Some(_) => Err(AutomationError::NeedsHumanReview(format!(
-                "鼠标位置 ({x}, {y}) 上压着的不是目标窗口，拒绝滚动：\
-                 滚轮事件送给光标下的窗口，滚下去会动到别的程序。\
-                 常见原因：目标窗口被弹窗或其它窗口遮挡。"
+                "鼠标位置 ({x}, {y}) 上压着的不是目标/同进程窗口，拒绝操作。"
             ))),
             None => Err(AutomationError::NeedsHumanReview(format!(
-                "鼠标位置 ({x}, {y}) 上没有窗口，拒绝滚动。"
+                "鼠标位置 ({x}, {y}) 上没有窗口，拒绝操作。"
             ))),
         }
     }
+}
+
+fn region_inside(region: Rect, window: Rect) -> bool {
+    region.x >= window.x
+        && region.y >= window.y
+        && region.x + region.width <= window.x + window.width
+        && region.y + region.height <= window.y + window.height
 }
 
 impl DesktopPlatform for WindowsDesktop {
@@ -316,7 +279,8 @@ impl DesktopPlatform for WindowsDesktop {
             }
         };
 
-        if !winapi::same_window(winapi::foreground_window(), hwnd) {
+        let fg = winapi::foreground_window();
+        if !winapi::same_window(fg, hwnd) && !winapi::same_process(fg, hwnd) {
             if let Err(detail) = winapi::bring_to_foreground(hwnd) {
                 eprintln!("[platform-windows] 置前失败：{detail}");
                 return Err(AutomationError::NeedsHumanReview(format!(
@@ -324,10 +288,6 @@ impl DesktopPlatform for WindowsDesktop {
                      请先在任务栏点一下目标窗口，让它成为前台窗口，再重试。"
                 )));
             }
-            // 关键分支：`SetForegroundWindow` 返回成功**不代表前台已经切过去了**——
-            // 实际切换由窗口管理器异步完成，且仍可能被前台锁定策略吞掉（只闪一下任务栏）。
-            // 所以不能立刻读 `GetForegroundWindow()`，否则会把"还没切完"误判成"切换失败"，
-            // 把一个本来能用的窗口判成不可用。
             if !winapi::wait_until_foreground(hwnd, self.config.foreground_settle_timeout) {
                 return Err(AutomationError::NeedsHumanReview(
                     "已找到目标窗口并发出了置前请求，但它仍然不是前台窗口——\
@@ -349,17 +309,12 @@ impl DesktopPlatform for WindowsDesktop {
     }
 
     fn resize_wecom(&self, width: i32, height: i32) -> Result<Rect, AutomationError> {
-        // 非法尺寸要**报错**，不能"夹到某个最小值"接着调：那等于把标定记录里的
-        // 错误值悄悄改成一个别的值，而调用方会以为窗口已经回到了标定尺寸。
         if width <= 0 || height <= 0 {
             return Err(AutomationError::NeedsHumanReview(format!(
                 "标定记录的窗口尺寸不合法（{width}×{height}），不能拿它去调整窗口。\
                  请重新点「记录窗口尺寸」并保存配置。"
             )));
         }
-        // 用 `current_target()` 而不是重新 `locate()`：目标窗口是 `focus_wecom`
-        // 已经确定好的那一个，重定位有可能选中同类的另一个窗口（Qt 系程序所有
-        // 顶层窗口共用同一个类名），那就调到别的窗口上去了。
         let hwnd = self.current_target()?;
         winapi::resize_window(hwnd, width, height).map_err(AutomationError::Platform)
     }
@@ -417,13 +372,42 @@ impl DesktopPlatform for WindowsDesktop {
         let hwnd = self.verify_guard(expected_window)?;
         winapi::move_cursor(target.x, target.y, self.config.pointer_speed_px_per_sec)
             .map_err(AutomationError::Platform)?;
-        // 移动后再次确认前台窗口没有被抢走。
         self.verify_guard(expected_window)?;
-        // 再确认光标**真的到了**。滚动那条路一直有这道校验，点击这条路原先漏了：
-        // 移动被系统静默忽略时，这次点击会落到光标实际停着的地方——在客户端里
-        // 就是**点到了别的按钮上**，而"点错了"比"没点到"难查得多。
         self.ensure_cursor_over_target(target, hwnd)?;
         winapi::left_click().map_err(AutomationError::Platform)
+    }
+
+    fn guarded_right_click(
+        &self,
+        target: Point,
+        expected_window: Rect,
+    ) -> Result<(), AutomationError> {
+        let hwnd = self.verify_guard(expected_window)?;
+        winapi::move_cursor(target.x, target.y, self.config.pointer_speed_px_per_sec)
+            .map_err(AutomationError::Platform)?;
+        self.verify_guard(expected_window)?;
+        self.ensure_cursor_over_target(target, hwnd)?;
+        winapi::right_click().map_err(AutomationError::Platform)
+    }
+
+    fn list_peer_top_windows(&self) -> Result<Vec<PeerTopWindow>, AutomationError> {
+        let hwnd = self.current_target()?;
+        let pid = winapi::window_pid(hwnd);
+        let main = winapi::window_rect(hwnd).map_err(AutomationError::Platform)?;
+        Ok(winapi::list_visible_windows_of_pid(pid)
+            .into_iter()
+            .map(|info| PeerTopWindow {
+                id: info.hwnd.to_string(),
+                title: info.title,
+                class_name: info.class_name,
+                rect: info.rect,
+                is_main: info.hwnd == hwnd.0 as isize
+                    || (info.rect.x == main.x
+                        && info.rect.y == main.y
+                        && info.rect.width == main.width
+                        && info.rect.height == main.height),
+            })
+            .collect())
     }
 
         fn move_pointer(&self, target: Point) -> Result<(), AutomationError> {
@@ -437,25 +421,14 @@ fn scroll(
         notches: i32,
         expected_window: Rect,
     ) -> Result<(), AutomationError> {
-        // 和点击同一套守卫：滚轮事件送给光标下的窗口，滚错窗口会把别人的界面滚走。
         //
-        // 守卫**无条件**执行，`notches == 0` 的短路放在它后面。
-        // 反过来写就等于留了一条"传 0 格就能绕过前台窗口校验"的捷径，
-        // 而且会让 `Ok` 的含义变得含糊——调用方应当能认定
-        // 「scroll 返回 Ok ⇒ 守卫已经通过」。
-        // 这里拿到的句柄就是"打算滚的那个窗口"，下面核对光标落点时要用它。
         let target = self.verify_guard(expected_window)?;
         if notches == 0 {
             return Ok(());
         }
         winapi::move_cursor(at.x, at.y, self.config.pointer_speed_px_per_sec)
             .map_err(AutomationError::Platform)?;
-        // 移动后再次确认前台窗口没有被抢走，再真正滚动。
-        // 这次只看"有没有被抢走"，句柄不另取——`current_target()` 在一次运行内不会变。
         self.verify_guard(expected_window)?;
-        // 然后确认**光标真的到了**：滚轮送给光标下的窗口，没到就等于滚了别的窗口。
-        // 这是"先验证再动作"。少了这一步，缺陷只在"光标本来就压着列表"时被掩盖
-        // （现象是"列表滚了、鼠标没动"），换台机器就变成"滚了别人的窗口"。
         self.ensure_cursor_over_target(at, target)?;
         winapi::scroll_wheel(notches).map_err(AutomationError::Platform)
     }

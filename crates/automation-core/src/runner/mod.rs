@@ -16,7 +16,10 @@ mod message;
 mod yolo_chat;
 mod yolo_click;
 mod yolo_common;
+mod yolo_ocr;
 mod yolo_contacts;
+mod yolo_forward;
+mod yolo_forward_ops;
 // 旧 search/list/navigate 模块暂不编入（YOLO 工作流已替换）；文件仍在树中待删。
 
 /// 由「结论 + 轨迹」拼出一条决策记录（见 [`decision`]）。
@@ -35,9 +38,10 @@ use crate::candidates::describe_candidates;
 use crate::diagnostics::{
     Decision, DiagnosticRecorder, IconHit, MatchTrail, Observation, ReplayInput, WindowShot,
 };
+use crate::{EvidenceRecorder, SendTask};
 use crate::ports::{
-    AutomationError, ContactMatcher, DesktopPlatform, EvidenceRecorder, IconLocator,
-    IconTemplate, LocalOcr, Point, Rect, ScreenMetrics, Screenshot, SendTask, TaskId,
+    AutomationError, ContactMatcher, DesktopPlatform, IconLocator, IconTemplate, LocalOcr, Point,
+    Rect, ScreenMetrics, Screenshot, TaskId,
     TextBox,
 };
 use crate::regions::{RelativePoint, RelativeRegion};
@@ -266,13 +270,16 @@ pub enum Workflow {
     /// 两条流程里的列表行在 13 类模型中同为 `list_item`（14 类旧模型的 conversation_item /
     /// contact_item 作别名接受），是会话还是联系人由本工作流导航到的页面决定（`yolo::ListPage`）。
     ContactsSearchSend,
+    /// 转发到联系人（Flow C）：消息页 → 文件传输助手 → 右键转发 → 选人 → 创建并发送。
+    ForwardToContact,
 }
 
 impl Workflow {
     /// 全部工作流，**顺序即界面上的顺序**。
-    pub const ALL: [Workflow; 2] = [
+    pub const ALL: [Workflow; 3] = [
         Workflow::ChatListSend,
         Workflow::ContactsSearchSend,
+        Workflow::ForwardToContact,
     ];
 
     /// 面向操作者的名字，用于界面下拉与失败信息。
@@ -280,6 +287,7 @@ impl Workflow {
         match self {
             Self::ChatListSend => "会话列表发送（消息页找人 → 发消息）",
             Self::ContactsSearchSend => "通讯录搜索发送（搜人 → 发消息 → 发正文）",
+            Self::ForwardToContact => "转发到联系人（文件传输助手 → 转发气泡）",
         }
     }
 }
@@ -700,7 +708,7 @@ struct Run<'a> {
 /// `navigate_to_view` 里图标定位也做了同样的事（`frame.width / strip.width`），
 /// 但那是每个调用点各算一遍。这里放在 `capture_and_recognize` 的出口统一做，
 /// 让所有 OCR 调用方拿到的都是逻辑坐标。
-fn scale_boxes_to_logical(
+pub(super) fn scale_boxes_to_logical(
     shot: Screenshot,
     boxes: Vec<TextBox>,
     region: Rect,
@@ -1336,6 +1344,7 @@ impl<'a> Run<'a> {
         match self.cfg().workflow {
             Workflow::ChatListSend => self.run_chat_list_send(),
             Workflow::ContactsSearchSend => self.run_contacts_search_send(),
+            Workflow::ForwardToContact => self.run_forward_to_contact(),
         }
     }
 

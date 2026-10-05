@@ -371,7 +371,6 @@ pub fn resize_window(w: WindowRef, width: i32, height: i32) -> MacResult<Rect> {
     if owner.is_empty() {
         return Err("无法读取窗口所有者名，拒绝调整尺寸".into());
     }
-    // 转义 AppleScript 字符串中的引号
     let owner_esc = owner.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         r#"tell application "System Events"
@@ -438,8 +437,6 @@ fn ensure_accessibility() -> MacResult<()> {
 }
 
 pub fn primary_scale_factor() -> f32 {
-    // 简化：Retina 通常为 2.0。用像素宽 / 点宽更准确，但需要 CGDisplayMode。
-    // 这里用 NSScreen.backingScaleFactor。
     unsafe {
         let cls = match Class::get("NSScreen") {
             Some(c) => c,
@@ -574,8 +571,6 @@ pub fn capture_region(region: Rect) -> MacResult<CapturedFrame> {
     if region.width <= 0 || region.height <= 0 {
         return Err("捕获区域尺寸无效".into());
     }
-    // 实测：本机用与 kCGWindowBounds 相同的左上原点矩形即可截到正确窗口内容。
-    // （文档写 Quartz 左下；若再翻转 Y，预览会与真窗口错位。）
     let rect = CGRect::new(
         &CGPoint::new(region.x as f64, region.y as f64),
         &CGSize::new(region.width as f64, region.height as f64),
@@ -658,16 +653,10 @@ pub fn cursor_position() -> MacResult<(i32, i32)> {
     let source = event_source()?;
     let event = CGEvent::new(source).map_err(|_| "无法读取光标位置".to_string())?;
     let loc = event.location();
-    // 与 kCGWindowBounds 同一套：主屏左上为原点的全局坐标。
-    // 若再按「Quartz 左下」做一次 Y 翻转，相对轨迹自检仍能画圆（读写一致），
-    // 但按窗口矩形算出来的绝对目标会整体偏掉——正是「绿框对、鼠标偏」的症状。
     Ok((loc.x.round() as i32, loc.y.round() as i32))
 }
 
 pub fn window_from_point(x: i32, y: i32) -> Option<WindowRef> {
-    // 与 Windows `WindowFromPoint` 对齐：取光标下**最具体**的那扇窗，不要求先获焦。
-    // CGWindowList 的前后序在多屏/全屏场景下不可靠；包含该点的窗口里取**面积最小**的，
-    // 避免命中背后那块几乎铺满屏的大窗（用户感觉像「取到了最大的窗口」）。
     let mut best: Option<WindowInfo> = None;
     let mut best_area: i64 = i64::MAX;
     for w in list_visible_windows() {
@@ -767,7 +756,6 @@ fn warp_cursor(x: i32, y: i32) -> MacResult<()> {
     Ok(())
 }
 
-
 const CIRCLE_MIN_DURATION: Duration = Duration::from_millis(400);
 const CIRCLE_MAX_DURATION: Duration = Duration::from_secs(8);
 const CIRCLE_MIN_STEPS: u32 = 24;
@@ -858,15 +846,27 @@ pub fn left_click() -> MacResult<()> {
     let (x, y) = cursor_position()?;
     let point = to_quartz_point(x, y);
     let down = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::LeftMouseDown,
-        point,
-        CGMouseButton::Left,
-    )
-    .map_err(|_| "创建鼠标按下事件失败".to_string())?;
-    let up =
-        CGEvent::new_mouse_event(source, CGEventType::LeftMouseUp, point, CGMouseButton::Left)
-            .map_err(|_| "创建鼠标抬起事件失败".to_string())?;
+        source.clone(), CGEventType::LeftMouseDown, point, CGMouseButton::Left,
+    ).map_err(|_| "创建鼠标按下事件失败".to_string())?;
+    let up = CGEvent::new_mouse_event(
+        source, CGEventType::LeftMouseUp, point, CGMouseButton::Left,
+    ).map_err(|_| "创建鼠标抬起事件失败".to_string())?;
+    down.post(CGEventTapLocation::HID);
+    up.post(CGEventTapLocation::HID);
+    Ok(())
+}
+
+pub fn right_click() -> MacResult<()> {
+    ensure_accessibility()?;
+    let source = event_source()?;
+    let (x, y) = cursor_position()?;
+    let point = to_quartz_point(x, y);
+    let down = CGEvent::new_mouse_event(
+        source.clone(), CGEventType::RightMouseDown, point, CGMouseButton::Right,
+    ).map_err(|_| "创建鼠标右键按下事件失败".to_string())?;
+    let up = CGEvent::new_mouse_event(
+        source, CGEventType::RightMouseUp, point, CGMouseButton::Right,
+    ).map_err(|_| "创建鼠标右键抬起事件失败".to_string())?;
     down.post(CGEventTapLocation::HID);
     up.post(CGEventTapLocation::HID);
     Ok(())

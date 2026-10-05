@@ -26,6 +26,7 @@ use std::time::Duration;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_A,
     VK_CONTROL, VK_DELETE, VK_V,
 };
@@ -127,6 +128,15 @@ pub fn left_click() -> WinResult<()> {
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent != inputs.len() as u32 {
         return Err("发送鼠标事件失败".to_string());
+    }
+    Ok(())
+}
+
+pub fn right_click() -> WinResult<()> {
+    let inputs = [mouse_input(MOUSEEVENTF_RIGHTDOWN), mouse_input(MOUSEEVENTF_RIGHTUP)];
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent != inputs.len() as u32 {
+        return Err("发送鼠标右键事件失败".to_string());
     }
     Ok(())
 }

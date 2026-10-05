@@ -74,6 +74,9 @@ fn truncate(text: &str, limit: usize) -> String {
 }
 
 /// 调用本机 OCR 程序完成识别。
+///
+/// 每次识别新起子进程，实现已是 `Send + Sync`，
+/// 可被 [`automation_core::recognize_many_with_raw`] 多路并发调用。
 #[derive(Debug, Clone)]
 pub struct ExternalOcr {
     pub command: PathBuf,

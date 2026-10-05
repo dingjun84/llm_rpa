@@ -223,6 +223,18 @@ impl AutomationError {
     }
 }
 
+/// 与主窗口同进程的可见顶层窗（含主窗）。用于菜单 / 转发对话框。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerTopWindow {
+    /// 平台句柄：Windows=`hwnd` 十进制；macOS=`CGWindowID`。
+    pub id: String,
+    pub title: String,
+    /// Windows 类名；macOS 无类名时为空。
+    pub class_name: String,
+    pub rect: Rect,
+    pub is_main: bool,
+}
+
 /// 真实实现只可对用户可见、已解锁的交互式桌面执行操作。
 pub trait DesktopPlatform: Send + Sync {
     /// 启动已由用户配置且经验证的企业微信可执行文件；不得猜测路径或提权启动。
@@ -288,11 +300,21 @@ pub trait DesktopPlatform: Send + Sync {
 
     fn screen_metrics(&self) -> Result<ScreenMetrics, AutomationError>;
 
-    /// 捕获指定屏幕区域。调用方不得传入企业微信窗口外的区域。
+    /// 捕获屏幕区域（不抢焦点）。区域须落在主窗或同进程顶层窗内。
     fn capture(&self, region: Rect) -> Result<Screenshot, AutomationError>;
 
     /// 点击前验证当前前台窗口与预期窗口一致；不满足则拒绝输入。
     fn guarded_click(&self, target: Point, expected_window: Rect) -> Result<(), AutomationError>;
+
+    /// 右键点击；守卫与 [`Self::guarded_click`] 相同（同进程弹出层允许）。
+    fn guarded_right_click(
+        &self,
+        target: Point,
+        expected_window: Rect,
+    ) -> Result<(), AutomationError>;
+
+    /// 枚举主窗同进程的可见顶层窗（含主窗）。只读、不抢焦点。
+    fn list_peer_top_windows(&self) -> Result<Vec<PeerTopWindow>, AutomationError>;
 
     /// 只把光标滑到 `target`，不点击、不做窗口守卫。
     ///
@@ -470,28 +492,7 @@ pub trait ContactMatcher: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SendTask {
-    pub id: TaskId,
-    pub external_contact_name: String,
-    pub text: String,
-    pub created_by: String,
-}
-
-// 这里曾经有一个 `HumanConfirmation` 端口（`confirm_send`）：发送前阻塞等操作者
-// 在界面上点一次"确认"。2026-09-22 操作者要求去掉——**没勾「只填不发」就是同意发**，
-// 中间不再插一道等人工的闸门（理由与替代的安全边界见 `runner/message.rs`）。
-//
-// 端口、替身、界面命令、配置项（`confirmation_ttl`）与审计里的 `confirmation_at`
-// 是**同一件事的五个落点**，一起去掉；留任何一个都是"看起来还能确认"的假痕迹。
-
-/// 失败证据记录端口。
-///
-/// 实现方**必须**先做局部裁切与脱敏（至少遮盖已识别出的文字区域），
-/// 只允许把脱敏后的画面落盘；不得保存整屏原图、消息正文或剪贴板内容。
-pub trait EvidenceRecorder: Send + Sync {
-    fn record(&self, task_id: TaskId, label: &str, frame: &Screenshot, text_boxes: &[TextBox]);
-}
+// SendTask / EvidenceRecorder → `crate::task`（本文件贴着 500 行上限）。
 
 // 排查材料的端口（`Observation` / `DiagnosticRecorder`）在 `crate::diagnostics`：
 // 本文件已经贴着 500 行的硬上限，新端口一律搬成同级模块。

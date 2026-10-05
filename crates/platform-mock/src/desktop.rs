@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use automation_core::{AutomationError, DesktopPlatform, Point, Rect, ScreenMetrics, Screenshot};
+use automation_core::{AutomationError, DesktopPlatform, PeerTopWindow, Point, Rect, ScreenMetrics, Screenshot};
 
 use crate::fault::MockFaults;
 
@@ -375,7 +375,29 @@ impl DesktopPlatform for MockDesktop {
         Ok(())
     }
 
-        fn move_pointer(&self, target: Point) -> Result<(), AutomationError> {
+    fn guarded_right_click(
+        &self,
+        target: Point,
+        expected_window: Rect,
+    ) -> Result<(), AutomationError> {
+        self.ensure_foreground_is_target(expected_window)?;
+        self.record("right_click");
+        self.clicks.lock().unwrap().push(target);
+        Ok(())
+    }
+
+    fn list_peer_top_windows(&self) -> Result<Vec<PeerTopWindow>, AutomationError> {
+        let window = self.window();
+        Ok(vec![PeerTopWindow {
+            id: "mock-main".into(),
+            title: "MockWeWork".into(),
+            class_name: "MockWeWorkWindow".into(),
+            rect: window,
+            is_main: true,
+        }])
+    }
+
+    fn move_pointer(&self, target: Point) -> Result<(), AutomationError> {
         let _ = target;
         Ok(())
     }

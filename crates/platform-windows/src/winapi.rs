@@ -286,6 +286,13 @@ pub fn list_visible_windows() -> Vec<WindowInfo> {
     ctx.found
 }
 
+pub fn list_visible_windows_of_pid(pid: u32) -> Vec<WindowInfo> {
+    list_visible_windows()
+        .into_iter()
+        .filter(|info| window_pid(HWND(info.hwnd as *mut _)) == pid)
+        .collect()
+}
+
 pub fn window_class_name(hwnd: HWND) -> String {
     let mut buffer = vec![0u16; MAX_CLASS_NAME_CHARS];
     let copied = unsafe { GetClassNameW(hwnd, &mut buffer) };
@@ -333,6 +340,19 @@ pub fn window_from_point(x: i32, y: i32) -> Option<HWND> {
     }
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
     Some(if root.0.is_null() { hwnd } else { root })
+}
+
+
+pub fn window_pid(hwnd: HWND) -> u32 {
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid
+}
+
+pub fn same_process(a: HWND, b: HWND) -> bool {
+    let pa = window_pid(a);
+    let pb = window_pid(b);
+    pa != 0 && pa == pb
 }
 
 /// 窗口所属进程的可执行文件路径。
@@ -409,22 +429,7 @@ pub fn resize_window(hwnd: HWND, width: i32, height: i32) -> WinResult<Rect> {
     window_rect(hwnd)
 }
 
-/// 把窗口置于前台。先尝试还原最小化窗口，再设置前台。
-///
-/// **只有前台进程能成功**：Windows 只允许"当前前台进程"切换前台窗口，后台进程的请求
-/// 会被静默吞掉（表现是任务栏闪一下）。返回 `true` 也只表示"请求被接受"，不代表已经
-/// 切过去了——调用方必须用 [`wait_until_foreground`] 核实，不能立刻读 `GetForegroundWindow`。
-///
-/// ★★ **不要试图绕过前台锁定**（2026-09-19 实测，两条路都堵死了）：
-///
-/// 1. `AttachThreadInput` 这个老办法**在 Win10/11 上已经失效**。实测把本线程分别附到
-///    前台线程与目标线程上（两次 `AttachThreadInput` 都返回成功）之后，
-///    `SetForegroundWindow` **依然返回 `false`**，前台一动不动。
-/// 2. `BringWindowToTop` / `SetWindowPos(HWND_TOPMOST)` 只改 **Z 序**，
-///    **不给键盘焦点**——而 `SendInput` 只送给前台窗口，所以对输入毫无帮助。
-///
-/// 结论：**抢前台这条路走不通**。要么调用方自己就是前台进程（界面上点「开始任务」
-/// 时就是这样），要么请操作者点一下目标窗口。失败时如实报错，不要兜底重试。
+/// 把窗口置于前台（不重试抢前台）。
 pub fn bring_to_foreground(hwnd: HWND) -> WinResult<()> {
     if is_minimized(hwnd) {
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
@@ -439,16 +444,7 @@ pub fn foreground_window() -> HWND {
     unsafe { GetForegroundWindow() }
 }
 
-/// 有界等待 `hwnd` 成为前台窗口；超时返回 `false`。
-///
-/// **为什么需要等**：`SetForegroundWindow` 返回 `true` 只表示"请求被接受"，
-/// **不代表前台已经切过去了**——实际切换由窗口管理器完成，且仍可能被
-/// 前台锁定策略吞掉（表现为任务栏闪一下）。所以调用后**不能立刻**
-/// 用 `GetForegroundWindow()` 判定，否则会把"还没切完"误判成"切换失败"。
-///
-/// 注意这不是"重试到成功"：**只等这一次请求生效**，超时就认失败。
-/// 本项目明确禁止反复重试到成功，所以这里等的是一个有界的结算窗口，
-/// 而不是"再试一次"。
+/// 有界等待前台切换生效。
 pub fn wait_until_foreground(hwnd: HWND, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -703,7 +699,7 @@ pub fn fingerprint_of(pixels: &[u8], width: u32, height: u32) -> String {
 mod input;
 
 pub use input::{
-    left_click, scroll_wheel, send_ctrl_a, send_ctrl_v, send_delete, send_unicode_text,
+    left_click, right_click, scroll_wheel, send_ctrl_a, send_ctrl_v, send_delete, send_unicode_text,
 };
 
 // ── 光标轨迹 ────────────────────────────────────────────────────────────

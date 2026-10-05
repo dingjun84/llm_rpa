@@ -67,60 +67,6 @@ impl Run<'_> {
         })
     }
 
-    /// 对单个 YOLO bbox 做 OCR，返回**图像坐标**下的文字框（相对整窗截图）。
-    pub(super) fn yolo_ocr_bbox(
-        &mut self,
-        window: Rect,
-        shot: &Screenshot,
-        det: &YoloDetection,
-        step: &str,
-    ) -> Result<Vec<TextBox>, AutomationError> {
-        let bounds = det.bounds_rect();
-        // 原图像素 → 屏幕区域，再 capture；OCR bounds 会再经 scale_boxes_to_logical。
-        let tl = shot_point_to_screen(bounds.x, bounds.y, window, shot.width, shot.height);
-        let br = shot_point_to_screen(
-            bounds.x + bounds.width,
-            bounds.y + bounds.height,
-            window,
-            shot.width,
-            shot.height,
-        );
-        let region = Rect {
-            x: tl.x,
-            y: tl.y,
-            width: (br.x - tl.x).max(1),
-            height: (br.y - tl.y).max(1),
-        };
-        let (_crop, boxes) = self.capture_and_recognize(region, step)?;
-        // capture_and_recognize 已把 bounds 换成相对 region 的逻辑坐标；
-        // 再叠到整窗图像坐标系，方便与其它条目比「首行更靠前」。
-        let scale_x = if shot.width > 0 {
-            shot.width as f32 / window.width.max(1) as f32
-        } else {
-            1.0
-        };
-        let scale_y = if shot.height > 0 {
-            shot.height as f32 / window.height.max(1) as f32
-        } else {
-            1.0
-        };
-        let origin_img_x = ((region.x - window.x) as f32 * scale_x).round() as i32;
-        let origin_img_y = ((region.y - window.y) as f32 * scale_y).round() as i32;
-        Ok(boxes
-            .into_iter()
-            .map(|mut b| {
-                b.bounds.x += origin_img_x;
-                b.bounds.y += origin_img_y;
-                b
-            })
-            .collect())
-    }
-
-    /// 取 bbox 内 OCR **第一行**（y 最小的一块；同行取最左）。
-    pub(super) fn yolo_first_line_text(boxes: &[TextBox]) -> Option<&TextBox> {
-        boxes.iter().min_by_key(|b| (b.bounds.y, b.bounds.x))
-    }
-
     /// 在 `list_item`（旧权重的 `conversation_item` / `contact_item` 同样接受）里用首行 OCR 找联系人。
     ///
     /// 是会话行还是联系人行不看 class 名，由 `page`（runner 刚导航到的页面）决定，只影响文案。
@@ -176,6 +122,8 @@ impl Run<'_> {
         let mut best: Option<(YoloDetection, usize, f32, TextBox)> = None;
         let mut runners_up: Vec<TextBox> = Vec::new();
         let mut verdicts: Vec<Verdict> = Vec::new();
+        // 先筛半截条目，再对剩余框并发 OCR（上限见 ocr_batch::MAX_OCR_CONCURRENCY）。
+        let mut tall: Vec<YoloDetection> = Vec::new();
         for det in items {
             let det_box = TextBox {
                 text: format!("{} {:.2}", det.class_name, det.conf),
@@ -194,7 +142,15 @@ impl Run<'_> {
                 ));
                 continue;
             }
-            let boxes = self.yolo_ocr_bbox(window, shot, det, step)?;
+            tall.push(det.clone());
+        }
+        let ocr_by_item = self.yolo_ocr_bboxes(window, shot, &tall, step)?;
+        for (det, boxes) in tall.iter().zip(ocr_by_item.into_iter()) {
+            let det_box = TextBox {
+                text: format!("{} {:.2}", det.class_name, det.conf),
+                bounds: det.bounds_rect(),
+                confidence: det.conf,
+            };
             let Some(first) = Self::yolo_first_line_text(&boxes) else {
                 verdicts.push(Verdict::rejected(&det_box, "bbox 内无 OCR 文字"));
                 continue;

@@ -9,6 +9,9 @@ use std::time::Duration;
 use automation_core::{AutomationError, LocalOcr, Screenshot, TextBox};
 
 /// 调用 `POST {base}/ocr` 的识别器。
+///
+/// 每次识别独立发 HTTP（`ureq::post`），实现已是 `Send + Sync`，
+/// 可被 [`automation_core::recognize_many_with_raw`] 多路并发调用。
 #[derive(Debug, Clone)]
 pub struct HttpOcr {
     pub api_base: String,

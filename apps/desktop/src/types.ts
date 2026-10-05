@@ -436,12 +436,13 @@ export interface RuntimeConfig {
 }
 
 /** 工作流。见 `RunChoice.workflow`。 */
-export type Workflow = "chat_list_send" | "contacts_search_send";
+export type Workflow = "chat_list_send" | "contacts_search_send" | "forward_to_contact";
 
 /** 工作流下拉文案（须区分两条路看的界面）。 */
 export const WORKFLOW_LABELS: Record<Workflow, string> = {
   chat_list_send: "会话列表发送（消息页找会话 → 发消息）",
   contacts_search_send: "通讯录搜索发送（搜人 → 发消息 → 发正文）",
+  forward_to_contact: "转发到联系人（文件传输助手 → 转发气泡）",
 };
 
 /** 一项标定区域对某条工作流的必要性（后端算好下发）。 */
@@ -467,15 +468,9 @@ export interface WorkflowRequirement {
   label: string;
   /** 必须标好的区域；空表 = 这条工作流一块新增区域都不需要。 */
   required: MarkRequirement[];
-  /**
-   * 这条工作流要不要填「外部联系人名称」。
-   *
-   * ★ 判据在后端（`runtime::workflow_inputs`），界面只渲染：`false` 时那个框
-   * **整个不显示**，「开始任务」也不拿它当门槛。前端自己判断的话，
-   * 两边不一致的表现是「按钮点不动、也不说为什么」——2026-09-20 实测过。
-   */
+  /** 要不要「外部联系人名称」（后端 `workflow_inputs`）。 */
   needs_contact: boolean;
-  /** 这条工作流要不要填「消息正文」。同上。 */
+  /** 要不要「消息正文」。 */
   needs_message: boolean;
 }
 

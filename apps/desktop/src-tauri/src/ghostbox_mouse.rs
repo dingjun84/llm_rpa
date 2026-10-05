@@ -67,10 +67,21 @@ fn ghost_move_to(target: Point) -> Result<(), AutomationError> {
 #[cfg(windows)]
 fn ghost_left_click() -> Result<(), AutomationError> {
     with_api(|api| {
-        api.PressMouseButton(1)
+        api.PressMouseButton(ghostbox::MOUSE_BUTTON_LEFT)
             .map_err(|err| AutomationError::Platform(format!("PressMouseButton 失败：{err}")))?;
-        api.ReleaseMouseButton(1)
+        api.ReleaseMouseButton(ghostbox::MOUSE_BUTTON_LEFT)
             .map_err(|err| AutomationError::Platform(format!("ReleaseMouseButton 失败：{err}")))?;
+        Ok(())
+    })
+}
+
+#[cfg(windows)]
+fn ghost_right_click() -> Result<(), AutomationError> {
+    with_api(|api| {
+        api.PressMouseButton(ghostbox::MOUSE_BUTTON_RIGHT)
+            .map_err(|err| AutomationError::Platform(format!("PressMouseButton(右) 失败：{err}")))?;
+        api.ReleaseMouseButton(ghostbox::MOUSE_BUTTON_RIGHT)
+            .map_err(|err| AutomationError::Platform(format!("ReleaseMouseButton(右) 失败：{err}")))?;
         Ok(())
     })
 }
@@ -105,16 +116,13 @@ impl DesktopPlatform for GhostboxMouseDesktop {
     }
 
     fn guarded_click(&self, target: Point, expected_window: Rect) -> Result<(), AutomationError> {
-        // 先让内层做窗口守卫（聚焦/校验），再改用 GhostBox 真正点下去。
-        // 内层 guarded_click 会走 OS 鼠标；这里拆成：校验用 focus + 量窗，点击用 HID。
-        // 先确认能把目标窗口置于前台。宽高不再与调用方传入的矩形比对。
-        let _current = self.inner.focus_wecom()?;
+        // 不强制 focus 主窗：同进程菜单/转发窗被拉主窗前台时会关掉。
+        // 任务开始时已 focus；此处只量窗确认目标进程仍在，再 HID 点击。
+        let _ = self.inner.measure_target_window()?;
         let _ = expected_window;
         #[cfg(windows)]
         {
             ghost_move_to(target)?;
-            // 移动后再确认前台。
-            let _ = self.inner.focus_wecom()?;
             ghost_left_click()
         }
         #[cfg(not(windows))]
@@ -124,6 +132,31 @@ impl DesktopPlatform for GhostboxMouseDesktop {
                 "幽灵盒鼠标仅支持 Windows（需要 gbilmd64.dll）".into(),
             ))
         }
+    }
+
+    fn guarded_right_click(
+        &self,
+        target: Point,
+        expected_window: Rect,
+    ) -> Result<(), AutomationError> {
+        let _ = self.inner.measure_target_window()?;
+        let _ = expected_window;
+        #[cfg(windows)]
+        {
+            ghost_move_to(target)?;
+            ghost_right_click()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = target;
+            Err(AutomationError::Platform(
+                "幽灵盒鼠标仅支持 Windows（需要 gbilmd64.dll）".into(),
+            ))
+        }
+    }
+
+    fn list_peer_top_windows(&self) -> Result<Vec<automation_core::PeerTopWindow>, AutomationError> {
+        self.inner.list_peer_top_windows()
     }
 
     fn move_pointer(&self, target: Point) -> Result<(), AutomationError> {

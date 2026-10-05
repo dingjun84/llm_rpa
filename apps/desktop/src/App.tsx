@@ -181,9 +181,12 @@ export function App() {
       (current) =>
         current ?? {
           mode: "live",
-          workflow: info.config.workflow === "contacts_search_send"
-            ? "contacts_search_send"
-            : "chat_list_send",
+          workflow:
+            info.config.workflow === "contacts_search_send"
+              ? "contacts_search_send"
+              : info.config.workflow === "forward_to_contact"
+                ? "forward_to_contact"
+                : "chat_list_send",
           nav_target: "",
         },
     );

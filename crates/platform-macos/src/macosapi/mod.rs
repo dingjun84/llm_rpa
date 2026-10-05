@@ -204,6 +204,10 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn right_click() -> MacResult<()> {
+        Err(unsupported())
+    }
+
     pub fn scroll_wheel(_notches: i32) -> MacResult<()> {
         Err(unsupported())
     }

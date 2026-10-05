@@ -87,7 +87,7 @@ pub struct WorkflowInputs {
 /// 一条工作流要不要填那两个输入框 —— **这条判据只此一处**。
 pub fn workflow_inputs(workflow: Workflow) -> WorkflowInputs {
     match workflow {
-        Workflow::ChatListSend | Workflow::ContactsSearchSend => {
+        Workflow::ChatListSend | Workflow::ContactsSearchSend | Workflow::ForwardToContact => {
             WorkflowInputs { contact: true, message: true }
         }
     }

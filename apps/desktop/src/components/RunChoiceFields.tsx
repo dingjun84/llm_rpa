@@ -24,7 +24,7 @@ interface Props {
   requirement: WorkflowRequirement | null;
 }
 
-const WORKFLOWS: Workflow[] = ["chat_list_send", "contacts_search_send"];
+const WORKFLOWS: Workflow[] = ["chat_list_send", "contacts_search_send", "forward_to_contact"];
 
 /**
  * 「这一次要跑什么」：工作流选择 + 标定缺口提示。
