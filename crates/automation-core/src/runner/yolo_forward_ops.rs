@@ -99,7 +99,24 @@ impl Run<'_> {
         }))
     }
 
-    /// 输入后结果行可能晚到：整窗轮询直到 `anchor` 下方出现含 `needle` 的框。
+    /// 搜索框与结果行之间的最小垂直间隙（像素）。
+    /// 命中顶边须 ≥ anchor 底边 + GAP，排除搜索框带内刚输入的文字。
+    const FORWARD_BELOW_GAP_PX: i32 = 10;
+
+    /// 搜索框下方列表区：y 从 anchor 底边起至 `origin`（窗/弹层）底，宽度跟 origin。
+    fn forward_list_region_below(origin: Rect, anchor: Rect) -> Rect {
+        let y = (anchor.y + anchor.height).max(origin.y);
+        let bottom = origin.y + origin.height;
+        Rect {
+            x: origin.x,
+            y,
+            width: origin.width,
+            height: (bottom - y).max(1),
+        }
+    }
+
+    /// 输入后结果行可能晚到：整窗轮询直到列表区相对输入后基线有变化，
+    /// 且 `anchor` 下方出现含 `needle` 的框。
     pub(super) fn forward_ocr_below_polled(
         &mut self,
         step: u32,
@@ -109,25 +126,39 @@ impl Run<'_> {
         let window = self.ensure_calibrated()?;
         let budget = HEADER_POLL_BUDGET;
         let interval = HEADER_POLL_INTERVAL;
+        let list_region = Self::forward_list_region_below(window, anchor);
+        let baseline = self
+            .capture_frame(list_region, &format!("转发·{step}·列表指纹基准"))?
+            .fingerprint;
         let started = Instant::now();
         let deadline = started + budget;
         let mut attempts = 0u32;
+        let mut list_changed = false;
         loop {
             attempts += 1;
             self.check_cancel()?;
+            let current_fp = self
+                .capture_frame(list_region, &format!("转发·{step}·列表指纹"))?
+                .fingerprint;
+            if current_fp != baseline {
+                list_changed = true;
+            }
             let (_shot, boxes) = self.capture_and_recognize(
                 window,
                 &format!("转发·{step}·下方「{needle}」"),
             )?;
-            if let Some(hit) = Self::forward_filter_below(&boxes, window, needle, anchor) {
-                self.evidence.push(format!(
-                    "步骤{step}：整窗轮询下方「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次（最少 {} 次）；预算 {}ms 间隔 {}ms）",
-                    started.elapsed().as_millis(),
-                    MIN_OCR_ATTEMPTS,
-                    budget.as_millis(),
-                    interval.as_millis(),
-                ));
-                return Ok(hit);
+            if list_changed {
+                if let Some(hit) = Self::forward_filter_below(&boxes, window, needle, anchor) {
+                    self.evidence.push(format!(
+                        "步骤{step}：整窗轮询下方「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次（最少 {} 次）；\
+                         列表指纹已变化；预算 {}ms 间隔 {}ms）",
+                        started.elapsed().as_millis(),
+                        MIN_OCR_ATTEMPTS,
+                        budget.as_millis(),
+                        interval.as_millis(),
+                    ));
+                    return Ok(hit);
+                }
             }
             let budget_exhausted = Instant::now() + interval >= deadline;
             if attempts >= MIN_OCR_ATTEMPTS && budget_exhausted {
@@ -135,20 +166,32 @@ impl Run<'_> {
             }
             std::thread::sleep(interval);
         }
+        let changed_zh = if list_changed { "已" } else { "未" };
+        self.evidence.push(format!(
+            "步骤{step}：整窗轮询下方「{needle}」→ 未找到（等待 {}ms，OCR {attempts} 次（最少 {} 次）；\
+             列表指纹{changed_zh}变化；预算 {}ms 间隔 {}ms）",
+            started.elapsed().as_millis(),
+            MIN_OCR_ATTEMPTS,
+            budget.as_millis(),
+            interval.as_millis(),
+        ));
         Err(AutomationError::NeedsHumanReview(format!(
-            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次，最少 {} 次）搜索框下方未见「{needle}」。",
+            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次，最少 {} 次）搜索框下方未见「{needle}」；\
+             列表指纹{changed_zh}变化，可能搜索结果未刷新。",
             started.elapsed().as_millis(),
             MIN_OCR_ATTEMPTS,
         )))
     }
 
     /// 从 OCR 框里筛 `anchor` 下方含 `needle` 的第一个（阅读序）。
+    /// 命中顶边须 ≥ anchor 底边 + [`Self::FORWARD_BELOW_GAP_PX`]，排除搜索框带内文字。
     fn forward_filter_below(
         boxes: &[TextBox],
         origin: Rect,
         needle: &str,
         anchor: Rect,
     ) -> Option<Rect> {
+        let min_y = anchor.y + anchor.height + Self::FORWARD_BELOW_GAP_PX;
         let mut hits: Vec<Rect> = boxes
             .iter()
             .filter(|b| b.text.contains(needle))
@@ -158,13 +201,14 @@ impl Run<'_> {
                     y: origin.y,
                 })
             })
-            .filter(|r| r.y > anchor.y + anchor.height / 2)
+            .filter(|r| r.y >= min_y)
             .collect();
         hits.sort_by_key(|r| (r.y, r.x));
         hits.into_iter().next()
     }
 
-    /// 输入联系人后结果行可能晚到：在 `region` 上轮询直到 `anchor` 下方出现最大匹配。
+    /// 输入联系人后结果行可能晚到：在 `region` 上轮询直到列表区相对输入后基线有变化，
+    /// 且 `anchor` 下方出现最大匹配。
     pub(super) fn forward_ocr_best_below_polled(
         &mut self,
         step: u32,
@@ -174,25 +218,40 @@ impl Run<'_> {
     ) -> Result<Rect, AutomationError> {
         let budget = PEER_POLL_BUDGET;
         let interval = HEADER_POLL_INTERVAL;
+        let list_region = Self::forward_list_region_below(region, anchor);
+        let baseline = self
+            .capture_frame(list_region, &format!("转发·{step}·列表指纹基准"))?
+            .fingerprint;
         let started = Instant::now();
         let deadline = started + budget;
         let mut attempts = 0u32;
+        let mut list_changed = false;
         loop {
             attempts += 1;
             self.check_cancel()?;
+            let current_fp = self
+                .capture_frame(list_region, &format!("转发·{step}·列表指纹"))?
+                .fingerprint;
+            if current_fp != baseline {
+                list_changed = true;
+            }
             let (_shot, boxes) = self.capture_and_recognize(
                 region,
                 &format!("转发·{step}·匹配「{needle}」"),
             )?;
-            if let Some(hit) = Self::forward_filter_best_below(&boxes, region, needle, anchor) {
-                self.evidence.push(format!(
-                    "步骤{step}：弹层轮询下方匹配「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次（最少 {} 次）；预算 {}ms 间隔 {}ms）",
-                    started.elapsed().as_millis(),
-                    MIN_OCR_ATTEMPTS,
-                    budget.as_millis(),
-                    interval.as_millis(),
-                ));
-                return Ok(hit);
+            if list_changed {
+                if let Some(hit) = Self::forward_filter_best_below(&boxes, region, needle, anchor)
+                {
+                    self.evidence.push(format!(
+                        "步骤{step}：弹层轮询下方匹配「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次（最少 {} 次）；\
+                         列表指纹已变化；预算 {}ms 间隔 {}ms）",
+                        started.elapsed().as_millis(),
+                        MIN_OCR_ATTEMPTS,
+                        budget.as_millis(),
+                        interval.as_millis(),
+                    ));
+                    return Ok(hit);
+                }
             }
             let budget_exhausted = Instant::now() + interval >= deadline;
             if attempts >= MIN_OCR_ATTEMPTS && budget_exhausted {
@@ -200,20 +259,32 @@ impl Run<'_> {
             }
             std::thread::sleep(interval);
         }
+        let changed_zh = if list_changed { "已" } else { "未" };
+        self.evidence.push(format!(
+            "步骤{step}：弹层轮询下方匹配「{needle}」→ 未找到（等待 {}ms，OCR {attempts} 次（最少 {} 次）；\
+             列表指纹{changed_zh}变化；预算 {}ms 间隔 {}ms）",
+            started.elapsed().as_millis(),
+            MIN_OCR_ATTEMPTS,
+            budget.as_millis(),
+            interval.as_millis(),
+        ));
         Err(AutomationError::NeedsHumanReview(format!(
-            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次，最少 {} 次）搜索框下未见包含「{needle}」的匹配行。",
+            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次，最少 {} 次）搜索框下未见包含「{needle}」的匹配行；\
+             列表指纹{changed_zh}变化，可能搜索结果未刷新。",
             started.elapsed().as_millis(),
             MIN_OCR_ATTEMPTS,
         )))
     }
 
     /// 第一个最大包含匹配：面积降序，再阅读序；且须在 `anchor` 下方。
+    /// 命中顶边须 ≥ anchor 底边 + [`Self::FORWARD_BELOW_GAP_PX`]。
     fn forward_filter_best_below(
         boxes: &[TextBox],
         origin: Rect,
         needle: &str,
         anchor: Rect,
     ) -> Option<Rect> {
+        let min_y = anchor.y + anchor.height + Self::FORWARD_BELOW_GAP_PX;
         let mut hits: Vec<(usize, Rect)> = boxes
             .iter()
             .filter(|b| b.text.contains(needle))
@@ -227,7 +298,7 @@ impl Run<'_> {
                     screen,
                 )
             })
-            .filter(|(_, r)| r.y > anchor.y + anchor.height / 2)
+            .filter(|(_, r)| r.y >= min_y)
             .collect();
         hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.y.cmp(&b.1.y)).then(a.1.x.cmp(&b.1.x)));
         hits.into_iter().next().map(|(_, r)| r)
