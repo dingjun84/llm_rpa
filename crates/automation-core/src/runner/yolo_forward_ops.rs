@@ -6,6 +6,7 @@ use crate::yolo::{
     all_by_class, class, random_point_in_central_half, shot_point_to_screen,
 };
 
+use super::ocr_poll::{HEADER_POLL_BUDGET, HEADER_POLL_INTERVAL};
 use super::Run;
 
 impl Run<'_> {
@@ -184,16 +185,36 @@ impl Run<'_> {
             width: (window.x + window.width - (hit.x + hit.width / 2)).max(1),
             height: (hit.y + hit.height * 2 - window.y).max(40).min(window.height),
         };
-        let (shot, boxes) = self.capture_and_recognize(band, "转发·4·会话标题带")?;
-        let _ = shot;
-        let ok = boxes.iter().any(|b| b.text.contains(file_helper));
+        // 点完立刻 OCR 会读到切换前的旧标题（任务 39a1754e）：先等标题带停稳再读，
+        // 读不到就在预算内重试，见 `ocr_poll`。
+        let poll = self.ocr_until_contains(
+            band,
+            "转发·4·会话标题带",
+            file_helper,
+            HEADER_POLL_BUDGET,
+            HEADER_POLL_INTERVAL,
+        )?;
+        let read = if self.cfg().log_ocr_candidates && !poll.found {
+            format!("；最后一次读到：{}", crate::candidates::describe_candidates(&poll.boxes))
+        } else {
+            String::new()
+        };
         self.evidence.push(format!(
-            "步骤4：在命中点右上方区域找「{file_helper}」→ {}",
-            if ok { "成功" } else { "未找到" }
+            "步骤4：在命中点右上方区域找「{file_helper}」→ {}（等待 {}ms，OCR {} 次，\
+             停稳截帧 {} 次，最后一次读前{}停稳；预算 {}ms 间隔 {}ms）{read}",
+            if poll.found { "成功" } else { "未找到" },
+            poll.waited.as_millis(),
+            poll.ocr_attempts,
+            poll.settle_frames,
+            if poll.settled { "已" } else { "未" },
+            HEADER_POLL_BUDGET.as_millis(),
+            HEADER_POLL_INTERVAL.as_millis(),
         ));
-        if !ok {
+        if !poll.found {
             return Err(AutomationError::NeedsHumanReview(format!(
-                "步骤4失败：点击后右上方未见「{file_helper}」，可能未进入会话。"
+                "步骤4失败：点击后 {}ms 内（OCR {} 次）右上方未见「{file_helper}」，可能未进入会话。",
+                poll.waited.as_millis(),
+                poll.ocr_attempts
             )));
         }
         Ok(())

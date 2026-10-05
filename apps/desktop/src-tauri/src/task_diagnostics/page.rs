@@ -35,9 +35,13 @@ pub(super) fn render_page(
         stamp,
         region: observation.region,
         frame: observation.frame,
-        // 整窗底图与图标命中直接透传：诊断图的画法由 `vision::render` 决定，
-        // 这里只负责把端口上的两样东西原样递过去。
-        window: observation.window.as_ref().map(|w| (w.frame, w.rect)),
+        // 图标命中直接透传；整窗底图**只给没做 OCR 的步骤**：做了 OCR 的步骤底图必须是
+        // 送 OCR 的那一帧（与 `raw/` 里的输入图同一份字节），见 `vision::render` 模块注释。
+        // runner 那边已经不给 OCR 步骤带整窗，这里再兜一层，免得别的上报方漏了这条。
+        window: match observation.ocr_raw {
+            Some(_) => None,
+            None => observation.window.as_ref().map(|w| (w.frame, w.rect)),
+        },
         text_boxes: observation.text_boxes,
         icon: observation.icon.as_ref(),
     };

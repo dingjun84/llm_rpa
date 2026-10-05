@@ -276,6 +276,48 @@ fn a_half_written_last_line_does_not_blind_the_replay_view() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// ★ OCR 步骤即便误带了整窗，`steps/` 底图也只能是送 OCR 的那一帧（与 `raw/` 同源）。
+///
+/// 任务 39a1754e 步骤4：OCR 帧还在旧会话，事后另截的整窗已切到新会话，
+/// 叠成一张图就成了"切完了却读错"的假象。
+#[test]
+fn an_ocr_step_never_uses_a_window_base() {
+    let root = temp_root("ocr_no_window");
+    let diagnostics = TaskDiagnostics::new(root.join("task"), "任务 x");
+    let shot = frame("a");
+    let window_shot = Screenshot {
+        fingerprint: "w".into(),
+        pixels: vec![90, 90, 90, 255].repeat(200 * 120),
+        width: 200,
+        height: 120,
+        captured_at: SystemTime::now(),
+    };
+    let boxes: Vec<TextBox> = vec![];
+    diagnostics.observe(
+        TaskId::nil(),
+        &Observation {
+            label: "标题带",
+            region: Rect { x: 10, y: 20, width: 60, height: 40 },
+            frame: &shot,
+            window: Some(automation_core::WindowShot {
+                rect: Rect { x: 0, y: 0, width: 200, height: 120 },
+                frame: &window_shot,
+            }),
+            text_boxes: &boxes,
+            icon: None,
+            ocr_raw: Some(OCR_RAW),
+        },
+    );
+    let page = std::fs::read(root.join("task").join(STEPS_DIR).join("01-标题带.png")).unwrap();
+    let page = vision::pixels::decode_png(&page).unwrap();
+    assert!(page.pixels().any(|p| p.0 == [40, 40, 40, 255]), "OCR 输入帧要贴在页面上");
+    assert!(
+        !page.pixels().any(|p| p.0 == [90, 90, 90, 255]),
+        "OCR 步骤不许拿事后的整窗当底图"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn temp_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("llm-rpa-diag-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);

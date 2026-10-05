@@ -128,6 +128,11 @@ struct Fixture {
 #[derive(Default)]
 struct RecordingDiagnostics {
     seen: Mutex<Vec<(String, Rect, usize)>>,
+    /// 做了 OCR（`ocr_raw.is_some()`）却还带着整窗的步骤——应当恒为空：
+    /// OCR 步骤的诊断底图必须是送 OCR 的那一帧，事后补截的整窗可能已是另一个画面。
+    ocr_with_window: Mutex<Vec<String>>,
+    /// 做了 OCR 的步骤数（证明上面那条断言不是"一步 OCR 都没有"而空过）。
+    ocr_steps: Mutex<usize>,
 }
 
 impl RecordingDiagnostics {
@@ -138,6 +143,12 @@ impl RecordingDiagnostics {
 
 impl DiagnosticRecorder for RecordingDiagnostics {
     fn observe(&self, _task_id: TaskId, observation: &Observation<'_>) {
+        if observation.ocr_raw.is_some() {
+            *self.ocr_steps.lock().unwrap() += 1;
+            if observation.window.is_some() {
+                self.ocr_with_window.lock().unwrap().push(observation.label.to_string());
+            }
+        }
         self.seen.lock().unwrap().push((
             observation.label.to_string(),
             observation.region,
@@ -955,6 +966,12 @@ fn every_read_step_reaches_the_diagnostic_recorder() {
             "步骤「{label}」报上来的是整窗 {region:?}——诊断图的价值就在于显示「只看了这一块」"
         );
     }
+    assert!(*fixture.diagnostics.ocr_steps.lock().unwrap() > 0, "这条流程里应当有 OCR 步骤");
+    let mixed = fixture.diagnostics.ocr_with_window.lock().unwrap().clone();
+    assert!(
+        mixed.is_empty(),
+        "OCR 步骤不许再带事后补截的整窗（底图必须是 OCR 输入帧）：{mixed:?}"
+    );
 }
 
 /// 关掉开关后，过程证据里**不该**出现识别到的文字，只留指纹。

@@ -13,6 +13,7 @@
 
 mod decision;
 mod message;
+mod ocr_poll;
 mod yolo_chat;
 mod yolo_click;
 mod yolo_common;
@@ -1036,10 +1037,15 @@ impl<'a> Run<'a> {
         let Some(recorder) = self.runner.diagnostics.as_ref() else {
             return;
         };
-        // 整窗底图**尽力而为**：它在标注图上只影响"区域框落在窗口哪儿"这一条，
-        // 而截屏可能失败（窗口没了、权限掉了）。诊断是观测手段，
-        // 不让它的一次失败变成任务的一次失败——拿不到就退回只画裁图。
-        let window = self.capture_window();
+        // ★ 做了 OCR 的步骤（`ocr_raw.is_some()`）**不再补截整窗**：底图必须就是送 OCR 的
+        // 那一帧（= `raw/` 里的输入图）。事后再截的整窗与 OCR 帧隔了一次截屏 + 一次识别
+        // （几百毫秒），界面可能已经变了——任务 39a1754e 步骤4 就是这样：OCR 帧还停在
+        // 旧会话，事后整窗已切到「文件传输助手」，标注图看起来像"切完了却读错"，其实是两帧。
+        //
+        // 没做 OCR 的步骤（指纹轮询、点击落点、YOLO 整窗）照旧尽力补一张整窗：
+        // 它只影响"区域框落在窗口哪儿"这一条，截不到就退回只画裁图——
+        // 诊断是观测手段，不让它的一次失败变成任务的一次失败。
+        let window = if ocr_raw.is_some() { None } else { self.capture_window() };
         let window = window.as_ref().map(|(rect, shot)| WindowShot { rect: *rect, frame: shot });
         recorder.observe(
             self.task.id,

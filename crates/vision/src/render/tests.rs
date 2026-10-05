@@ -85,7 +85,10 @@ fn the_frame_itself_is_drawn_onto_the_page() {
     assert!(page.pixels().any(|p| p.0 == [40, 40, 40, 255]));
 }
 
-/// ★ 用户要的那一条：有整窗时**用它当底图**，并且区域框落在窗口内的位置上。
+/// 调用方给了整窗时**用它当底图**，并且区域框落在窗口内的位置上。
+///
+/// 注意：只有**没做 OCR** 的步骤才会给整窗；OCR 步骤调用方不传 `window`，
+/// 底图就是送 OCR 的那一帧（见下一条用例与 `render.rs` 模块注释）。
 ///
 /// 这一条钉住两件事：
 /// - 底图是整窗（裁图那 40 灰**不该**出现在页面上）；
@@ -230,4 +233,44 @@ fn an_overview_without_pages_still_produces_an_image() {
     let Some(font) = font() else { return };
     let sheet = compose_overview("任务 abc 过程诊断", "", &font, &[]);
     assert!(sheet.is_ok(), "一步都没记上时也不能出错");
+}
+/// ★ OCR 步骤（调用方不传整窗）：页面上的底图**逐像素**就是送 OCR 的那一帧。
+///
+/// `raw/` 里的输入图是 `encode_png(to_rgba(frame))`，这里断言底图块 = `to_rgba(frame)`，
+/// 即「诊断底图与 raw 同一份像素」——任务 39a1754e 步骤4 的两帧串图不会再出现。
+#[test]
+fn an_ocr_step_base_is_exactly_the_ocr_input_frame() {
+    let Some(font) = font() else { return };
+    let (w, h) = (90u32, 30u32);
+    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+    for i in 0..w * h {
+        let v = (i % 251) as u8;
+        pixels.extend_from_slice(&[v, v.wrapping_mul(3), v.wrapping_add(17), 255]);
+    }
+    let shot = Screenshot { fingerprint: "ocr".into(), pixels, width: w, height: h, captured_at: SystemTime::now() };
+    let page = annotate_step(
+        &Step {
+            label: "转发·4·会话标题带",
+            stamp: "t",
+            region: Rect { x: 300, y: 10, width: w as i32, height: h as i32 },
+            frame: &shot,
+            window: None,
+            text_boxes: &[],
+            icon: None,
+        },
+        &font,
+    )
+    .unwrap();
+    let raw = crate::pixels::to_rgba(&shot).unwrap();
+    let top = (MARGIN + HEADER_H + HEADER_GAP) as u32;
+    // 四边各留 2px：区域框（2px 宽）描在图像边界上，会盖掉最外两圈。
+    for y in 2..h - 2 {
+        for x in 2..w - 2 {
+            assert_eq!(
+                page.get_pixel(MARGIN as u32 + x, top + y),
+                raw.get_pixel(x, y),
+                "({x}, {y}) 处底图与 OCR 输入帧不一致"
+            );
+        }
+    }
 }

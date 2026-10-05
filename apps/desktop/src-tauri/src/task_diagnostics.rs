@@ -289,7 +289,11 @@ impl DiagnosticRecorder for TaskDiagnostics {
                  合计 {}ms（底图 {}）",
                 observation.label,
                 started.elapsed().as_millis(),
-                if observation.window.is_some() { "整窗" } else { "裁图" }
+                match (observation.ocr_raw.is_some(), observation.window.is_some()) {
+                    (true, _) => "OCR 输入帧",
+                    (false, true) => "整窗",
+                    (false, false) => "裁图",
+                }
             ),
         );
     }
