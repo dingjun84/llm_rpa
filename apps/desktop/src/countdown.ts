@@ -5,9 +5,9 @@ import { useEffect, useRef, useState } from "react";
  *
  * ## 为什么抽出来
  *
- * 现在有三处用到：延时截图（`CaptureTrigger`）、画圆自检（`CursorMotionPanel`）、
- * 指认窗口（`WindowPicker`）。三处要的**秒数**各不相同——8 秒够切回客户端输完联系人名、
- * 3 秒够把手从按钮挪到想当圆心的位置——所以秒数留在各调用点，共用的只有"怎么数"。
+ * 现在有多处用到：延时截图（`CaptureTrigger`）、画圆 / HID 右键自检（`CursorMotionPanel`）、
+ * 指认窗口（`WindowPicker`）。各处要的**秒数**各不相同——8 秒够切回客户端输完联系人名、
+ * 3 秒够把手从按钮挪到圆心或企微气泡——所以秒数留在各调用点，共用的只有"怎么数"。
  *
  * ⚠️ `WindowPicker` **没有**改用这个 hook：它那个定时器每跳一次还要顺便采一次
  * "光标下是哪个窗口"，数与采是同一拍。它只共用 [`remainingSeconds`] 的显示口径。

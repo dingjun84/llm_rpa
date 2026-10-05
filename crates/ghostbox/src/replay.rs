@@ -351,9 +351,11 @@ fn apply_button_delta(api: &GBMAPI, prev: u8, next: u8) -> Result<usize, Ghostbo
             continue;
         }
         if next & mask != 0 {
-            let _ = api.PressMouseButton(btn_id)?;
+            let code = api.PressMouseButton(btn_id)?;
+            crate::api::ensure_mouse_button_ok("PressMouseButton", code)?;
         } else {
-            let _ = api.ReleaseMouseButton(btn_id)?;
+            let code = api.ReleaseMouseButton(btn_id)?;
+            crate::api::ensure_mouse_button_ok("ReleaseMouseButton", code)?;
         }
         events += 1;
     }

@@ -1,6 +1,7 @@
 //! GhostBox 鼠标适配：把 `DesktopPlatform` 的移动/点击/滚动落到 HID。
 //!
 //! ★ 仅 Windows；进程级 `shared_device_session` 开一次，**不**在每次操作后 CloseDevice。
+//! ★ 滚轮 Windows 上走 `MoveMouseWheel`（官方：Z 正上负下，返回 1=成功）。
 //! ★ 键盘（`type_text` / `clear_text_field` / `paste_text`）仍走内层 OS 实现。
 
 use std::sync::Arc;
@@ -67,10 +68,14 @@ fn ghost_move_to(target: Point) -> Result<(), AutomationError> {
 #[cfg(windows)]
 fn ghost_left_click() -> Result<(), AutomationError> {
     with_api(|api| {
-        api.PressMouseButton(ghostbox::MOUSE_BUTTON_LEFT)
-            .map_err(|err| AutomationError::Platform(format!("PressMouseButton 失败：{err}")))?;
-        api.ReleaseMouseButton(ghostbox::MOUSE_BUTTON_LEFT)
-            .map_err(|err| AutomationError::Platform(format!("ReleaseMouseButton 失败：{err}")))?;
+        let code = api
+            .PressAndReleaseMouseButton(ghostbox::MOUSE_BUTTON_LEFT)
+            .map_err(|err| {
+                AutomationError::Platform(format!("PressAndReleaseMouseButton(左) 失败：{err}"))
+            })?;
+        ghostbox::ensure_mouse_button_ok("PressAndReleaseMouseButton(1=左)", code).map_err(
+            |err| AutomationError::Platform(format!("左键未成功：{err}")),
+        )?;
         Ok(())
     })
 }
@@ -78,10 +83,35 @@ fn ghost_left_click() -> Result<(), AutomationError> {
 #[cfg(windows)]
 fn ghost_right_click() -> Result<(), AutomationError> {
     with_api(|api| {
-        api.PressMouseButton(ghostbox::MOUSE_BUTTON_RIGHT)
-            .map_err(|err| AutomationError::Platform(format!("PressMouseButton(右) 失败：{err}")))?;
-        api.ReleaseMouseButton(ghostbox::MOUSE_BUTTON_RIGHT)
-            .map_err(|err| AutomationError::Platform(format!("ReleaseMouseButton(右) 失败：{err}")))?;
+        // 官方：3=右键；用 PressAndRelease（按下→释放延时由 SetMouseMovementDelay 控制）。
+        let code = api
+            .PressAndReleaseMouseButton(ghostbox::MOUSE_BUTTON_RIGHT)
+            .map_err(|err| {
+                AutomationError::Platform(format!("PressAndReleaseMouseButton(右) 失败：{err}"))
+            })?;
+        ghostbox::ensure_mouse_button_ok("PressAndReleaseMouseButton(3=右)", code).map_err(
+            |err| AutomationError::Platform(format!("右键未成功：{err}")),
+        )?;
+        Ok(())
+    })
+}
+
+/// RPA `notches>0` = 向下滚内容 → GhostBox `MoveMouseWheel` 的 Z 为负（官方：正上负下）。
+#[cfg(windows)]
+fn ghost_scroll(notches: i32) -> Result<(), AutomationError> {
+    if notches == 0 {
+        return Ok(());
+    }
+    let z = ghostbox::notches_to_wheel_z(notches);
+    with_api(|api| {
+        let code = api.MoveMouseWheel(z).map_err(|err| {
+            AutomationError::Platform(format!("MoveMouseWheel({z}) 失败：{err}"))
+        })?;
+        ghostbox::ensure_mouse_wheel_ok("MoveMouseWheel", code).map_err(|err| {
+            AutomationError::Platform(format!(
+                "滚轮未成功：MoveMouseWheel({z}) → {err}（期望返回 1）"
+            ))
+        })?;
         Ok(())
     })
 }
@@ -179,12 +209,19 @@ impl DesktopPlatform for GhostboxMouseDesktop {
         notches: i32,
         expected_window: Rect,
     ) -> Result<(), AutomationError> {
-        // 滚轮仍走内层 OS；Windows 上先用 GhostBox 把光标移到落点。
+        // Windows：移动 + 滚轮都走幽灵盒 HID（MoveMouseWheel；Z 正上负下）。
+        // 非 Windows：仍委托内层。
+        let _ = expected_window;
         #[cfg(windows)]
         {
+            let _ = self.inner.measure_target_window()?;
             ghost_move_to(at)?;
+            return ghost_scroll(notches);
         }
-        self.inner.scroll(at, notches, expected_window)
+        #[cfg(not(windows))]
+        {
+            self.inner.scroll(at, notches, expected_window)
+        }
     }
 
     fn paste_text(&self, text: &str, expected_window: Rect) -> Result<(), AutomationError> {

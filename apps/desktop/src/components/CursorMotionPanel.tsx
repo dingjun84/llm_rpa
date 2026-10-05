@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { drawCursorCircle, ghostboxResetDevice } from "../api";
+import { drawCursorCircle, ghostboxResetDevice, ghostboxRightClick } from "../api";
 import { remainingSeconds, useCountdown } from "../countdown";
 import type { CircleTraceView } from "../types";
 
@@ -34,6 +34,12 @@ import type { CircleTraceView } from "../types";
  *
  * 画圆的每一步都经进程级共享会话的 `MoveMouseTo`（与「远程检测」同一条路径）。
  * 「重置幽灵盒」也放在本页：平时移动只 Open 一次，重置才 Close→Reset。
+ *
+ * ## HID 右键自检
+ *
+ * 另有「测试 HID 右键」：倒计时 3 秒后在**当前光标位置**触发
+ * `PressAndReleaseMouseButton(3)`（官方：3=右键，返回 2=成功），**不**先 MoveMouseTo。
+ * 用来单独验证任务里声称调了右击但菜单没出现时，硬件右键本身是否生效。
  */
 
 /**
@@ -59,6 +65,7 @@ export function CursorMotionPanel({ busy }: Props) {
   const [result, setResult] = useState<CircleTraceView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [rightClicking, setRightClicking] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [log, setLog] = useState<string[]>([]);
 
@@ -86,6 +93,21 @@ export function CursorMotionPanel({ busy }: Props) {
     }
   };
 
+  const runRightClick = async () => {
+    setRightClicking(true);
+    setError(null);
+    pushLog("正在触发 HID 右键（当前光标位置，不 MoveMouseTo）…");
+    try {
+      const next = await ghostboxRightClick();
+      pushLog(next.notice);
+    } catch (err) {
+      setError(String(err));
+      pushLog(`HID 右键失败：${String(err)}`);
+    } finally {
+      setRightClicking(false);
+    }
+  };
+
   const resetDevice = async () => {
     setResetting(true);
     setError(null);
@@ -101,12 +123,17 @@ export function CursorMotionPanel({ busy }: Props) {
   };
 
   // `run` 每次渲染都是新函数，但 hook 内部把它放进 ref 了，不会因此重新计时。
-  const { counting, remainingMs, start, stop } = useCountdown(DELAY_TRACE_SECS, () => {
+  const circleCountdown = useCountdown(DELAY_TRACE_SECS, () => {
     void run();
   });
+  const rightClickCountdown = useCountdown(DELAY_TRACE_SECS, () => {
+    void runRightClick();
+  });
 
-  const seconds = remainingSeconds(remainingMs);
-  const blocked = busy || running || resetting;
+  const circleSeconds = remainingSeconds(circleCountdown.remainingMs);
+  const rightClickSeconds = remainingSeconds(rightClickCountdown.remainingMs);
+  const anyCounting = circleCountdown.counting || rightClickCountdown.counting;
+  const blocked = busy || running || rightClicking || resetting || anyCounting;
 
   return (
     <section className="panel">
@@ -122,28 +149,66 @@ export function CursorMotionPanel({ busy }: Props) {
       </p>
 
       <div className="guide-stage-actions">
-        {counting ? (
+        {circleCountdown.counting ? (
           <>
-            <button type="button" onClick={stop}>
-              取消
+            <button type="button" onClick={circleCountdown.stop}>
+              取消画圆
             </button>
             <span className="picker-countdown" role="status">
-              把鼠标移到想当圆心的位置… {seconds} 秒后开始
+              把鼠标移到想当圆心的位置… {circleSeconds} 秒后开始
             </span>
           </>
         ) : (
-          <button type="button" disabled={blocked} onClick={start}>
+          <button
+            type="button"
+            disabled={blocked}
+            onClick={circleCountdown.start}
+          >
             {running ? "正在画圆…" : `画一个圆（${DELAY_TRACE_SECS} 秒后开始）`}
           </button>
         )}
-        <button type="button" disabled={busy || resetting || running} onClick={() => void resetDevice()}>
+        {rightClickCountdown.counting ? (
+          <>
+            <button type="button" onClick={rightClickCountdown.stop}>
+              取消右键
+            </button>
+            <span className="picker-countdown" role="status">
+              将在 {rightClickSeconds}s 后右键（把鼠标移到企微气泡等位置）
+            </span>
+          </>
+        ) : (
+          <button
+            type="button"
+            disabled={blocked}
+            onClick={() => {
+              pushLog(`将在 ${DELAY_TRACE_SECS}s 后触发 HID 右键（不 MoveMouseTo）`);
+              rightClickCountdown.start();
+            }}
+          >
+            {rightClicking
+              ? "正在右键…"
+              : `测试 HID 右键（${DELAY_TRACE_SECS} 秒后）`}
+          </button>
+        )}
+        <button
+          type="button"
+          disabled={busy || resetting || running || rightClicking || anyCounting}
+          onClick={() => void resetDevice()}
+        >
           {resetting ? "重置中…" : "重置幽灵盒"}
         </button>
       </div>
 
       <p className="field-hint">
+        「测试 HID 右键」：倒计时结束后在<strong>当前光标位置</strong>触发幽灵盒{" "}
+        <code className="mono">PressAndReleaseMouseButton(3)</code>
+        （官方 3=右键；返回码 2=成功 / 0=失败），
+        <strong>不会</strong>先 MoveMouseTo。看企微等是否弹出右键菜单；成功/失败与 DLL
+        返回码会写进下方状态日志，以及{" "}
+        <code className="mono">%TEMP%\ghostbox-replay.log</code>。
+        <br />
         「重置幽灵盒」始终可点（任务跑着时除外）：关闭进程级会话（CloseDevice →
-        ResetDevice）并等待 2 秒。平时画圆 / 远程移动只 Open 一次，不会每次都关。
+        ResetDevice）并等待 2 秒。平时画圆 / 远程移动 / 右键只 Open 一次，不会每次都关。
         <br />
         ⚠️ 轨迹<strong>只有跑起来才看得见</strong> —— 命令返回时已经走完了，
         不会留下任何痕迹。所以点完就别动鼠标，看着屏幕。
@@ -207,13 +272,14 @@ export function CursorMotionPanel({ busy }: Props) {
       )}
 
       <p className="field-hint">
-        这条自检<strong>只移动光标</strong>：不点击、不输入、不抢前台，
+        「画一个圆」这条自检<strong>只移动光标</strong>：不点击、不输入、不抢前台，
         所以演练模式下也能用，也不会在客户端里留下任何痕迹。
+        「测试 HID 右键」会真实发出右键，用于验证菜单能否弹出。
         <br />
         速度<strong>不在这里配</strong> —— 它只在后端有一处定义，也就是任务里用的那个值；
         界面把它报出来只是让你能核对，而不是让你去调它。
         <br />
-        逐步 MoveMouseTo 日志：<code className="mono">%TEMP%\ghostbox-replay.log</code>
+        逐步日志：<code className="mono">%TEMP%\ghostbox-replay.log</code>
         （以及 exe 旁同名文件）。
       </p>
     </section>

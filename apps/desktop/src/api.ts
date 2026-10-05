@@ -21,6 +21,7 @@ import type {
 import type {
   GhostboxMoveResult,
   GhostboxResetResult,
+  GhostboxRightClickResult,
   YoloDetectRequest,
   YoloDetectResult,
 } from "./yoloRemoteTypes";
@@ -424,6 +425,15 @@ export function yoloDetectTargetWindow(
 /** 幽灵盒 MoveMouseTo（屏幕绝对坐标；Windows）。 */
 export function ghostboxMoveTo(x: number, y: number): Promise<GhostboxMoveResult> {
   return invoke<GhostboxMoveResult>("ghostbox_move_to", { x, y });
+}
+
+/**
+ * 幽灵盒 HID 右键（当前光标位置；不 MoveMouseTo）。
+ *
+ * 界面应先倒计时再调：留给操作者把鼠标挪到企微气泡等位置。
+ */
+export function ghostboxRightClick(): Promise<GhostboxRightClickResult> {
+  return invoke<GhostboxRightClickResult>("ghostbox_right_click");
 }
 
 /** 重置幽灵盒进程级会话（CloseDevice → ResetDevice + 2s）。 */

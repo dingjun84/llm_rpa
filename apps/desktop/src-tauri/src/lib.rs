@@ -2166,6 +2166,7 @@ pub fn with_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R
         click_icon,
         cursor_trace::draw_cursor_circle,
         yolo_remote::yolo_detect_target_window, ghostbox_session::ghostbox_move_to,
+        ghostbox_session::ghostbox_right_click,
         ghostbox_session::ghostbox_reset_device
     ])
 }

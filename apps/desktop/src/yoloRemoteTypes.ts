@@ -41,6 +41,13 @@ export interface GhostboxResetResult {
   notice: string;
 }
 
+export interface GhostboxRightClickResult {
+  /** PressAndReleaseMouseButton(3) 返回码：2=成功，0=失败。 */
+  code: number;
+  reused_session: boolean;
+  notice: string;
+}
+
 /** 远程检测里可定位的导航图标类别。 */
 export const YOLO_MOVE_CLASSES = ["nav_chat_icon", "nav_contacts_icon"] as const;
 export type YoloMoveClass = (typeof YOLO_MOVE_CLASSES)[number];

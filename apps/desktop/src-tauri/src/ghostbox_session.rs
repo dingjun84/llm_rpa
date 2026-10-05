@@ -24,6 +24,16 @@ pub struct GhostboxResetResult {
     pub notice: String,
 }
 
+/// `ghostbox_right_click` 的返回（给界面打日志）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GhostboxRightClickResult {
+    /// `PressAndReleaseMouseButton(3)` 的返回码（官方：2=成功，0=失败）。
+    pub code: i32,
+    /// 是否复用了已有进程级会话（否则是本次新 Open）。
+    pub reused_session: bool,
+    pub notice: String,
+}
+
 /// 把幽灵盒光标移到屏幕绝对坐标 `(x, y)`（Windows + gbilmd64.dll）。
 #[tauri::command]
 pub fn ghostbox_move_to(x: i32, y: i32) -> Result<GhostboxMoveResult, String> {
@@ -34,6 +44,23 @@ pub fn ghostbox_move_to(x: i32, y: i32) -> Result<GhostboxMoveResult, String> {
     #[cfg(not(windows))]
     {
         let _ = (x, y);
+        Err("幽灵盒 HID 仅支持 Windows（需要 gbilmd64.dll 与已连接的硬件）。".into())
+    }
+}
+
+/// 在**当前光标位置**触发幽灵盒 HID 右键（`PressAndReleaseMouseButton(3)`）。
+///
+/// ★ 故意**不**先 `MoveMouseTo`：自检用途是单独验证右键能否弹出菜单
+/// （例如企微气泡），鼠标由操作者在倒计时内自己挪到位。
+/// ★ 官方按键：1=左 / 2=中 / **3=右**；返回码 **2=成功 / 0=失败**。
+#[tauri::command]
+pub fn ghostbox_right_click() -> Result<GhostboxRightClickResult, String> {
+    #[cfg(windows)]
+    {
+        right_click_windows()
+    }
+    #[cfg(not(windows))]
+    {
         Err("幽灵盒 HID 仅支持 Windows（需要 gbilmd64.dll 与已连接的硬件）。".into())
     }
 }
@@ -111,6 +138,80 @@ fn move_to_windows(x: i32, y: i32) -> Result<GhostboxMoveResult, String> {
 }
 
 #[cfg(windows)]
+fn right_click_windows() -> Result<GhostboxRightClickResult, String> {
+    ghostbox::append_replay_log(
+        "ghostbox_right_click: start PressAndReleaseMouseButton(3=右); no MoveMouseTo",
+    );
+    let dll = match resolve_dll(None) {
+        Ok(path) => path,
+        Err(err) => {
+            ghostbox::append_replay_log(&format!("ghostbox_right_click: resolve_dll fail: {err}"));
+            return Err(err);
+        }
+    };
+    let reused = ghostbox::shared_device_is_open();
+    ghostbox::append_replay_log(&format!(
+        "ghostbox_right_click: before open reused_session={reused} dll={}",
+        dll.display()
+    ));
+    let api = match ghostbox::shared_device_session(&dll, ghostbox::OPEN_DEVICE_TIMEOUT) {
+        Ok(api) => api,
+        Err(err) => {
+            ghostbox::append_replay_log(&format!("ghostbox_right_click: open-session fail: {err}"));
+            return Err(format!("打开幽灵盒失败：{err}"));
+        }
+    };
+    ghostbox::append_replay_log(&format!(
+        "ghostbox_right_click: open-session ok reused_session={reused}; PressAndReleaseMouseButton({})",
+        ghostbox::MOUSE_BUTTON_RIGHT
+    ));
+    let code = match api.PressAndReleaseMouseButton(ghostbox::MOUSE_BUTTON_RIGHT) {
+        Ok(code) => code,
+        Err(err) => {
+            ghostbox::append_replay_log(&format!(
+                "ghostbox_right_click: PressAndReleaseMouseButton({}) fail: {err}",
+                ghostbox::MOUSE_BUTTON_RIGHT
+            ));
+            return Err(format!(
+                "PressAndReleaseMouseButton({}) 调用失败：{err}",
+                ghostbox::MOUSE_BUTTON_RIGHT
+            ));
+        }
+    };
+    ghostbox::append_replay_log(&format!(
+        "ghostbox_right_click: PressAndReleaseMouseButton({}) → code {code} (2=成功/0=失败)",
+        ghostbox::MOUSE_BUTTON_RIGHT
+    ));
+    if let Err(err) =
+        ghostbox::ensure_mouse_button_ok("PressAndReleaseMouseButton(3=右)", code)
+    {
+        let session_note = if reused {
+            "复用进程级会话"
+        } else {
+            "新开进程级会话"
+        };
+        let notice = format!(
+            "HID 右键失败：PressAndReleaseMouseButton(3) → code {code}（期望 2=成功）；{session_note}；{err}"
+        );
+        ghostbox::append_replay_log(&format!("ghostbox_right_click: {notice}"));
+        return Err(notice);
+    }
+    let session_note = if reused {
+        "复用进程级会话"
+    } else {
+        "新开进程级会话（OpenDevice 一次）"
+    };
+    let notice = format!(
+        "HID 右键成功：PressAndReleaseMouseButton(3) → code {code}（2=成功）；{session_note}（未 MoveMouseTo，用当前光标位置）。"
+    );
+    Ok(GhostboxRightClickResult {
+        code,
+        reused_session: reused,
+        notice,
+    })
+}
+
+#[cfg(windows)]
 fn reset_windows() -> Result<GhostboxResetResult, String> {
     ghostbox::append_replay_log("ghostbox_reset_device: begin");
     let dll = match resolve_dll(None) {
@@ -164,4 +265,3 @@ fn resolve_dll(explicit: Option<&std::path::Path>) -> Result<std::path::PathBuf,
             .join(", ")
     ))
 }
-

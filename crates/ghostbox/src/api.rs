@@ -38,13 +38,59 @@ pub fn append_replay_log(line: &str) {
     }
 }
 
-/// Mouse button IDs for `PressMouseButton` / `ReleaseMouseButton`.
+/// Mouse button IDs for `PressMouseButton` / `ReleaseMouseButton` /
+/// `PressAndReleaseMouseButton`（官方文档：1=左键，2=中键，3=右键）。
 ///
-/// Vendor Python demo uses `PressMouseButton(1)` for primary click.
-/// Mapped from HID bitfield: bit0→1 (left), bit1→2 (right), bit2→3 (middle).
+/// HID 报告位域仍是 bit0=左 / bit1=右 / bit2=中；映射到本常量时：
+/// bit0→[`MOUSE_BUTTON_LEFT`]、bit1→[`MOUSE_BUTTON_RIGHT`]、bit2→[`MOUSE_BUTTON_MIDDLE`]。
+///
+/// ⚠️ 曾误写成 RIGHT=2 / MIDDLE=3（与官方对调），会导致右键实际打出中键、菜单不弹。
 pub const MOUSE_BUTTON_LEFT: c_int = 1;
-pub const MOUSE_BUTTON_RIGHT: c_int = 2;
-pub const MOUSE_BUTTON_MIDDLE: c_int = 3;
+pub const MOUSE_BUTTON_MIDDLE: c_int = 2;
+pub const MOUSE_BUTTON_RIGHT: c_int = 3;
+
+/// 厂商鼠标按键类 API 成功返回码。
+///
+/// 官方（`PressAndReleaseMouseButton`）：**2 = 成功，0 = 失败**。
+/// `PressMouseButton` / `ReleaseMouseButton` 沿用同一校验（[`ensure_mouse_button_ok`]）。
+pub const MOUSE_BUTTON_OK: c_int = 2;
+
+/// 校验鼠标按键 API 返回码：官方约定 `2` 成功、`0` 失败。
+pub fn ensure_mouse_button_ok(op: &'static str, code: c_int) -> Result<c_int, GhostboxError> {
+    if code == MOUSE_BUTTON_OK {
+        Ok(code)
+    } else {
+        Err(GhostboxError::Sdk { op, code })
+    }
+}
+
+/// `MoveMouseWheel(Z)` 的 Z 合法范围（官方：-127 ~ +127）。
+pub const MOUSE_WHEEL_MIN: c_int = -127;
+pub const MOUSE_WHEEL_MAX: c_int = 127;
+
+/// 厂商滚轮 API 成功返回码。
+///
+/// 官方（`MoveMouseWheel`）：**1 = 成功，0 = 失败**（与按键的 2≠0 不同，勿混用）。
+pub const MOUSE_WHEEL_OK: c_int = 1;
+
+/// 校验滚轮 API 返回码：官方约定 `1` 成功、`0` 失败。
+pub fn ensure_mouse_wheel_ok(op: &'static str, code: c_int) -> Result<c_int, GhostboxError> {
+    if code == MOUSE_WHEEL_OK {
+        Ok(code)
+    } else {
+        Err(GhostboxError::Sdk { op, code })
+    }
+}
+
+/// 把本仓库 RPA 的 `notches` 换成 GhostBox `MoveMouseWheel(Z)`。
+///
+/// - 本仓库约定：`notches > 0` = **向下**滚内容（看更靠后的项），`< 0` = 向上。
+/// - 官方约定：`Z > 0` = **向上**，`Z < 0` = 向下，范围 [`MOUSE_WHEEL_MIN`]..=[`MOUSE_WHEEL_MAX`]。
+///
+/// 因此 `Z = (-notches).clamp(-127, 127)`。
+pub fn notches_to_wheel_z(notches: i32) -> c_int {
+    (-notches).clamp(MOUSE_WHEEL_MIN, MOUSE_WHEEL_MAX)
+}
 
 /// Dynamically loaded GhostBox SDK (`gbilmd64.dll`).
 pub struct GBMAPI {
@@ -201,7 +247,11 @@ impl GBMAPI {
         }
     }
 
-    /// Press mouse button (`MOUSE_BUTTON_*`).
+    /// 按下鼠标键（只按下不释放）。
+    ///
+    /// `mouse_button`：官方 **1=左键 / 2=中键 / 3=右键**（见 [`MOUSE_BUTTON_LEFT`] 等）。
+    /// 完整单击优先用 [`Self::PressAndReleaseMouseButton`]。
+    /// 返回码按 [`ensure_mouse_button_ok`] 校验（**2=成功，0=失败**）。
     pub fn PressMouseButton(&self, mouse_button: c_int) -> Result<c_int, GhostboxError> {
         type Fn = unsafe extern "C" fn(c_int) -> c_int;
         // SAFETY: vendor export; button id is a small int (1/2/3).
@@ -214,7 +264,10 @@ impl GBMAPI {
         }
     }
 
-    /// Release mouse button (`MOUSE_BUTTON_*`).
+    /// 释放鼠标键。
+    ///
+    /// `mouse_button`：官方 **1=左键 / 2=中键 / 3=右键**。
+    /// 返回码按 [`ensure_mouse_button_ok`] 校验（**2=成功，0=失败**）。
     pub fn ReleaseMouseButton(&self, mouse_button: c_int) -> Result<c_int, GhostboxError> {
         type Fn = unsafe extern "C" fn(c_int) -> c_int;
         // SAFETY: vendor export; button id is a small int (1/2/3).
@@ -224,6 +277,43 @@ impl GBMAPI {
                 .get(b"ReleaseMouseButton")
                 .map_err(GhostboxError::symbol)?;
             Ok(func(mouse_button))
+        }
+    }
+
+    /// 按下并释放一次鼠标键（推荐的单击路径）。
+    ///
+    /// - `mouse_button`：官方 **1=左键 / 2=中键 / 3=右键**
+    /// - 按下与释放之间的延时由厂商 `SetMouseMovementDelay` 决定
+    /// - 官方返回值：**2 = 成功，0 = 失败**（调用方必须用 [`ensure_mouse_button_ok`]）
+    pub fn PressAndReleaseMouseButton(&self, mouse_button: c_int) -> Result<c_int, GhostboxError> {
+        type Fn = unsafe extern "C" fn(c_int) -> c_int;
+        // SAFETY: vendor export; button id is a small int (1/2/3).
+        unsafe {
+            let func: Symbol<Fn> = self
+                .lib
+                .get(b"PressAndReleaseMouseButton")
+                .map_err(GhostboxError::symbol)?;
+            Ok(func(mouse_button))
+        }
+    }
+
+    /// 滚动鼠标滚轮：`MoveMouseWheel(Z)`。
+    ///
+    /// 官方说明：
+    /// - `Z`：滚轮幅度，**正数向上、负数向下**，范围 **-127 ~ +127**
+    /// - 返回值：**1 = 成功，0 = 失败**（用 [`ensure_mouse_wheel_ok`]，**不是**按键的 2）
+    ///
+    /// 与本仓库 `DesktopPlatform::scroll` 的 `notches` 方向相反：
+    /// `notches > 0`（向下滚内容）应对应 **负** `Z`，见 [`notches_to_wheel_z`]。
+    pub fn MoveMouseWheel(&self, z: c_int) -> Result<c_int, GhostboxError> {
+        type Fn = unsafe extern "C" fn(c_int) -> c_int;
+        // SAFETY: vendor export; z is a signed notch count in [-127, 127].
+        unsafe {
+            let func: Symbol<Fn> = self
+                .lib
+                .get(b"MoveMouseWheel")
+                .map_err(GhostboxError::symbol)?;
+            Ok(func(z))
         }
     }
 
