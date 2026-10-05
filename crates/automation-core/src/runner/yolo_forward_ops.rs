@@ -8,7 +8,7 @@ use crate::yolo::{
 
 use std::time::Instant;
 
-use super::ocr_poll::{HEADER_POLL_BUDGET, HEADER_POLL_INTERVAL, PEER_POLL_BUDGET};
+use super::ocr_poll::{HEADER_POLL_BUDGET, HEADER_POLL_INTERVAL, MIN_OCR_ATTEMPTS, PEER_POLL_BUDGET};
 use super::Run;
 
 impl Run<'_> {
@@ -62,11 +62,12 @@ impl Run<'_> {
             )
         )?;
         self.evidence.push(format!(
-            "步骤{step}：整窗轮询「{needle}」→ {}（等待 {}ms，OCR {} 次，\
+            "步骤{step}：整窗轮询「{needle}」→ {}（等待 {}ms，OCR {} 次（最少 {} 次），\
              停稳截帧 {} 次，最后一次读前{}停稳；预算 {}ms 间隔 {}ms）",
             if poll.found { "成功" } else { "未找到" },
             poll.waited.as_millis(),
             poll.ocr_attempts,
+            MIN_OCR_ATTEMPTS,
             poll.settle_frames,
             if poll.settled { "已" } else { "未" },
             HEADER_POLL_BUDGET.as_millis(),
@@ -120,21 +121,24 @@ impl Run<'_> {
             )?;
             if let Some(hit) = Self::forward_filter_below(&boxes, window, needle, anchor) {
                 self.evidence.push(format!(
-                    "步骤{step}：整窗轮询下方「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次；预算 {}ms 间隔 {}ms）",
+                    "步骤{step}：整窗轮询下方「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次（最少 {} 次）；预算 {}ms 间隔 {}ms）",
                     started.elapsed().as_millis(),
+                    MIN_OCR_ATTEMPTS,
                     budget.as_millis(),
                     interval.as_millis(),
                 ));
                 return Ok(hit);
             }
-            if Instant::now() + interval >= deadline {
+            let budget_exhausted = Instant::now() + interval >= deadline;
+            if attempts >= MIN_OCR_ATTEMPTS && budget_exhausted {
                 break;
             }
             std::thread::sleep(interval);
         }
         Err(AutomationError::NeedsHumanReview(format!(
-            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次）搜索框下方未见「{needle}」。",
+            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次，最少 {} 次）搜索框下方未见「{needle}」。",
             started.elapsed().as_millis(),
+            MIN_OCR_ATTEMPTS,
         )))
     }
 
@@ -182,21 +186,24 @@ impl Run<'_> {
             )?;
             if let Some(hit) = Self::forward_filter_best_below(&boxes, region, needle, anchor) {
                 self.evidence.push(format!(
-                    "步骤{step}：弹层轮询下方匹配「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次；预算 {}ms 间隔 {}ms）",
+                    "步骤{step}：弹层轮询下方匹配「{needle}」→ 成功（等待 {}ms，OCR {attempts} 次（最少 {} 次）；预算 {}ms 间隔 {}ms）",
                     started.elapsed().as_millis(),
+                    MIN_OCR_ATTEMPTS,
                     budget.as_millis(),
                     interval.as_millis(),
                 ));
                 return Ok(hit);
             }
-            if Instant::now() + interval >= deadline {
+            let budget_exhausted = Instant::now() + interval >= deadline;
+            if attempts >= MIN_OCR_ATTEMPTS && budget_exhausted {
                 break;
             }
             std::thread::sleep(interval);
         }
         Err(AutomationError::NeedsHumanReview(format!(
-            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次）搜索框下未见包含「{needle}」的匹配行。",
+            "步骤{step}失败：输入后 {}ms 内（OCR {attempts} 次，最少 {} 次）搜索框下未见包含「{needle}」的匹配行。",
             started.elapsed().as_millis(),
+            MIN_OCR_ATTEMPTS,
         )))
     }
 
@@ -335,11 +342,12 @@ impl Run<'_> {
             String::new()
         };
         self.evidence.push(format!(
-            "步骤4：在命中点右上方区域找「{file_helper}」→ {}（等待 {}ms，OCR {} 次，\
+            "步骤4：在命中点右上方区域找「{file_helper}」→ {}（等待 {}ms，OCR {} 次（最少 {} 次），\
              停稳截帧 {} 次，最后一次读前{}停稳；预算 {}ms 间隔 {}ms）{read}",
             if poll.found { "成功" } else { "未找到" },
             poll.waited.as_millis(),
             poll.ocr_attempts,
+            MIN_OCR_ATTEMPTS,
             poll.settle_frames,
             if poll.settled { "已" } else { "未" },
             HEADER_POLL_BUDGET.as_millis(),
@@ -545,13 +553,17 @@ impl Run<'_> {
         let started = Instant::now();
         let deadline = started + budget;
         let mut attempts = 0u32;
+        let mut ocr_attempts = 0u32;
         let mut last_peers;
         loop {
             attempts += 1;
             self.check_cancel()?;
             let (peers, picked) = self.forward_try_pick_peer(&pred)?;
             last_peers = Self::summarize_peers(&peers);
+            let mut did_ocr = false;
             if let Some(peer) = picked {
+                ocr_attempts += 1;
+                did_ocr = true;
                 let (_shot, boxes) = self.capture_and_recognize(
                     peer.rect,
                     &format!("转发·{step}·OCR「{needle}」"),
@@ -570,8 +582,9 @@ impl Run<'_> {
                     Self::forward_prefer_hit(&mut hits, prefer);
                     let hit = hits[0];
                     self.evidence.push(format!(
-                        "步骤{step}：弹层轮询「{needle}」→ 成功（等待 {}ms，尝试 {attempts} 次；预算 {}ms 间隔 {}ms；窗 class=`{}` title=`{}` id=`{}`）",
+                        "步骤{step}：弹层轮询「{needle}」→ 成功（等待 {}ms，尝试 {attempts} 次、OCR {ocr_attempts} 次（最少 {} 次）；预算 {}ms 间隔 {}ms；窗 class=`{}` title=`{}` id=`{}`）",
                         started.elapsed().as_millis(),
+                        MIN_OCR_ATTEMPTS,
                         budget.as_millis(),
                         interval.as_millis(),
                         peer.class_name,
@@ -581,14 +594,21 @@ impl Run<'_> {
                     return self.forward_click_screen_box(step, needle, Some(&peer), hit);
                 }
             }
-            if Instant::now() + interval >= deadline {
-                break;
+            let budget_exhausted = Instant::now() + interval >= deadline;
+            // 优先凑满真正 OCR；从未有窗时退而保证完整尝试循环 ≥ MIN。
+            if budget_exhausted {
+                if ocr_attempts >= MIN_OCR_ATTEMPTS
+                    || (!did_ocr && attempts >= MIN_OCR_ATTEMPTS)
+                {
+                    break;
+                }
             }
             std::thread::sleep(interval);
         }
         Err(AutomationError::NeedsHumanReview(format!(
-            "步骤{step}失败：等待 {}ms（尝试 {attempts} 次）未见弹层「{needle}」。最后顶层窗：{}",
+            "步骤{step}失败：等待 {}ms（尝试 {attempts} 次、OCR {ocr_attempts} 次，最少 {} 次）未见弹层「{needle}」。最后顶层窗：{}",
             started.elapsed().as_millis(),
+            MIN_OCR_ATTEMPTS,
             last_peers,
         )))
     }
@@ -605,13 +625,17 @@ impl Run<'_> {
         let started = Instant::now();
         let deadline = started + budget;
         let mut attempts = 0u32;
+        let mut ocr_attempts = 0u32;
         let mut last_peers;
         loop {
             attempts += 1;
             self.check_cancel()?;
             let (peers, picked) = self.forward_try_pick_peer(&pred)?;
             last_peers = Self::summarize_peers(&peers);
+            let mut did_ocr = false;
             if let Some(peer) = picked {
+                ocr_attempts += 1;
+                did_ocr = true;
                 let (_shot, boxes) = self.capture_and_recognize(
                     peer.rect,
                     &format!("转发·{step}·OCR「{needle}」"),
@@ -627,8 +651,9 @@ impl Run<'_> {
                         y: peer.rect.y,
                     });
                     self.evidence.push(format!(
-                        "步骤{step}：弹层轮询「{needle}」→ 成功（等待 {}ms，尝试 {attempts} 次；预算 {}ms 间隔 {}ms；窗 class=`{}` title=`{}` id=`{}`）",
+                        "步骤{step}：弹层轮询「{needle}」→ 成功（等待 {}ms，尝试 {attempts} 次、OCR {ocr_attempts} 次（最少 {} 次）；预算 {}ms 间隔 {}ms；窗 class=`{}` title=`{}` id=`{}`）",
                         started.elapsed().as_millis(),
+                        MIN_OCR_ATTEMPTS,
                         budget.as_millis(),
                         interval.as_millis(),
                         peer.class_name,
@@ -638,14 +663,21 @@ impl Run<'_> {
                     return Ok((peer, screen));
                 }
             }
-            if Instant::now() + interval >= deadline {
-                break;
+            let budget_exhausted = Instant::now() + interval >= deadline;
+            // 优先凑满真正 OCR；从未有窗时退而保证完整尝试循环 ≥ MIN。
+            if budget_exhausted {
+                if ocr_attempts >= MIN_OCR_ATTEMPTS
+                    || (!did_ocr && attempts >= MIN_OCR_ATTEMPTS)
+                {
+                    break;
+                }
             }
             std::thread::sleep(interval);
         }
         Err(AutomationError::NeedsHumanReview(format!(
-            "步骤{step}失败：等待 {}ms（尝试 {attempts} 次）未见弹层「{needle}」。最后顶层窗：{}",
+            "步骤{step}失败：等待 {}ms（尝试 {attempts} 次、OCR {ocr_attempts} 次，最少 {} 次）未见弹层「{needle}」。最后顶层窗：{}",
             started.elapsed().as_millis(),
+            MIN_OCR_ATTEMPTS,
             last_peers,
         )))
     }

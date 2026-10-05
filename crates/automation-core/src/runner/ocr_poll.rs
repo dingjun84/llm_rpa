@@ -8,10 +8,13 @@
 //!
 //! 1. 对**同一块区域**按指纹轮询，连续两帧一致 = 停稳（与 `wait_for_settle` 同一思路）；
 //! 2. 停稳（或预算用完）后 OCR 一次，读到目标就收工；
-//! 3. 没读到且预算还够，隔一个间隔再来一轮（界面可能停在过渡帧上）。
+//! 3. 没读到且预算还够，隔一个间隔再来一轮（界面可能停在过渡帧上）；
+//! 4. 预算用尽仍未找到时，若 OCR 次数 < [`MIN_OCR_ATTEMPTS`]，继续补 OCR 直到满次数
+//!    （避免 settle 吃光预算后只 OCR 1 次就失败）。已找到则不必凑满。
 //!
-//! 总时长 ≤ 预算 + 最后一次 OCR 的耗时；等了多久、截了几帧、OCR 了几次全部带回，
-//! 由调用方写进 evidence——"是没等够还是真没切过去"不该靠猜。
+//! 总时长通常 ≤ 预算 + 末次 OCR；若触发最少次数补试，可能略超预算。
+//! 等了多久、截了几帧、OCR 了几次全部带回，由调用方写进 evidence——
+//! "是没等够还是真没切过去"不该靠猜。
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +29,8 @@ pub(super) const HEADER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// 弹出层（菜单 / 转发对话框）出现偶发更慢：右击→菜单、点「转发」→选人窗等。
 /// evidence 会写明用的是本预算而非 HEADER_POLL_BUDGET。
 pub(super) const PEER_POLL_BUDGET: Duration = Duration::from_millis(2500);
+/// 未命中时最少 OCR / 尝试次数（1 次初试 + 2 次重试）。找到可提前结束。
+pub(super) const MIN_OCR_ATTEMPTS: u32 = 3;
 
 /// 一次轮询的结果与轨迹。
 pub(super) struct OcrPoll {
@@ -35,7 +40,7 @@ pub(super) struct OcrPoll {
     pub found: bool,
     /// 从开始轮询到拿到结论的总耗时。
     pub waited: Duration,
-    /// OCR 次数（≥ 1）。
+    /// OCR 次数：找到时可 < [`MIN_OCR_ATTEMPTS`]；未找到时 ≥ [`MIN_OCR_ATTEMPTS`]。
     pub ocr_attempts: u32,
     /// 为判断"停稳"截的指纹帧数。
     pub settle_frames: u32,
@@ -44,9 +49,11 @@ pub(super) struct OcrPoll {
 }
 
 impl Run<'_> {
-    /// 在 `region` 上「等停稳 → OCR」，直到某次读到含 `needle` 的文字或预算用完。
+    /// 在 `region` 上「等停稳 → OCR」，直到某次读到含 `needle` 的文字，
+    /// 或预算用尽且 OCR 已满 [`MIN_OCR_ATTEMPTS`] 次。
     ///
     /// 预算用完**不报错**：返回 `found = false` 由调用方决定怎么失败（文案归它）。
+    /// 若预算尽时 `ocr_attempts < MIN_OCR_ATTEMPTS` 且仍未找到，继续补 OCR 直到满次数。
     /// 平台 / OCR 的硬错误照常向上抛。
     pub(super) fn ocr_until_contains(
         &mut self,
@@ -67,7 +74,9 @@ impl Run<'_> {
             ocr_attempts += 1;
             let (_shot, boxes) = self.capture_and_recognize(region, label)?;
             let found = boxes.iter().any(|b| b.text.contains(needle));
-            if found || Instant::now() + interval >= deadline {
+            let budget_exhausted = Instant::now() + interval >= deadline;
+            // 找到立即收工；未找到须满最少次数，且预算将尽/已尽才退出。
+            if found || (ocr_attempts >= MIN_OCR_ATTEMPTS && budget_exhausted) {
                 return Ok(OcrPoll {
                     boxes,
                     found,
