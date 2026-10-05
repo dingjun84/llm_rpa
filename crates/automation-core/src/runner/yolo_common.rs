@@ -28,29 +28,35 @@ impl Run<'_> {
         step: &str,
     ) -> Result<(Rect, Screenshot, Vec<YoloDetection>), AutomationError> {
         // 每次检测前重读当前窗口。任务开始时冻住的矩形在窗口变宽后会截偏。
-        let window = self.ensure_calibrated()?;
-        let shot = self.with_retry(step, || self.runner.ports.platform.capture(window))?;
-        let conf = self.cfg().yolo_conf;
-        let dets = self
-            .runner
-            .ports
-            .yolo
-            .detect(&shot, conf)
-            .map_err(|err| match err {
-                AutomationError::Platform(msg) => AutomationError::Platform(format!(
-                    "{step}：YOLO 检测失败：{msg}"
-                )),
-                other => other,
-            })?;
-        let overlays = detections_as_text_boxes(&dets);
-        self.report(step, window, &shot, &overlays, None, None);
-        self.evidence.push(format!(
-            "{step}：YOLO 检出 {} 个（conf≥{conf:.2}，图 {}×{}）",
-            dets.len(),
-            shot.width,
-            shot.height
-        ));
-        Ok((window, shot, dets))
+        let detect_started = std::time::Instant::now();
+        let what = format!("YOLO 整窗检测·{step}");
+        let result = (|| {
+            let window = self.ensure_calibrated()?;
+            let shot = self.with_retry(step, || self.runner.ports.platform.capture(window))?;
+            let conf = self.cfg().yolo_conf;
+            let dets = self
+                .runner
+                .ports
+                .yolo
+                .detect(&shot, conf)
+                .map_err(|err| match err {
+                    AutomationError::Platform(msg) => AutomationError::Platform(format!(
+                        "{step}：YOLO 检测失败：{msg}"
+                    )),
+                    other => other,
+                })?;
+            let overlays = detections_as_text_boxes(&dets);
+            self.report(step, window, &shot, &overlays, None, None);
+            self.evidence.push(format!(
+                "{step}：YOLO 检出 {} 个（conf≥{conf:.2}，图 {}×{}）",
+                dets.len(),
+                shot.width,
+                shot.height
+            ));
+            Ok((window, shot, dets))
+        })();
+        self.note_elapsed(&what, concat!(file!(), ":", line!()), detect_started.elapsed());
+        result
     }
 
     /// 在检测列表里找 class，没有则转人工。

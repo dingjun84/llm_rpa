@@ -17,8 +17,15 @@ impl Run<'_> {
         det: &YoloDetection,
         step: &str,
     ) -> Result<Vec<TextBox>, AutomationError> {
+        let started = std::time::Instant::now();
         let region = bbox_screen_region(window, shot, det);
-        let (_crop, boxes) = self.capture_and_recognize(region, step)?;
+        let result = self.capture_and_recognize(region, step);
+        self.note_elapsed(
+            &format!("OCR 单次·bbox·{step}"),
+            concat!(file!(), ":", line!()),
+            started.elapsed(),
+        );
+        let (_crop, boxes) = result?;
         Ok(remap_boxes_to_window(window, shot, region, boxes))
     }
 
@@ -43,43 +50,52 @@ impl Run<'_> {
             return Ok(vec![self.yolo_ocr_bbox(window, shot, &dets[0], step)?]);
         }
 
-        // 1) 算屏幕区域并串行截屏（平台截屏不并行）。
-        let mut regions = Vec::with_capacity(dets.len());
-        let mut crops = Vec::with_capacity(dets.len());
-        for det in dets {
-            let region = bbox_screen_region(window, shot, det);
-            let crop = self.with_retry(step, || self.runner.ports.platform.capture(region))?;
-            regions.push(region);
-            crops.push(crop);
-        }
+        let batch_started = std::time::Instant::now();
+        let n = dets.len();
+        let what = format!("OCR 多气泡 batch·{n}框·{step}");
 
-        // 2) 并发 OCR（可重试的瞬时错误在 worker 内按配置重试）。
-        let attempts = self.cfg().max_attempts.max(1);
-        let backoff = self.cfg().retry_backoff;
-        let ocr = self.runner.ports.ocr.clone();
-        let ocr_results = ocr_batch::recognize_many_with_raw_retrying(
-            ocr.as_ref(),
-            &crops,
-            attempts,
-            backoff,
-        );
+        // 用闭包包住，保证成功/失败都落耗时（失败时仍要能看出 batch 卡了多久）。
+        let result = (|| {
+            // 1) 算屏幕区域并串行截屏（平台截屏不并行）。
+            let mut regions = Vec::with_capacity(dets.len());
+            let mut crops = Vec::with_capacity(dets.len());
+            for det in dets {
+                let region = bbox_screen_region(window, shot, det);
+                let crop = self.with_retry(step, || self.runner.ports.platform.capture(region))?;
+                regions.push(region);
+                crops.push(crop);
+            }
 
-        // 3) 按原序：缩到逻辑坐标 → 上报证据 → 叠回整窗图像坐标。
-        let mut all = Vec::with_capacity(dets.len());
-        let mut last_frame: Option<(Screenshot, Vec<TextBox>)> = None;
-        for (i, ocr_result) in ocr_results.into_iter().enumerate() {
-            let (raw_boxes, raw) = ocr_result?;
-            let region = regions[i];
-            let crop = crops[i].clone();
-            let (crop, boxes) = super::scale_boxes_to_logical(crop, raw_boxes, region);
-            self.report(step, region, &crop, &boxes, Some(&raw), None);
-            last_frame = Some((crop, boxes.clone()));
-            all.push(remap_boxes_to_window(window, shot, region, boxes));
-        }
-        if let Some(frame) = last_frame {
-            self.last_frame = Some(frame);
-        }
-        Ok(all)
+            // 2) 并发 OCR（可重试的瞬时错误在 worker 内按配置重试）。
+            let attempts = self.cfg().max_attempts.max(1);
+            let backoff = self.cfg().retry_backoff;
+            let ocr = self.runner.ports.ocr.clone();
+            let ocr_results = ocr_batch::recognize_many_with_raw_retrying(
+                ocr.as_ref(),
+                &crops,
+                attempts,
+                backoff,
+            );
+
+            // 3) 按原序：缩到逻辑坐标 → 上报证据 → 叠回整窗图像坐标。
+            let mut all = Vec::with_capacity(dets.len());
+            let mut last_frame: Option<(Screenshot, Vec<TextBox>)> = None;
+            for (i, ocr_result) in ocr_results.into_iter().enumerate() {
+                let (raw_boxes, raw) = ocr_result?;
+                let region = regions[i];
+                let crop = crops[i].clone();
+                let (crop, boxes) = super::scale_boxes_to_logical(crop, raw_boxes, region);
+                self.report(step, region, &crop, &boxes, Some(&raw), None);
+                last_frame = Some((crop, boxes.clone()));
+                all.push(remap_boxes_to_window(window, shot, region, boxes));
+            }
+            if let Some(frame) = last_frame {
+                self.last_frame.replace(frame);
+            }
+            Ok(all)
+        })();
+        self.note_elapsed(&what, concat!(file!(), ":", line!()), batch_started.elapsed());
+        result
     }
 
     /// 取 bbox 内 OCR **第一行**（y 最小的一块；同行取最左）。

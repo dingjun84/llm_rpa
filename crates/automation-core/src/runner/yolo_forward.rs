@@ -73,7 +73,9 @@ impl Run<'_> {
                 .platform
                 .type_text(&file_helper, expected)?;
             self.check_deadline("输入文件传输助手")?;
-            std::thread::sleep(self.cfg().scroll_settle_timeout);
+            timed!(self, "停稳 sleep·输入后", {
+                std::thread::sleep(self.cfg().scroll_settle_timeout);
+            });
         }
         let helper_hit = self.forward_ocr_below(file_helper.as_str(), search_box)?;
         self.forward_click_screen_box(3, "文件传输助手结果行", None, helper_hit)?;
@@ -99,7 +101,9 @@ impl Run<'_> {
         // ── 6. 含 message_text 的 bubble 上右击 ──
         self.step_begin(6, "右击目标气泡")?;
         self.forward_right_click_bubble(&message_text)?;
-        std::thread::sleep(self.cfg().scroll_settle_timeout);
+        timed!(self, "停稳 sleep·右击后", {
+            std::thread::sleep(self.cfg().scroll_settle_timeout);
+        });
 
         self.advance(TaskState::PreparingMessage, Some("转发：准备弹出层操作".into()))?;
 
@@ -117,7 +121,9 @@ impl Run<'_> {
             },
             Prefer::FirstTopLeft,
         )?;
-        std::thread::sleep(self.cfg().scroll_settle_timeout);
+        timed!(self, "停稳 sleep·点转发后", {
+            std::thread::sleep(self.cfg().scroll_settle_timeout);
+        });
 
         // ── 8. 转发窗第一个「创建聊天」 ──
         self.step_begin(8, "转发窗点「创建聊天」")?;
@@ -131,7 +137,9 @@ impl Run<'_> {
             },
             Prefer::FirstTopLeft,
         )?;
-        std::thread::sleep(self.cfg().scroll_settle_timeout);
+        timed!(self, "停稳 sleep·点创建聊天后", {
+            std::thread::sleep(self.cfg().scroll_settle_timeout);
+        });
 
         // ── 9. 最上层窗搜索框输入 contact_query ──
         self.step_begin(9, "转发窗搜索联系人")?;
@@ -153,14 +161,18 @@ impl Run<'_> {
                 .platform
                 .type_text(&contact_query, expected)?;
             self.check_deadline("输入转发联系人")?;
-            std::thread::sleep(self.cfg().scroll_settle_timeout);
+            timed!(self, "停稳 sleep·输入联系人后", {
+                std::thread::sleep(self.cfg().scroll_settle_timeout);
+            });
         }
 
         // ── 10. 搜索框下第一个最大包含匹配行 ──
         self.step_begin(10, "点搜索结果联系人行")?;
         let row = self.forward_ocr_best_below(&contact_query, search_in_peer, peer.rect)?;
         self.forward_click_screen_box(10, "联系人匹配行", Some(&peer), row)?;
-        std::thread::sleep(self.cfg().scroll_settle_timeout);
+        timed!(self, "停稳 sleep·点联系人行后", {
+            std::thread::sleep(self.cfg().scroll_settle_timeout);
+        });
 
         // ── 11. 最靠右下「创建并发送」 ──
         self.step_begin(11, "点「创建并发送」")?;
@@ -175,6 +187,7 @@ impl Run<'_> {
             Prefer::BottomRightMost,
         )?;
 
+        self.finish_forward_step();
         self.advance(TaskState::Sending, Some("已点击「创建并发送」".into()))?;
         self.advance(TaskState::VerifyingDelivery, None)?;
         self.advance(
@@ -184,11 +197,15 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// 开始新步骤：先落上一步耗时，再写步骤分隔行并启动计时。
     fn step_begin(&mut self, n: u32, title: &str) -> Result<(), AutomationError> {
+        self.finish_forward_step();
         self.evidence.push(format!("—— 步骤{n}：{title} ——"));
+        self.forward_step = Some((n, title.to_string(), std::time::Instant::now()));
         self.check_deadline(&format!("转发步骤{n}"))?;
         Ok(())
     }
+
 
     fn log_click_ctx(
         &mut self,

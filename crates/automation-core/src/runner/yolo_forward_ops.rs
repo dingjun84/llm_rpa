@@ -16,7 +16,11 @@ impl Run<'_> {
             Some(r) => r,
             None => self.ensure_calibrated()?,
         };
-        let (shot, boxes) = self.capture_and_recognize(window, &format!("转发·OCR「{needle}」"))?;
+        let (shot, boxes) = timed!(
+            self,
+            &format!("OCR 单次·「{needle}」"),
+            self.capture_and_recognize(window, &format!("转发·OCR「{needle}」"))
+        )?;
         let _ = shot;
         let mut hits: Vec<&TextBox> = boxes
             .iter()
@@ -42,7 +46,11 @@ impl Run<'_> {
     /// 在 `anchor` 下方（y 更大）找包含 `needle` 的文字框。
     pub(super) fn forward_ocr_below(&mut self, needle: &str, anchor: Rect) -> Result<Rect, AutomationError> {
         let window = self.ensure_calibrated()?;
-        let (shot, boxes) = self.capture_and_recognize(window, &format!("转发·下方「{needle}」"))?;
+        let (shot, boxes) = timed!(
+            self,
+            &format!("OCR 单次·下方「{needle}」"),
+            self.capture_and_recognize(window, &format!("转发·下方「{needle}」"))
+        )?;
         let _ = shot;
         let mut hits: Vec<Rect> = boxes
             .iter()
@@ -69,7 +77,11 @@ impl Run<'_> {
         anchor: Rect,
         region: Rect,
     ) -> Result<Rect, AutomationError> {
-        let (shot, boxes) = self.capture_and_recognize(region, &format!("转发·匹配「{needle}」"))?;
+        let (shot, boxes) = timed!(
+            self,
+            &format!("OCR 单次·匹配「{needle}」"),
+            self.capture_and_recognize(region, &format!("转发·匹配「{needle}」"))
+        )?;
         let _ = shot;
         let mut hits: Vec<(usize, Rect)> = boxes
             .iter()
@@ -187,12 +199,16 @@ impl Run<'_> {
         };
         // 点完立刻 OCR 会读到切换前的旧标题（任务 39a1754e）：先等标题带停稳再读，
         // 读不到就在预算内重试，见 `ocr_poll`。
-        let poll = self.ocr_until_contains(
-            band,
-            "转发·4·会话标题带",
-            file_helper,
-            HEADER_POLL_BUDGET,
-            HEADER_POLL_INTERVAL,
+        let poll = timed!(
+            self,
+            "ocr_until_contains 轮询·会话标题",
+            self.ocr_until_contains(
+                band,
+                "转发·4·会话标题带",
+                file_helper,
+                HEADER_POLL_BUDGET,
+                HEADER_POLL_INTERVAL,
+            )
         )?;
         let read = if self.cfg().log_ocr_candidates && !poll.found {
             format!("；最后一次读到：{}", crate::candidates::describe_candidates(&poll.boxes))
@@ -221,6 +237,7 @@ impl Run<'_> {
     }
 
     pub(super) fn forward_scroll_chat_to_bottom(&mut self) -> Result<(), AutomationError> {
+        let scroll_started = std::time::Instant::now();
         let (window, shot, dets) = self.yolo_detect_window("转发·5·气泡区")?;
         let bubbles: Vec<_> = all_by_class(&dets, class::INCOMING_BUBBLE)
             .into_iter()
@@ -255,6 +272,30 @@ impl Run<'_> {
         ));
         self.runner.ports.platform.move_pointer(at)?;
         let expected = window;
+
+        // 临时关闭：任务489c反馈定位到右击太慢
+        // 「判断消息是否滚到最后一条」：原逻辑每次 scroll(1) + scroll_settle_timeout + 指纹比对，
+        // 直到画面不变才算到底；聊天未在底部时会滚很多轮、每轮都长等。先短路退出该判断。
+        const DISABLE_SCROLL_BOTTOM_DETECT: bool = true; // 临时关闭：任务489c反馈定位到右击太慢
+        if DISABLE_SCROLL_BOTTOM_DETECT {
+            // 保留少量滚轮（一次多格），短停后直接继续；不做「滚后指纹不变才算到底」循环。
+            self.runner
+                .ports
+                .platform
+                .scroll(at, 3, expected)?;
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            self.evidence.push(
+                "步骤5：临时关闭「判断已滚到最后」；仅少量滚动后继续（任务489c）".into(),
+            );
+            self.note_elapsed(
+                "滚轮 scroll_to_bottom",
+                concat!(file!(), ":", line!()),
+                scroll_started.elapsed(),
+            );
+            return Ok(());
+        }
+
+        // --- 以下为原「滚到最后 / 指纹停稳到底」逻辑（保留，开关关上即可恢复）---
         let mut prev = self
             .runner
             .ports
@@ -271,12 +312,22 @@ impl Run<'_> {
             if next == prev {
                 self.evidence
                     .push(format!("步骤5：第{}次滚动后画面无变化 → 已到底", i + 1));
+                self.note_elapsed(
+                    "滚轮 scroll_to_bottom",
+                    concat!(file!(), ":", line!()),
+                    scroll_started.elapsed(),
+                );
                 return Ok(());
             }
             prev = next;
         }
         self.evidence
             .push("步骤5：达到滚动上限，按已到底继续".into());
+        self.note_elapsed(
+            "滚轮 scroll_to_bottom",
+            concat!(file!(), ":", line!()),
+            scroll_started.elapsed(),
+        );
         Ok(())
     }
 
@@ -313,10 +364,12 @@ impl Run<'_> {
         ));
         let expected = window;
         self.ensure_not_frozen("已取消右击气泡")?;
-        self.runner
-            .ports
-            .platform
-            .guarded_right_click(target, expected)?;
+        timed!(self, "右击 guarded_right_click", {
+            self.runner
+                .ports
+                .platform
+                .guarded_right_click(target, expected)
+        })?;
         self.check_deadline("右击气泡")
     }
 

@@ -11,6 +11,21 @@
 //! 端口是同步的，因此超时是**协作式**的：每个步骤返回后校验是否超期。
 //! 阻塞在端口内部的调用无法被抢占，平台层需要为自己的阻塞操作设置内部超时。
 
+/// 量一段代码花了多久，并把它记成一条证据行（见 [`Run::note_elapsed`]）。
+///
+/// 位置（`file:line`）取在**展开处**——`file!()`/`line!()` 对 `macro_rules!` 是
+/// 透明的，所以证据里那条指的就是"被量的这段代码"，不是这个宏自己。
+///
+/// 旧 `navigate` 模块里有同名宏，但该模块暂未编入；转发 / YOLO 路径在此复用。
+macro_rules! timed {
+    ($run:expr, $what:expr, $body:expr) => {{
+        let started = ::std::time::Instant::now();
+        let value = $body;
+        ($run).note_elapsed($what, concat!(file!(), ":", line!()), started.elapsed());
+        value
+    }};
+}
+
 mod decision;
 mod message;
 mod ocr_poll;
@@ -698,6 +713,9 @@ struct Run<'a> {
     last_click_reacted: Option<bool>,
     evidence: Vec<String>,
     failure: Option<Failure>,
+    /// 转发流程当前步骤起点（步骤号、标题、开始时刻）。
+    /// 下一步 `step_begin` / 流程结束时落一条 `⏱ 步骤N「标题」` 耗时。
+    forward_step: Option<(u32, String, Instant)>,
 }
 
 /// 把 OCR 返回的文字框从**截图物理像素坐标**换算成**区域逻辑坐标**。
@@ -762,6 +780,7 @@ impl<'a> Run<'a> {
             last_click_reacted: None,
             evidence: Vec::new(),
             failure: None,
+            forward_step: None,
         }
     }
 
@@ -855,8 +874,21 @@ impl<'a> Run<'a> {
         ));
     }
 
+    /// 落当前转发步骤耗时（成功收尾 / 下一步 begin / 失败 settle 都会调）。
+    fn finish_forward_step(&mut self) {
+        if let Some((n, title, started)) = self.forward_step.take() {
+            self.note_elapsed(
+                &format!("步骤{n}「{title}」"),
+                concat!(file!(), ":", line!()),
+                started.elapsed(),
+            );
+        }
+    }
+
     /// 把失败收敛为终态，并写入带失败代码的审计记录。
     fn settle(&mut self, err: &AutomationError) {
+        // 失败时也把进行中的转发步骤耗时写入证据，便于对照「慢在哪一步」。
+        self.finish_forward_step();
         let target = match err {
             AutomationError::Cancelled => TaskState::Cancelled,
             other if other.requires_human_review() => TaskState::NeedsHumanReview,
