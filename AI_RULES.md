@@ -211,6 +211,18 @@ Tauri 依赖链里 `schemars 0.8.22` → `indexmap 1.9.3`,后者在 rustc 1.98 �
 编译失败(`E0107: struct takes 3 generic arguments but 2 were supplied`)。
 所以**一律用 `-p` 指定 crate**,别用 `--workspace`。CI 也是这么配的。
 
+**另一台机(Intel Mac,2026-10-07 实测)**:工具链在**系统 PATH**
+(`~/.cargo/bin`,`stable-x86_64-apple-darwin`),cargo 1.98.1 / rustc 1.98.1,
+`cargo check` / `cargo test` 正常。**但 clippy 没装**:
+
+```
+error: 'cargo-clippy' is not installed for the toolchain 'stable-x86_64-apple-darwin'
+help: run `rustup component add clippy` to install it
+```
+
+即 §7 那段④静态检查在**这台机上跑不了**。别把"clippy 没跑"说成"没超基线" ——
+规模/架构两道门禁(`checks/` 两个脚本,纯 Python)不受影响,照跑。
+
 ### 9.2 换行符(多机同步的坑)
 
 本机 git `core.autocrlf = true`。仓库根有 `.gitattributes` 把 shell 脚本
