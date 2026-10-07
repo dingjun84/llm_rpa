@@ -10,7 +10,7 @@ use crate::ports::{AutomationError, PeerTopWindow, Rect, Screenshot};
 use crate::state::TaskState;
 use crate::yolo::{class, random_point_in_central_half, shot_point_to_screen};
 
-use super::yolo_forward_ops::Prefer;
+use super::yolo_forward_poll::Prefer;
 use super::Run;
 
 const DEFAULT_FILE_HELPER: &str = "文件传输助手";

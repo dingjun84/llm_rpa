@@ -2118,3 +2118,53 @@ T29 补齐了「看到了什么」（标注图）与「为什么这么判」（�
 - 资料页与聊天标题两块区域**只差 2 像素**这件事本身没解决——现在靠"顺序 + 结论回传"绕开了，
   标定侧是否该把 `chat_header` 的上边界往下收一点（避开与资料页重叠的那条带），待定。
 
+---
+
+## T33 ✅ 已做（2026-10-07）：转发流程的四份轮询循环收敛成一份
+
+### 现象
+
+`runner/yolo_forward_ops.rs` 里有**四份**内联的有界轮询循环（"等某个东西出现，再决定点哪儿"）。
+四份之间**只有参数不同，收尾判据却各写了一遍**，并且已经分叉成三种写法：
+
+| 调用点 | 原来的收尾条件 |
+| --- | --- |
+| 区域停稳后 OCR | `attempts >= MIN_OCR_ATTEMPTS && budget_exhausted` |
+| 枚举弹层挑联系人 | `waited >= budget && (ocr_attempts >= MIN \|\| …)` |
+| 只看指纹变没变 | 只看 `budget_exhausted` |
+
+这正是 `CONVENTIONS.md` §1.3 禁止的"同一判据两处源"——改一处阈值，另一处不会跟着动。
+同时该文件 767 行，超 500 行上限（`CONVENTIONS.md` §2/§9）。
+
+### 落地
+
+1. **`runner/ocr_poll.rs`**（119 → 354 行）：新增通用驱动 `Run::poll_bounded`
+   ——探测交给闭包，**预算口径与收尾判据只留这一处**。
+   新增 `PollBudget`（`WallClock` / `SleepOnly` 两种口径）、`PollStats`、`PollOutcome`、`Round`，
+   以及唯一的收尾判据 `poll_should_stop`。附 6 个单测（预算未耗尽绝不停、命中也要凑够
+   OCR 次数、弹层从未出现时退回轮数、本轮弹层消失走轮数回退、墙钟口径预留下一次 sleep、
+   SleepOnly 不理会墙钟）。
+2. **`runner/yolo_forward_poll.rs`（新增，443 行）**：转发工作流的**全部轮询参数**——
+   步骤 3/10 看 `BelowPoll`，步骤 7/8/9/11 看 `PeerPoll`。"两个步骤差在哪"只看这两个结构体。
+3. **`runner/yolo_forward_ops.rs`**（767 → **341** 行）：只剩一次性动作——落点点击、滚聊天到底、
+   右击气泡、整窗轮询认一个标签。顺带删掉死代码 `forward_ocr_first_label`。
+4. **`runner/yolo_forward.rs`**：`Prefer` 的 import 改指向新模块。
+
+★ **为什么是"搬一整类功能"而不是"按行数对半切"**：轮询在本流程里自成一类
+（`CONVENTIONS.md` §9），而且搬走之后 `yolo_forward_ops.rs` 不必进 `baselines.toml`
+就能满足 500 行上限——是消掉一条**既有**违规，不是把违规挪个地方。
+
+### 还没做（**刻意保留**，不是漏掉）
+
+- **四处的预算口径仍然不一致**：本次只把原来的语义**原样搬成参数**，没有替调用点决定。
+  `forward_click_in_peer` 走 `SleepOnly`（`waited` 仍是 sleep 之和，与原 evidence 文案一致），
+  其余走 `WallClock`。统一口径得先看**现场数据**（每步 OCR 几次才够、纯 sleep 更贴近谁的手感），
+  现在拍板只是把一种猜测固化成判据。锚点见 `runner/ocr_poll.rs` 的 `TODO(T33)`。
+- **步骤 11 没有事后校验**：`yolo_forward.rs` 的步骤 11 走
+  `finish_forward_step()` → `advance(Sending)` → `advance(VerifyingDelivery, None)` → `advance(Completed)`，
+  其中 `VerifyingDelivery` 实际是**空转**——"创建并发送"点下去之后，程序不确认消息是否真发出去了。
+  2026-10-07 用户明确要求**先保持不变**，策略待定。
+- 对称缺口：本流程一半的检查是判"某东西**消失**了"，但 `ocr_poll.rs` 只有 `ocr_until_contains`，
+  没有 `ocr_until_absent`。要不要补，取决于上面两条怎么定。
+
+

@@ -15,7 +15,6 @@
 ///
 /// 位置（`file:line`）取在**展开处**——`file!()`/`line!()` 对 `macro_rules!` 是
 /// 透明的，所以证据里那条指的就是"被量的这段代码"，不是这个宏自己。
-///
 /// 旧 `navigate` 模块里有同名宏，但该模块暂未编入；转发 / YOLO 路径在此复用。
 macro_rules! timed {
     ($run:expr, $what:expr, $body:expr) => {{
@@ -36,6 +35,7 @@ mod yolo_ocr;
 mod yolo_contacts;
 mod yolo_forward;
 mod yolo_forward_ops;
+mod yolo_forward_poll;
 // 旧 search/list/navigate 模块暂不编入（YOLO 工作流已替换）；文件仍在树中待删。
 
 /// 由「结论 + 轨迹」拼出一条决策记录（见 [`decision`]）。

@@ -92,6 +92,10 @@
 | `src/runner/list.rs` | 261 | **列表扫描式**（原有那条路） | `locate_contact`、`sweep_contact_list`、`scroll_to_top` |
 | `src/runner/navigate.rs` | 238 | 导航图标模板匹配 + 点击（工作流 1 / 2）。★ 每一步都记一条分段耗时（`timed!` 宏 + `Run::note_elapsed`）：截屏 / `icons.locate` / 诊断上报 / 守卫 / 点击各一段，`file:line` 取在宏展开处 | `navigate_to_view`、`nav_prior` |
 | `src/runner/message.rs` | 246 | 聚焦输入框 + 把正文**逐字**敲进输入框，以及**发不发**这一步：勾了「只填不发」停在 `Prepared`，没勾就直接**点发送按钮** → 核验送达，**中间不插任何等人工的环节**。★ 判据只有 `stop_before_send` 一处，与工作流无关。★ 发送动作 = 逐字输入 + 点按钮：**不粘贴**（不碰剪贴板）、**不按 Enter**（客户端的发送键设置因人而异，按错键表现为"多了个换行、消息没出去"） | `prepare_message`、`type_into_composer`、`click_send_button`、`verify_delivery` |
+| `src/runner/ocr_poll.rs` | 354 | ★★ **「点击后验文字」的有界轮询本体**：预算口径（`PollBudget` 分墙钟 / 只计 sleep）与收尾判据 `poll_should_stop` **只有这一处**。四类探测（固定区域停稳后 OCR / 枚举顶层窗找弹层 / 只看指纹变没变 / 整窗 OCR 只认某条带）原来各写一份循环、收尾条件已经分叉，现统一成 `poll_bounded`：**探测交给闭包，预算口径与收尾判据留在这里**。等了多久 / 截了几帧 / OCR 几次全部带回，由调用方写进 evidence——"是没等够还是真没切过去"不该靠猜 | `poll_bounded`、`PollBudget`、`PollOutcome`、`Round`、`poll_should_stop` |
+| `src/runner/yolo_forward.rs` | 222 | 工作流 `forward_to_contact` 的**编排**：消息页 → 文件传输助手 → 右键转发 → 选联系人 → 创建并发送 | `run_forward_to_contact` |
+| `src/runner/yolo_forward_ops.rs` | 341 | 转发流程的**一次性**动作：落点点击、滚聊天到底、右击气泡、整窗轮询认一个标签。★ **轮询与它的参数不在这里**（在 `yolo_forward_poll.rs`）——这里只留"做一次就完"的那几个 | `forward_ocr_first_label_polled`、`forward_click_screen_box`、`forward_verify_chat_header`、`forward_scroll_chat_to_bottom`、`forward_right_click_bubble` |
+| `src/runner/yolo_forward_poll.rs` | 443 | ★★ 转发工作流里**所有**有界轮询的**参数**（机制在 `ocr_poll.rs`）：步骤 3/10 看 `BelowPoll`（输入后列表**下方**冒出目标行），步骤 7/8/9/11 看 `PeerPoll`（弹层里挑联系人）。★"两个步骤到底差在哪"只看那两个结构体 | `BelowPoll`、`PeerPoll`、`Prefer`、`forward_poll_below`、`forward_poll_peer` |
 | `src/policy.rs` | 445 | `ContactMatcher` 的实现：逐字精确匹配 + 宽松开关 | `ExactNameMatcher` |
 | `src/policy/trail.rs` | 369 | ★★ **姓名匹配的判据本体**：结论（选中谁）与轨迹（每块为什么）**同一次交出** | `strict_judge`、`contains_judge`、`name_match_decision` |
 | `src/policy/trail/verdicts.rs` | 176 | 轨迹的**措辞**层：逐块写「过 / 淘汰 + 理由」 | `verdicts_strict`、`verdicts_relaxed` |
@@ -101,7 +105,11 @@
 | `src/audit.rs` | 189 | 审计契约（只存长度/哈希/时间） | `AuditSink`、`SendLedger` |
 | `src/lib.rs` | 18 | 模块声明与 re-export | — |
 
-⚠️ **`runner` 是个目录**（`runner/mod.rs` + 四个子模块）。四个子模块里各有一批
+⚠️ **`runner` 是个目录**（`runner/mod.rs` + 十一个子模块，以 `mod.rs` 顶部的
+`mod` 声明为准）。⚠️ **上表里 `search.rs` / `list.rs` / `navigate.rs` 三行是旧路**
+——YOLO 工作流已替换它们，三个文件仍在树中但**不编入**（`runner/mod.rs` 第 40 行有注），
+别按那三行去读现流程；现流程的入口是 `yolo_forward.rs` 一族。
+各子模块里各有一批
 `impl Run<'_> { … }` 块，方法一律是 `pub(super) fn`——不是随手加的可见性，
 而是**必须**：Rust 的私有意味着「只有定义它的模块及其子孙可见」，
 搬进子模块后父模块里的 `execute()` 就调不到了。
