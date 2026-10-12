@@ -18,7 +18,8 @@ use crate::yolo::{
 use super::Run;
 
 /// 一格滚轮在企业微信消息区大约滚动的像素（Windows 默认 3 行）。用于把「60% 高度」换成格数。
-const PX_PER_NOTCH: i32 = 60;
+/// 任务 1decbea4：按 60px/格算出 5 格，实测滚得太少；改 20px/格（约 3 倍），过量由重叠核对回退兜底。
+const PX_PER_NOTCH: i32 = 20;
 /// 到底：先一次大跳，再小步确认。
 const BOTTOM_JUMP_NOTCHES: i32 = 40;
 const BOTTOM_CONFIRM_NOTCHES: i32 = 3;
@@ -53,21 +54,8 @@ pub(super) fn chat_area_img(w: u32, h: u32, dets: &[YoloDetection]) -> Rect {
         .map(|d| d.bounds_rect().y)
         .filter(|&y| y > top + 40)
         .unwrap_or((h as f32 * 0.78).round() as i32);
-    let bubbles = bubbles_of(dets);
-    let (x1, x2) = if bubbles.is_empty() {
-        ((w as f32 * 0.30) as i32, (w as f32 * 0.98) as i32)
-    } else {
-        let x1 = bubbles.iter().map(|b| b.bounds_rect().x).min().unwrap_or(0);
-        let x2 = bubbles
-            .iter()
-            .map(|b| {
-                let r = b.bounds_rect();
-                r.x + r.width
-            })
-            .max()
-            .unwrap_or(w);
-        (x1.max(0), x2.min(w))
-    };
+    // 左右固定取窗宽 30%..98%：任务 1decbea4 只有 2 个窄气泡时并集仅 125px 宽，指纹/滚轮点太偏。
+    let (x1, x2) = ((w as f32 * 0.30) as i32, (w as f32 * 0.98) as i32);
     Rect {
         x: x1,
         y: top,
@@ -222,12 +210,13 @@ impl Run<'_> {
             if step == SEARCH_MAX_STEPS || started.elapsed() >= SEARCH_BUDGET {
                 break;
             }
-            self.check_deadline("向上找气泡")?;
 
             // 向上滚一步；指纹不变（含懒加载复核）即到顶。
             prev_top_text = texts.first().cloned();
             let before = self.chat_fp(area)?;
             self.wheel(at, -n, window)?;
+            // 每滚一步是一次独立尝试：重置单步计时（同 list.rs），总上限由 SEARCH_BUDGET 管。
+            self.step_started = Instant::now();
             if self.chat_fp(area)? == before {
                 std::thread::sleep(TOP_LAZY_LOAD_WAIT);
                 if self.chat_fp(area)? == before {
@@ -256,8 +245,8 @@ mod tests {
 
     #[test]
     fn step_is_sixty_percent_of_area() {
-        // 500px 高（1:1 缩放）→ 300px → 5 格
-        assert_eq!(step_notches(500, 1000, 1000), 5);
+        // 500px 高（1:1 缩放）→ 300px → 15 格
+        assert_eq!(step_notches(500, 1000, 1000), 15);
         assert_eq!(step_notches(20, 1000, 1000), 1);
     }
 
