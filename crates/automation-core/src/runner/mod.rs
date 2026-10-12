@@ -38,6 +38,7 @@ mod yolo_forward_create_chat;
 mod yolo_forward_ops;
 mod yolo_forward_poll;
 mod yolo_forward_select;
+mod yolo_forward_scroll;
 // 旧 search/list/navigate 模块暂不编入（YOLO 工作流已替换）；文件仍在树中待删。
 
 /// 由「结论 + 轨迹」拼出一条决策记录（见 [`decision`]）。
