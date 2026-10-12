@@ -44,6 +44,10 @@ struct BelowPoll<'a> {
     anchor: Rect,
     /// OCR 与「列表指纹」所在区域（主窗 / 转发窗）。
     origin: Rect,
+    /// 输入**前**拍下的列表区指纹（调用方在 type_text 之前用
+    /// [`Run::forward_capture_list_baseline`] 取得）。不得在输入后再拍——
+    /// 否则下拉已展开，基线会被污染。
+    baseline: &'a str,
     budget: Duration,
     pick: BelowPick,
     /// OCR 步骤名里的动作词（"下方" / "匹配"），诊断里靠它认出是哪一次识别。
@@ -64,7 +68,7 @@ enum BelowPick {
 struct BelowPolled {
     hit: Option<Rect>,
     stats: PollStats,
-    /// 列表指纹相对「输入后的基线」是否变化过。
+    /// 列表指纹相对「输入前的基线」是否变化过。
     list_changed: bool,
 }
 
@@ -94,7 +98,7 @@ impl Run<'_> {
     const FORWARD_BELOW_GAP_PX: i32 = 10;
 
     /// 搜索框下方列表区：y 从 anchor 底边起至 `origin`（窗/弹层）底，宽度跟 origin。
-    fn forward_list_region_below(origin: Rect, anchor: Rect) -> Rect {
+    pub(super) fn forward_list_region_below(origin: Rect, anchor: Rect) -> Rect {
         let y = (anchor.y + anchor.height).max(origin.y);
         let bottom = origin.y + origin.height;
         Rect {
@@ -105,17 +109,31 @@ impl Run<'_> {
         }
     }
 
+    /// 在输入关键词**之前**拍下搜索框下方列表区指纹，作为后续轮询基线。
+    ///
+    /// 必须在 `type_text` 之前调用：输入后下拉可能已展开，基线会被污染，
+    /// 比较区（本函数所截区域）又恰好在搜索框下方，不应受框内文字影响。
+    pub(super) fn forward_capture_list_baseline(
+        &mut self,
+        step: u32,
+        origin: Rect,
+        anchor: Rect,
+    ) -> Result<String, AutomationError> {
+        let list_region = Self::forward_list_region_below(origin, anchor);
+        let label = format!("转发·{step}·列表指纹基准");
+        Ok(self.capture_frame(list_region, &label)?.fingerprint)
+    }
+
     /// 「输入后列表下方出现目标行」的轮询（步骤3 / 步骤10 共用）。
     ///
-    /// 命中须**同时**满足：列表指纹相对"输入后的基线"变了、且锚点下方出现了目标文字。
+    /// 命中须**同时**满足：列表指纹相对**输入前基线**变了、且锚点下方出现了目标文字。
     /// 只认文字不够——输入前列表里可能还留着上一次搜索的同名旧内容，
     /// 那会点进一个与这次输入无关的结果。
+    ///
+    /// `p.baseline` 必须由调用方在输入前经 [`Self::forward_capture_list_baseline`] 取得。
     fn forward_poll_below(&mut self, p: BelowPoll<'_>) -> Result<BelowPolled, AutomationError> {
         let list_region = Self::forward_list_region_below(p.origin, p.anchor);
         let fp_label = format!("转发·{}·列表指纹", p.step);
-        let baseline = self
-            .capture_frame(list_region, &format!("{fp_label}基准"))?
-            .fingerprint;
         let mut list_changed = false;
         let outcome = self.poll_bounded(
             PollBudget::WallClock(p.budget),
@@ -123,7 +141,7 @@ impl Run<'_> {
             |run| {
                 // 指纹先取、OCR 后取（与原来一致）：指纹便宜，且"列表变了"这个
                 // 事实必须在解释这一帧之前就定下来。
-                if run.capture_frame(list_region, &fp_label)?.fingerprint != baseline {
+                if run.capture_frame(list_region, &fp_label)?.fingerprint != p.baseline {
                     list_changed = true;
                 }
                 let (_shot, boxes) = run.capture_and_recognize(
@@ -181,11 +199,13 @@ impl Run<'_> {
     /// 步骤3：输入「文件传输助手」后，在**主窗**搜索框下方轮询到那一条结果行。
     ///
     /// 用主窗矩形当 OCR 区域——这一步还没有弹层可枚举（见 [`Self::forward_poll_peer`]）。
+    /// `baseline` 须在输入前由 [`Self::forward_capture_list_baseline`] 取得。
     pub(super) fn forward_ocr_below_polled(
         &mut self,
         step: u32,
         needle: &str,
         anchor: Rect,
+        baseline: &str,
     ) -> Result<Rect, AutomationError> {
         let window = self.ensure_calibrated()?;
         let polled = self.forward_poll_below(BelowPoll {
@@ -193,6 +213,7 @@ impl Run<'_> {
             needle,
             anchor,
             origin: window,
+            baseline,
             budget: HEADER_POLL_BUDGET,
             pick: BelowPick::FirstRow,
             ocr_label: "下方",
@@ -225,18 +246,21 @@ impl Run<'_> {
     ///
     /// 预算比步骤3 长（[`PEER_POLL_BUDGET`]）：前面刚点过菜单与选人窗，弹出层响应更慢。
     /// 取"面积最大的一块"而不是阅读序第一行——这里的命中必须是**被选中的人**。
+    /// `baseline` 须在输入前由 [`Self::forward_capture_list_baseline`] 取得。
     pub(super) fn forward_ocr_best_below_polled(
         &mut self,
         step: u32,
         needle: &str,
         anchor: Rect,
         region: Rect,
+        baseline: &str,
     ) -> Result<Rect, AutomationError> {
         let polled = self.forward_poll_below(BelowPoll {
             step,
             needle,
             anchor,
             origin: region,
+            baseline,
             budget: PEER_POLL_BUDGET,
             pick: BelowPick::LargestArea,
             ocr_label: "匹配",
@@ -439,5 +463,35 @@ impl Run<'_> {
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod list_region_tests {
+    use super::*;
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect { x, y, width: w, height: h }
+    }
+
+    #[test]
+    fn list_region_starts_at_anchor_bottom() {
+        let origin = r(100, 50, 400, 600);
+        let anchor = r(120, 80, 200, 30);
+        let region = Run::forward_list_region_below(origin, anchor);
+        assert_eq!(region.x, 100);
+        assert_eq!(region.y, 110); // 80+30
+        assert_eq!(region.width, 400);
+        assert_eq!(region.height, 540); // 650-110
+    }
+
+    #[test]
+    fn list_region_clamps_to_origin_top() {
+        // anchor 底边若高于 origin 顶，仍从 origin.y 起
+        let origin = r(0, 100, 300, 400);
+        let anchor = r(10, 40, 100, 20); // bottom=60 < origin.y
+        let region = Run::forward_list_region_below(origin, anchor);
+        assert_eq!(region.y, 100);
+        assert_eq!(region.height, 400);
     }
 }

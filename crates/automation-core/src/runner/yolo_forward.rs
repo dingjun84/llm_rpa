@@ -8,7 +8,9 @@
 
 use crate::ports::{AutomationError, PeerTopWindow, Rect, Screenshot};
 use crate::state::TaskState;
-use crate::yolo::{random_point_in_central_half, shot_point_to_screen};
+use crate::yolo::{
+    best_by_class, class, random_point_in_central_half, shot_point_to_screen,
+};
 
 use super::yolo_forward_poll::Prefer;
 use super::Run;
@@ -47,15 +49,18 @@ impl Run<'_> {
 
         self.advance(TaskState::SearchingContact, Some("转发：搜索文件传输助手".into()))?;
 
-        // ── 2. 轮询 OCR 第一个「搜索」并点击（导航切页可能未完成）──
-        self.step_begin(2, "轮询 OCR 第一个「搜索」= 搜索框")?;
-        let search_box = self.forward_ocr_first_label_polled(2, LABEL_SEARCH, "搜索框")?;
+        // ── 2. 定位搜索框：YOLO search_bar 优先，未检出则 OCR「搜索」──
+        self.step_begin(2, "定位搜索框（API 优先，OCR 回退）")?;
+        let search_box = self.forward_locate_search_box(2, LABEL_SEARCH)?;
         self.forward_click_screen_box(2, "搜索框", None, search_box)?;
 
-        // ── 3. 输入文件传输助手；在搜索框下方找该文字并点 ──
+        // ── 3. 先拍列表指纹基线，再输入；在搜索框下方找该文字并点 ──
         self.step_begin(3, "输入文件传输助手并轮询下方结果")?;
+        let window = self.ensure_calibrated()?;
+        // 基线必须在输入前：输入后下拉可能已展开，比较区在搜索框下方不应受框内文字影响。
+        let list_baseline = self.forward_capture_list_baseline(3, window, search_box)?;
         {
-            let expected = self.ensure_calibrated()?;
+            let expected = window;
             let _ = self.runner.ports.platform.clear_text_field(expected);
             self.evidence
                 .push(format!("步骤3：逐字输入「{file_helper}」"));
@@ -66,8 +71,12 @@ impl Run<'_> {
             self.check_deadline("输入文件传输助手")?;
         }
         self.forward_verify_typed_in_search_box(3, file_helper.as_str(), search_box)?;
-        let helper_hit =
-            self.forward_ocr_below_polled(3, file_helper.as_str(), search_box)?;
+        let helper_hit = self.forward_ocr_below_polled(
+            3,
+            file_helper.as_str(),
+            search_box,
+            &list_baseline,
+        )?;
         self.forward_click_screen_box(3, "文件传输助手结果行", None, helper_hit)?;
 
         self.advance(
@@ -132,6 +141,9 @@ impl Run<'_> {
         let (peer, search_in_peer) =
             self.forward_ocr_first_in_peer_polled(9, LABEL_SEARCH, peer_pred)?;
         self.forward_click_screen_box(9, "转发窗搜索框", Some(&peer), search_in_peer)?;
+        // 步骤10 的列表指纹基线必须在输入前拍下（比较区 = 搜索框下方）。
+        let peer_list_baseline =
+            self.forward_capture_list_baseline(10, peer.rect, search_in_peer)?;
         {
             // 弹出层：用主窗矩形做守卫（同进程允许）；不清空失败也不致命。
             let expected = self.window.unwrap_or(peer.rect);
@@ -152,6 +164,7 @@ impl Run<'_> {
             &contact_query,
             search_in_peer,
             peer.rect,
+            &peer_list_baseline,
         )?;
         self.forward_click_screen_box(10, "联系人匹配行", Some(&peer), row)?;
 
@@ -176,6 +189,45 @@ impl Run<'_> {
             Some("转发到联系人流程完成".into()),
         )?;
         Ok(())
+    }
+
+    /// 步骤2：定位主窗搜索框。
+    ///
+    /// 1. 先 YOLO 检出 `search_bar` → 用其屏幕矩形（位移/落点都走这框）；
+    /// 2. 未检出 → 回退现有 OCR「搜索」轮询逻辑。
+    fn forward_locate_search_box(
+        &mut self,
+        step: u32,
+        ocr_needle: &str,
+    ) -> Result<Rect, AutomationError> {
+        let (window, shot, dets) =
+            self.yolo_detect_window(&format!("转发·{step}·YOLO搜索框"))?;
+        if let Some(bar) = best_by_class(&dets, class::SEARCH_BAR) {
+            let img = bar.bounds_rect();
+            let tl = shot_point_to_screen(img.x, img.y, window, shot.width, shot.height);
+            let br = shot_point_to_screen(
+                img.x + img.width,
+                img.y + img.height,
+                window,
+                shot.width,
+                shot.height,
+            );
+            let screen = Rect {
+                x: tl.x,
+                y: tl.y,
+                width: (br.x - tl.x).max(1),
+                height: (br.y - tl.y).max(1),
+            };
+            self.evidence.push(format!(
+                "步骤{step}：YOLO 检出 search_bar conf={:.2} → 屏幕框 ({}, {}) {}x{}",
+                bar.conf, screen.x, screen.y, screen.width, screen.height
+            ));
+            return Ok(screen);
+        }
+        self.evidence.push(format!(
+            "步骤{step}：YOLO 未检出 search_bar，回退 OCR「{ocr_needle}」"
+        ));
+        self.forward_ocr_first_label_polled(step, ocr_needle, "搜索框")
     }
 
     /// 开始新步骤：先落上一步耗时，再写步骤分隔行并启动计时。
