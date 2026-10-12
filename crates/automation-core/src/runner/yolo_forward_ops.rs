@@ -431,8 +431,9 @@ impl Run<'_> {
                 "步骤6失败：未检出 incoming_bubble / outgoing_bubble。".into(),
             ));
         }
-        // 多气泡同一时刻 OCR：并发（上限见 ocr_batch::MAX_OCR_CONCURRENCY），
-        // 再按原 det 顺序挑第一条命中，证据仍可按序回放。
+        // 多气泡同一时刻 OCR：从整窗截图裁切后并发识别（上限见
+        // ocr_batch::MAX_OCR_CONCURRENCY），再按原 det 顺序挑第一条命中，
+        // 证据仍可按序回放。
         let ocr_by_bubble = self.yolo_ocr_bboxes(window, &shot, &bubbles, "转发·6·气泡OCR")?;
         let det = bubbles
             .iter()

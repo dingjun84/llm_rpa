@@ -1,4 +1,10 @@
 //! YOLO bbox → OCR：单框串行、多框并发（上限见 [`crate::ocr_batch::MAX_OCR_CONCURRENCY`]）。
+//!
+//! 多框路径从**已有整窗截图**按图像坐标裁切，再并发识别——不再对每个
+//! bbox 串行 `platform.capture`（那会把延迟按气泡数线性放大，且与识别
+//! 并发叠在一起也省不下来）。单框仍走截屏+OCR 同一次 `with_retry`。
+
+use sha2::{Digest, Sha256};
 
 use crate::ocr_batch;
 use crate::ports::{AutomationError, Rect, Screenshot, TextBox};
@@ -29,7 +35,7 @@ impl Run<'_> {
         Ok(remap_boxes_to_window(window, shot, region, boxes))
     }
 
-    /// 对多个 YOLO bbox **并发** OCR（截屏仍串行；识别最多
+    /// 对多个 YOLO bbox **并发** OCR（裁切自已有整窗截图；识别最多
     /// [`ocr_batch::MAX_OCR_CONCURRENCY`] 路并行）。
     ///
     /// 返回与 `dets` **等长、同序**；每个元素是该框在**整窗图像坐标**下的文字框。
@@ -56,12 +62,14 @@ impl Run<'_> {
 
         // 用闭包包住，保证成功/失败都落耗时（失败时仍要能看出 batch 卡了多久）。
         let result = (|| {
-            // 1) 算屏幕区域并串行截屏（平台截屏不并行）。
+            // 1) 从整窗截图按图像坐标裁切（不再对每个 bbox 串行 platform.capture）。
             let mut regions = Vec::with_capacity(dets.len());
             let mut crops = Vec::with_capacity(dets.len());
             for det in dets {
                 let region = bbox_screen_region(window, shot, det);
-                let crop = self.with_retry(step, || self.runner.ports.platform.capture(region))?;
+                let crop = crop_from_shot(shot, det.bounds_rect()).map_err(|msg| {
+                    AutomationError::Platform(format!("{step}：裁切气泡失败：{msg}"))
+                })?;
                 regions.push(region);
                 crops.push(crop);
             }
@@ -148,4 +156,142 @@ fn remap_boxes_to_window(
             b
         })
         .collect()
+}
+
+/// 从整窗截图裁出 bbox 对应区域（`region` 为**图像坐标**，与 YOLO bounds 同系）。
+///
+/// 指纹算法与 `vision::pixels::crop` 对齐（宽高 LE + 像素 SHA-256），便于证据绑定。
+fn crop_from_shot(shot: &Screenshot, region: Rect) -> Result<Screenshot, String> {
+    if region.width <= 0 || region.height <= 0 {
+        return Err(format!(
+            "退化矩形 ({}, {}) {}x{}",
+            region.x, region.y, region.width, region.height
+        ));
+    }
+    let right = region.x + region.width;
+    let bottom = region.y + region.height;
+    if region.x < 0
+        || region.y < 0
+        || right > shot.width as i32
+        || bottom > shot.height as i32
+    {
+        return Err(format!(
+            "越界 ({}, {}) {}x{}，截图 {}x{}",
+            region.x, region.y, region.width, region.height, shot.width, shot.height
+        ));
+    }
+    let expected = shot.width as usize * shot.height as usize * 4;
+    if shot.pixels.len() != expected {
+        return Err(format!(
+            "像素缓冲长度不符：期望 {expected}，实际 {}",
+            shot.pixels.len()
+        ));
+    }
+    let w = region.width as u32;
+    let h = region.height as u32;
+    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+    let src_stride = (shot.width * 4) as usize;
+    let x0 = region.x as usize;
+    let y0 = region.y as usize;
+    for row in 0..h as usize {
+        let start = (y0 + row) * src_stride + x0 * 4;
+        let end = start + (w as usize * 4);
+        pixels.extend_from_slice(&shot.pixels[start..end]);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(w.to_le_bytes());
+    hasher.update(h.to_le_bytes());
+    hasher.update(&pixels);
+    Ok(Screenshot {
+        fingerprint: hex_lower(&hasher.finalize()),
+        pixels,
+        width: w,
+        height: h,
+        captured_at: shot.captured_at,
+    })
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn solid(w: u32, h: u32, b: u8, g: u8, r: u8) -> Screenshot {
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            pixels.extend_from_slice(&[b, g, r, 255]);
+        }
+        Screenshot {
+            fingerprint: "src".into(),
+            pixels,
+            width: w,
+            height: h,
+            captured_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn crop_from_shot_keeps_size_and_fingerprint_differs() {
+        let shot = solid(8, 6, 10, 20, 30);
+        let a = crop_from_shot(
+            &shot,
+            Rect {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(a.width, 3);
+        assert_eq!(a.height, 2);
+        assert_eq!(a.pixels.len(), 3 * 2 * 4);
+        assert_eq!(&a.pixels[0..4], &[10, 20, 30, 255]);
+        let b = crop_from_shot(
+            &shot,
+            Rect {
+                x: 4,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+        )
+        .unwrap();
+        assert_ne!(a.fingerprint, b.fingerprint);
+    }
+
+    #[test]
+    fn crop_from_shot_rejects_oob() {
+        let shot = solid(4, 4, 0, 0, 0);
+        assert!(crop_from_shot(
+            &shot,
+            Rect {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 2
+            }
+        )
+        .is_err());
+        assert!(crop_from_shot(
+            &shot,
+            Rect {
+                x: -1,
+                y: 0,
+                width: 2,
+                height: 2
+            }
+        )
+        .is_err());
+    }
 }

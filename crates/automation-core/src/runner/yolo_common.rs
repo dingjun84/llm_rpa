@@ -128,7 +128,7 @@ impl Run<'_> {
         let mut best: Option<(YoloDetection, usize, f32, TextBox)> = None;
         let mut runners_up: Vec<TextBox> = Vec::new();
         let mut verdicts: Vec<Verdict> = Vec::new();
-        // 先筛半截条目，再对剩余框并发 OCR（上限见 ocr_batch::MAX_OCR_CONCURRENCY）。
+        // 先筛半截条目，再对剩余框裁切后并发 OCR（上限见 ocr_batch::MAX_OCR_CONCURRENCY）。
         let mut tall: Vec<YoloDetection> = Vec::new();
         for det in items {
             let det_box = TextBox {
