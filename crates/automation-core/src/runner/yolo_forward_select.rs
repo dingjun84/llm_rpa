@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::nav_selected::{is_list_item_selected, nav_icon_selected_ratio, LIST_ITEM_SELECTED_RATIO};
+use crate::nav_selected::{blue_ratio_exceeds, is_list_item_selected, nav_icon_selected_ratio, LIST_ITEM_SELECTED_RATIO};
 use crate::ports::{AutomationError, Rect, Screenshot, TextBox};
 use crate::yolo::{all_by_class, class, random_point_in_central_half, shot_point_to_screen};
 
@@ -154,8 +154,41 @@ impl Run<'_> {
         if items.is_empty() {
             return Ok(RowSelectStatus::NotFound);
         }
-        let ocr_by_item = self.yolo_ocr_bboxes(window, &shot, &items, &label)?;
-        classify_list_item_selection(&shot, &items, &ocr_by_item, needle)
+        // 先对全部 list_item 算蓝占比（纯像素，廉价），蓝色候选按占比降序逐个 OCR，
+        // 首行命中即判选中、立即返回；都不命中才对其余行批量 OCR（并发）找左击目标。
+        let ratios: Vec<f32> = items
+            .iter()
+            .map(|d| nav_icon_selected_ratio(&shot, d.bounds_rect()))
+            .collect();
+        let rects: Vec<Rect> = items.iter().map(|d| d.bounds_rect()).collect();
+        let plan = plan_selection_ocr(&ratios, &rects);
+        let mut ocr_calls = 0usize;
+        for &i in &plan.blue {
+            let boxes = self.yolo_ocr_bbox(window, &shot, &items[i], &label)?;
+            ocr_calls += 1;
+            if ocr_first_line_contains(&boxes, needle) {
+                self.evidence.push(format!(
+                    "步骤{step}：蓝色候选 OCR {ocr_calls} 个即命中「{needle}」（共 {} 个 list_item，蓝色候选 {} 个）",
+                    items.len(),
+                    plan.blue.len()
+                ));
+                return Ok(RowSelectStatus::Selected {
+                    ratio: ratios[i],
+                    bounds: rects[i],
+                });
+            }
+        }
+        if plan.rest.is_empty() {
+            return Ok(RowSelectStatus::NotFound);
+        }
+        let rest_items: Vec<_> = plan.rest.iter().map(|&i| items[i].clone()).collect();
+        let ocr_rest = self.yolo_ocr_bboxes(window, &shot, &rest_items, &label)?;
+        self.evidence.push(format!(
+            "步骤{step}：蓝色候选 {} 个未命中，回退 OCR 其余 {} 个 list_item",
+            plan.blue.len(),
+            rest_items.len()
+        ));
+        classify_list_item_selection(&shot, &rest_items, &ocr_rest, needle)
     }
 
     /// 在 list_item 图像框的中心半区落点并左击（平台 `guarded_click`，含移入）。
@@ -221,6 +254,48 @@ fn classify_list_item_selection(
     })
 }
 
+/// 选中校验的 OCR 顺序：`blue` 为蓝占比过阈值的行（占比降序，同占比按阅读序）；
+/// `rest` 为其余行（阅读序，上→下、左→右）。
+#[derive(Debug, Clone, PartialEq)]
+struct SelectionOcrPlan {
+    blue: Vec<usize>,
+    rest: Vec<usize>,
+}
+
+fn plan_selection_ocr(ratios: &[f32], rects: &[Rect]) -> SelectionOcrPlan {
+    let mut blue = Vec::new();
+    let mut rest = Vec::new();
+    for i in 0..ratios.len() {
+        if blue_ratio_exceeds(ratios[i], LIST_ITEM_SELECTED_RATIO) {
+            blue.push(i);
+        } else {
+            rest.push(i);
+        }
+    }
+    let key = |i: usize| (rects[i].y, rects[i].x);
+    blue.sort_by(|&a, &b| {
+        ratios[b]
+            .partial_cmp(&ratios[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| key(a).cmp(&key(b)))
+    });
+    rest.sort_by_key(|&i| key(i));
+    SelectionOcrPlan { blue, rest }
+}
+
+/// 按计划顺序逐个「OCR」（`first_line_hit(i)`），返回 (命中下标, 已调用次数)；首个命中即停。
+#[cfg(test)]
+fn first_hit_in_order<F: FnMut(usize) -> bool>(order: &[usize], mut first_line_hit: F) -> (Option<usize>, usize) {
+    let mut calls = 0;
+    for &i in order {
+        calls += 1;
+        if first_line_hit(i) {
+            return (Some(i), calls);
+        }
+    }
+    (None, calls)
+}
+
 /// OCR 框集合的「首行」是否包含 `needle`（y 最小，同行取最左）——与 [`Run::yolo_first_line_text`] 同口径。
 fn ocr_first_line_contains(boxes: &[TextBox], needle: &str) -> bool {
     first_line_box(boxes)
@@ -271,7 +346,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nav_selected::blue_ratio_exceeds;
     use crate::ports::TextBox;
     use std::time::SystemTime;
 
@@ -444,5 +518,53 @@ mod tests {
         );
         assert_eq!(got, Err(RowSelectStatus::NotFound));
         assert_eq!(clicks, 0);
+    }
+
+    fn r(x: i32, y: i32) -> Rect {
+        Rect { x, y, width: 100, height: 40 }
+    }
+
+    #[test]
+    fn plan_puts_blue_first_sorted_by_ratio_desc() {
+        let ratios = [0.05, 0.6, 0.0, 0.9, 0.41, 0.4];
+        let rects = [r(0, 0), r(0, 40), r(0, 80), r(0, 120), r(0, 160), r(0, 200)];
+        let p = plan_selection_ocr(&ratios, &rects);
+        assert_eq!(p.blue, vec![3, 1, 4]);
+        // 0.4 不过阈值（严格 >），归 rest；rest 按阅读序
+        assert_eq!(p.rest, vec![0, 2, 5]);
+    }
+
+    #[test]
+    fn plan_rest_reading_order_and_blue_tie_break() {
+        let ratios = [0.1, 0.7, 0.2, 0.7];
+        let rects = [r(0, 120), r(0, 80), r(0, 0), r(0, 10)];
+        let p = plan_selection_ocr(&ratios, &rects);
+        assert_eq!(p.blue, vec![3, 1]);
+        assert_eq!(p.rest, vec![2, 0]);
+    }
+
+    #[test]
+    fn early_stop_on_first_blue_hit_uses_one_ocr() {
+        let ratios = [0.0, 0.0, 0.85, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let rects: Vec<Rect> = (0..12).map(|i| r(0, i * 40)).collect();
+        let p = plan_selection_ocr(&ratios, &rects);
+        let (hit, calls) = first_hit_in_order(&p.blue, |i| i == 2);
+        assert_eq!((hit, calls), (Some(2), 1));
+    }
+
+    #[test]
+    fn blue_miss_falls_back_to_rest() {
+        let ratios = [0.0, 0.9, 0.0];
+        let rects = [r(0, 0), r(0, 40), r(0, 80)];
+        let p = plan_selection_ocr(&ratios, &rects);
+        let (hit, calls) = first_hit_in_order(&p.blue, |i| i == 2);
+        assert_eq!((hit, calls), (None, 1));
+        assert_eq!(p.rest, vec![0, 2]);
+    }
+
+    #[test]
+    fn plan_empty() {
+        let p = plan_selection_ocr(&[], &[]);
+        assert!(p.blue.is_empty() && p.rest.is_empty());
     }
 }
