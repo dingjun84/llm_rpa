@@ -6,6 +6,8 @@
 //! 鼠标点击/右键/滚轮一律走平台端口（Windows 上由 GhostBox 封装）。
 //! 弹出层按主窗同进程可见顶层窗枚举；截图不抢焦点。
 
+use std::time::Duration;
+
 use crate::ports::{AutomationError, PeerTopWindow, Rect, Screenshot};
 use crate::state::TaskState;
 use crate::yolo::{
@@ -49,10 +51,10 @@ impl Run<'_> {
 
         self.advance(TaskState::SearchingContact, Some("转发：搜索文件传输助手".into()))?;
 
-        // ── 2. 定位搜索框：YOLO search_bar 优先，未检出则 OCR「搜索」──
-        self.step_begin(2, "定位搜索框（API 优先，OCR 回退）")?;
+        // ── 2. 定位搜索框并点击至焦点（指纹变化）；YOLO search_bar 优先，未检出则 OCR「搜索」──
+        self.step_begin(2, "定位并点击搜索框至焦点（API 优先，OCR 回退）")?;
         let search_box = self.forward_locate_search_box(2, LABEL_SEARCH)?;
-        self.forward_click_screen_box(2, "搜索框", None, search_box)?;
+        self.forward_click_search_box_until_focused(2, search_box)?;
 
         // ── 3. 先拍列表指纹基线，再输入；在搜索框下方找该文字并点 ──
         self.step_begin(3, "输入文件传输助手并轮询下方结果")?;
@@ -240,6 +242,73 @@ impl Run<'_> {
     }
 
 
+    /// 步骤2：点击搜索框并确认焦点——框内区域指纹在点击后必须变化。
+    ///
+    /// 每次尝试：拍框内指纹 → 在中心半区落点（重试时先 `move_pointer` 挪进框内）→
+    /// 点击 → 短暂等待后再拍同一区域。指纹变了 = 焦点已获取；否则最多共
+    /// [`SEARCH_FOCUS_MAX_ATTEMPTS`] 次。
+    fn forward_click_search_box_until_focused(
+        &mut self,
+        step: u32,
+        search_box: Rect,
+    ) -> Result<(), AutomationError> {
+        for attempt in 1..=SEARCH_FOCUS_MAX_ATTEMPTS {
+            self.check_cancel()?;
+            let before = self
+                .capture_frame(
+                    search_box,
+                    &format!("转发·{step}·搜索框焦点前·第{attempt}次"),
+                )?
+                .fingerprint;
+            let target = random_point_in_central_half(search_box);
+            self.evidence.push(format!(
+                "步骤{step}：搜索框焦点尝试 {attempt}/{SEARCH_FOCUS_MAX_ATTEMPTS} → 点 ({}, {})；框 ({}, {}) {}x{}；点击前指纹 `{before}`",
+                target.x,
+                target.y,
+                search_box.x,
+                search_box.y,
+                search_box.width,
+                search_box.height
+            ));
+            let expected = self.window.unwrap_or(search_box);
+            // 重试：先把指针挪进框内再点，避免落在旧坐标/框外。
+            if attempt > 1 {
+                self.runner.ports.platform.move_pointer(target)?;
+            }
+            self.ensure_not_frozen("已取消点击搜索框")?;
+            self.runner
+                .ports
+                .platform
+                .guarded_click(target, expected)?;
+            self.check_deadline("点击搜索框")?;
+            // 等 UI 画出焦点/光标后再比；过短会把慢机器上的成功当成失败。
+            std::thread::sleep(SEARCH_FOCUS_REACT_WAIT);
+            let after = self
+                .capture_frame(
+                    search_box,
+                    &format!("转发·{step}·搜索框焦点后·第{attempt}次"),
+                )?
+                .fingerprint;
+            if search_box_focus_acquired(&before, &after) {
+                self.evidence.push(format!(
+                    "步骤{step}：焦点检查 attempt={attempt} → changed（后指纹 `{after}`）"
+                ));
+                return Ok(());
+            }
+            self.evidence.push(format!(
+                "步骤{step}：焦点检查 attempt={attempt} → same（后指纹 `{after}`）；{}",
+                if attempt < SEARCH_FOCUS_MAX_ATTEMPTS {
+                    "将在框内挪点重试"
+                } else {
+                    "已达上限"
+                }
+            ));
+        }
+        Err(AutomationError::NeedsHumanReview(format!(
+            "步骤{step}失败：点击搜索框 {SEARCH_FOCUS_MAX_ATTEMPTS} 次后区域指纹仍未变化，可能未获得输入焦点。请确认搜索框可见且可点击。"
+        )))
+    }
+
     pub(super) fn log_click_ctx(
         &mut self,
         step: u32,
@@ -263,4 +332,69 @@ impl Run<'_> {
         Ok(())
     }
 
+}
+
+/// 步骤2 点击搜索框：最多尝试次数（含首次；指纹不变则框内挪点再点）。
+const SEARCH_FOCUS_MAX_ATTEMPTS: u32 = 3;
+/// 每次点击后、再拍指纹前的等待（给焦点/光标一点绘制时间）。
+const SEARCH_FOCUS_REACT_WAIT: Duration = Duration::from_millis(200);
+
+/// 搜索框区域指纹是否在点击后变化（变化 = 视为已获焦点）。
+fn search_box_focus_acquired(before: &str, after: &str) -> bool {
+    before != after
+}
+
+/// 纯重试驱动：最多 `max_attempts` 次；`reacted(attempt)` 为真则返回该次（1-based）。
+///
+/// 与 [`Run::forward_click_search_box_until_focused`] 同语义，便于单测不接平台。
+fn search_focus_attempts_until<F>(max_attempts: u32, mut reacted: F) -> Option<u32>
+where
+    F: FnMut(u32) -> bool,
+{
+    for attempt in 1..=max_attempts {
+        if reacted(attempt) {
+            return Some(attempt);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod search_focus_tests {
+    use super::*;
+
+    #[test]
+    fn focus_acquired_iff_fingerprint_differs() {
+        assert!(search_box_focus_acquired("aaa", "bbb"));
+        assert!(!search_box_focus_acquired("aaa", "aaa"));
+        assert!(!search_box_focus_acquired("", ""));
+    }
+
+    #[test]
+    fn retry_loop_succeeds_on_second_attempt() {
+        let mut calls = 0u32;
+        let got = search_focus_attempts_until(3, |_| {
+            calls += 1;
+            calls >= 2
+        });
+        assert_eq!(got, Some(2));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn retry_loop_fails_after_three_unchanged() {
+        let mut calls = 0u32;
+        let got = search_focus_attempts_until(SEARCH_FOCUS_MAX_ATTEMPTS, |_| {
+            calls += 1;
+            false
+        });
+        assert_eq!(got, None);
+        assert_eq!(calls, SEARCH_FOCUS_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_loop_succeeds_on_first_attempt() {
+        let got = search_focus_attempts_until(3, |_| true);
+        assert_eq!(got, Some(1));
+    }
 }
