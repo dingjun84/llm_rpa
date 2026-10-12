@@ -109,7 +109,7 @@ impl Run<'_> {
 
         // ── 7. 轮询菜单窗出现且 OCR「转发」再点 ──
         self.step_begin(7, "轮询菜单点「转发」")?;
-        self.forward_click_in_peer(
+        let _ = self.forward_click_in_peer(
             7,
             LABEL_FORWARD,
             |w| {
@@ -124,7 +124,7 @@ impl Run<'_> {
 
         // ── 8. 轮询转发窗「创建聊天」 ──
         self.step_begin(8, "轮询转发窗点「创建聊天」")?;
-        self.forward_click_in_peer(
+        let create_chat_peer = self.forward_click_in_peer(
             8,
             LABEL_CREATE_CHAT,
             |w| {
@@ -134,6 +134,8 @@ impl Run<'_> {
             },
             Prefer::FirstTopLeft,
         )?;
+        // 点击后校验：100ms 后 OCR 弹层，仍见「创建聊天」= 未跳转 → 重新定位再点，最多 3 次。
+        self.forward_verify_create_chat_left(8, LABEL_CREATE_CHAT, &create_chat_peer)?;
 
         // ── 9. 轮询最上层窗「搜索」再输入 contact_query ──
         self.step_begin(9, "轮询转发窗搜索联系人")?;
@@ -174,7 +176,7 @@ impl Run<'_> {
 
         // ── 11. 轮询最靠右下「创建并发送」 ──
         self.step_begin(11, "轮询点「创建并发送」")?;
-        self.forward_click_in_peer(
+        let _ = self.forward_click_in_peer(
             11,
             LABEL_CREATE_SEND,
             |w| {

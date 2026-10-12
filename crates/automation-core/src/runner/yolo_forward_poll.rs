@@ -321,7 +321,7 @@ impl Run<'_> {
         Ok((peers, picked))
     }
 
-    fn forward_prefer_hit(hits: &mut [Rect], prefer: Prefer) {
+    pub(super) fn forward_prefer_hit(hits: &mut [Rect], prefer: Prefer) {
         match prefer {
             Prefer::FirstTopLeft => hits.sort_by_key(|r| (r.y, r.x)),
             Prefer::BottomRightMost => {
@@ -371,7 +371,7 @@ impl Run<'_> {
     }
 
     /// 步骤7/8/11：在弹出层里轮询到 `needle`，再点它。覆盖菜单「转发」、
-    /// 「创建聊天」、「创建并发送」。
+    /// 「创建聊天」、「创建并发送」。返回命中的弹层窗（步骤8 点击后校验要用）。
     ///
     /// 预算走"只累计等界面"的口径：这里每轮都要枚举一次顶层窗 + 一次 OCR，各是几百毫秒，
     /// 算进预算会把等待悄悄压缩。这是原来定下的口径，**没有**替它与步骤9 统一
@@ -382,7 +382,7 @@ impl Run<'_> {
         needle: &str,
         pred: impl Fn(&PeerTopWindow) -> bool,
         prefer: Prefer,
-    ) -> Result<(), AutomationError> {
+    ) -> Result<PeerTopWindow, AutomationError> {
         let polled = self.forward_poll_peer(PeerPoll {
             step,
             needle,
@@ -405,7 +405,8 @@ impl Run<'_> {
                     peer.title,
                     peer.id,
                 ));
-                self.forward_click_screen_box(step, needle, Some(&peer), hit)
+                self.forward_click_screen_box(step, needle, Some(&peer), hit)?;
+                Ok(peer)
             }
             PeerPolled::Exhausted { stats, last_peers } => {
                 Err(AutomationError::NeedsHumanReview(format!(

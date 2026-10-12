@@ -34,6 +34,7 @@ mod yolo_common;
 mod yolo_ocr;
 mod yolo_contacts;
 mod yolo_forward;
+mod yolo_forward_create_chat;
 mod yolo_forward_ops;
 mod yolo_forward_poll;
 mod yolo_forward_select;
