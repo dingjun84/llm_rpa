@@ -8,7 +8,7 @@
 
 use crate::ports::{AutomationError, PeerTopWindow, Rect, Screenshot};
 use crate::state::TaskState;
-use crate::yolo::{class, random_point_in_central_half, shot_point_to_screen};
+use crate::yolo::{random_point_in_central_half, shot_point_to_screen};
 
 use super::yolo_forward_poll::Prefer;
 use super::Run;
@@ -41,18 +41,9 @@ impl Run<'_> {
             Some("转发：目标消息导航图标".into()),
         )?;
 
-        // ── 1. 点导航消息 icon ──
+        // ── 1. 已在会话列表则跳过；否则点消息导航并轮询选中态 ──
         self.step_begin(1, "点导航消息 icon → 会话列表")?;
-        {
-            let (window, shot, dets) = self.yolo_detect_window("转发·1·导航消息")?;
-            let nav = self.yolo_require_class(
-                &dets,
-                class::NAV_CHAT_ICON,
-                "请确认企业微信左侧导航可见。",
-            )?;
-            self.log_click_ctx(1, "nav_chat_icon", None, window, &shot, nav.bounds_rect())?;
-            self.yolo_click_detection(window, &shot, nav, "消息导航")?;
-        }
+        self.forward_ensure_message_nav_selected()?;
 
         self.advance(TaskState::SearchingContact, Some("转发：搜索文件传输助手".into()))?;
 
@@ -74,6 +65,7 @@ impl Run<'_> {
                 .type_text(&file_helper, expected)?;
             self.check_deadline("输入文件传输助手")?;
         }
+        self.forward_verify_typed_in_search_box(3, file_helper.as_str(), search_box)?;
         let helper_hit =
             self.forward_ocr_below_polled(3, file_helper.as_str(), search_box)?;
         self.forward_click_screen_box(3, "文件传输助手结果行", None, helper_hit)?;
@@ -196,7 +188,7 @@ impl Run<'_> {
     }
 
 
-    fn log_click_ctx(
+    pub(super) fn log_click_ctx(
         &mut self,
         step: u32,
         what: &str,

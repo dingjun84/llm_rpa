@@ -14,6 +14,128 @@ use super::ocr_poll::{HEADER_POLL_BUDGET, HEADER_POLL_INTERVAL, MIN_OCR_ATTEMPTS
 use super::Run;
 
 impl Run<'_> {
+
+    /// 步骤3 校验：输入后、点下拉结果前，确认「搜索框里真的出现了输入的文字」——
+    /// 即整窗 OCR 中有含 `needle` 的文字框与步骤2 定位的搜索框（屏幕坐标）**有重叠**。
+    /// 不重叠 ⇒ 搜索框定位偏了（字打到别处），转人工，不去点下拉。
+    pub(super) fn forward_verify_typed_in_search_box(
+        &mut self,
+        step: u32,
+        needle: &str,
+        search_box: Rect,
+    ) -> Result<Rect, AutomationError> {
+        use super::ocr_poll::{PollBudget, PollOutcome, Round};
+
+        let window = self.ensure_calibrated()?;
+        let origin = Point { x: window.x, y: window.y };
+        let outcome = self.poll_bounded(
+            PollBudget::WallClock(HEADER_POLL_BUDGET),
+            HEADER_POLL_INTERVAL,
+            |run| {
+                let (_shot, boxes) =
+                    run.capture_and_recognize(window, &format!("转发·{step}·搜索框内「{needle}」"))?;
+                let hit = boxes
+                    .iter()
+                    .filter(|b| b.text.contains(needle))
+                    .map(|b| b.bounds.to_screen(origin))
+                    .find(|r| rects_overlap(*r, search_box));
+                Ok(match hit {
+                    Some(r) => Round::hit(r),
+                    None => Round::missed(),
+                })
+            },
+        )?;
+        match outcome {
+            PollOutcome::Found { value, stats } => {
+                self.evidence.push(format!(
+                    "步骤{step}：搜索框内已出现「{needle}」（文字框 {:?} 与搜索框 {:?} 重叠；OCR {} 次，墙钟 {}ms）",
+                    value, search_box, stats.ocr_attempts, stats.wall.as_millis()
+                ));
+                Ok(value)
+            }
+            PollOutcome::Exhausted { stats } => Err(AutomationError::NeedsHumanReview(format!(
+                "步骤{step}失败：输入后 {}ms 内（OCR {} 次）未见与搜索框 {:?} 重叠的「{needle}」文字框，\
+                 搜索框可能定位不准（字没打进搜索框）。",
+                stats.wall.as_millis(), stats.ocr_attempts, search_box
+            ))),
+        }
+    }
+
+
+    /// 步骤1：若消息导航已是选中态则跳过点击；否则点击后墙钟 2s 内每 200ms
+    /// 重检（YOLO 找框 + HSV 蓝占比），超时则转人工。
+    ///
+    /// 选中判据只走 [`crate::nav_selected::is_nav_icon_selected`]，不在此另写阈值。
+    pub(super) fn forward_ensure_message_nav_selected(&mut self) -> Result<(), AutomationError> {
+        use std::time::{Duration, Instant};
+
+        use crate::nav_selected::{is_nav_icon_selected, nav_icon_selected_ratio, SELECTED_RATIO};
+        use crate::yolo::best_by_class;
+
+        const POLL_BUDGET: Duration = Duration::from_millis(2000);
+        const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+        let (window, shot, dets) = self.yolo_detect_window("转发·1·导航消息")?;
+        let nav = self.yolo_require_class(
+            &dets,
+            class::NAV_CHAT_ICON,
+            "请确认企业微信左侧导航可见。",
+        )?;
+        let bounds = nav.bounds_rect();
+        let ratio = nav_icon_selected_ratio(&shot, bounds);
+        if is_nav_icon_selected(&shot, bounds) {
+            self.evidence.push(format!(
+                "步骤1：消息导航已选中（蓝占比 {ratio:.3} ≥ {SELECTED_RATIO}），跳过点击"
+            ));
+            return Ok(());
+        }
+        self.evidence.push(format!(
+            "步骤1：消息导航未选中（蓝占比 {ratio:.3} < {SELECTED_RATIO}），点击并轮询选中态"
+        ));
+        self.log_click_ctx(1, "nav_chat_icon", None, window, &shot, bounds)?;
+        self.yolo_click_detection(window, &shot, nav, "消息导航")?;
+
+        // 超时从点击后**发起检测**起算（不含点击本身）。
+        let started = Instant::now();
+        let mut attempts = 0u32;
+        let mut last_ratio = 0.0f32;
+        let mut saw_icon = false;
+        loop {
+            self.check_cancel()?;
+            attempts += 1;
+            let (_w, shot, dets) = self.yolo_detect_window(&format!("转发·1·选中态·第{attempts}次"))?;
+            match best_by_class(&dets, class::NAV_CHAT_ICON) {
+                Some(nav) => {
+                    saw_icon = true;
+                    let bounds = nav.bounds_rect();
+                    last_ratio = nav_icon_selected_ratio(&shot, bounds);
+                    if is_nav_icon_selected(&shot, bounds) {
+                        self.evidence.push(format!(
+                            "步骤1：点击后第 {attempts} 次检出选中（蓝占比 {last_ratio:.3}，墙钟 {}ms）",
+                            started.elapsed().as_millis()
+                        ));
+                        return Ok(());
+                    }
+                }
+                None => {
+                    self.evidence.push(format!(
+                        "步骤1：第 {attempts} 次未检出 nav_chat_icon（墙钟 {}ms）",
+                        started.elapsed().as_millis()
+                    ));
+                }
+            }
+            if started.elapsed() >= POLL_BUDGET {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        Err(AutomationError::NeedsHumanReview(format!(
+            "步骤1失败：点击消息导航后 {}ms 内轮询 {attempts} 次仍未选中             （最后蓝占比 {last_ratio:.3}，阈值 {SELECTED_RATIO}；              是否检出图标：{}）。请确认企业微信左侧消息图标变为蓝色选中态。",
+            started.elapsed().as_millis(),
+            if saw_icon { "有" } else { "无" },
+        )))
+    }
+
     /// 点完导航后页面可能还没切过来：整窗上 `ocr_until_contains` 轮询，
     /// 再取阅读序第一个含 `needle` 的框（屏幕坐标）。证据对齐步骤4风格。
     pub(super) fn forward_ocr_first_label_polled(
@@ -337,5 +459,22 @@ impl Run<'_> {
                 .guarded_right_click(target, expected)
         })?;
         self.check_deadline("右击气泡")
+    }
+}
+
+/// 两个屏幕矩形是否有正面积重叠。
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    fn r(x: i32, y: i32, w: i32, h: i32) -> Rect { Rect { x, y, width: w, height: h } }
+    #[test]
+    fn overlap_cases() {
+        assert!(rects_overlap(r(0, 0, 10, 10), r(5, 5, 10, 10)));
+        assert!(!rects_overlap(r(0, 0, 10, 10), r(10, 0, 5, 5)));
+        assert!(!rects_overlap(r(0, 0, 10, 10), r(0, 30, 10, 10)));
     }
 }

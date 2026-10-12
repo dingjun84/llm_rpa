@@ -15,6 +15,7 @@ pub mod policy;
 pub mod ports;
 pub mod task;
 pub mod yolo;
+pub mod nav_selected;
 pub mod regions;
 pub mod runner;
 pub mod state;
