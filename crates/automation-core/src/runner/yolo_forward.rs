@@ -80,6 +80,8 @@ impl Run<'_> {
             &list_baseline,
         )?;
         self.forward_click_screen_box(3, "文件传输助手结果行", None, helper_hit)?;
+        // 点击后校验：list_item 首行「文件传输助手」且蓝占比 >0.4；否则左击重试最多 3 次。
+        self.forward_verify_file_helper_row_selected(3, file_helper.as_str())?;
 
         self.advance(
             TaskState::VerifyingCandidate,

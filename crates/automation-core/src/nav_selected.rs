@@ -36,6 +36,28 @@ pub fn is_nav_icon_selected(shot: &Screenshot, bounds: Rect) -> bool {
     nav_icon_selected_ratio(shot, bounds) >= SELECTED_RATIO
 }
 
+/// 转发步骤3：会话/搜索结果 `list_item` 行选中阈值（用户口径：**严格大于** 0.4）。
+///
+/// 与导航 icon 的 [`SELECTED_RATIO`]（≥0.35）分开：list_item 面积更大，阈值更高且用 `>`。
+pub const LIST_ITEM_SELECTED_RATIO: f32 = 0.4;
+
+/// 蓝占比是否**严格大于** `min_ratio`（list_item 用 [`LIST_ITEM_SELECTED_RATIO`]）。
+///
+/// HSV 命中条件与 [`nav_icon_selected_ratio`] 同源；只把阈值参数化，避免第二套色相逻辑。
+pub fn is_blue_selected_above(shot: &Screenshot, bounds: Rect, min_ratio: f32) -> bool {
+    nav_icon_selected_ratio(shot, bounds) > min_ratio
+}
+
+/// `list_item` 行是否选中：蓝占比 > [`LIST_ITEM_SELECTED_RATIO`]。
+pub fn is_list_item_selected(shot: &Screenshot, bounds: Rect) -> bool {
+    is_blue_selected_above(shot, bounds, LIST_ITEM_SELECTED_RATIO)
+}
+
+/// 纯阈值判据（无截图）：`ratio > min_ratio`。单测与日志共用，避免 runner 里再写 `>`。
+pub fn blue_ratio_exceeds(ratio: f32, min_ratio: f32) -> bool {
+    ratio > min_ratio
+}
+
 fn count_hit_pixels(shot: &Screenshot, bounds: Rect) -> (usize, usize) {
     if bounds.is_degenerate() || shot.width == 0 || shot.height == 0 {
         return (0, 0);
@@ -179,5 +201,58 @@ mod tests {
             (200.0..=230.0).contains(&h),
             "expected ~214°, got {h}"
         );
+    }
+
+    #[test]
+    fn list_item_threshold_is_strict_gt_0_4() {
+        assert!(!blue_ratio_exceeds(0.4, LIST_ITEM_SELECTED_RATIO));
+        assert!(blue_ratio_exceeds(0.4001, LIST_ITEM_SELECTED_RATIO));
+        assert!(!blue_ratio_exceeds(0.35, LIST_ITEM_SELECTED_RATIO));
+        assert!(blue_ratio_exceeds(0.5, LIST_ITEM_SELECTED_RATIO));
+    }
+
+    #[test]
+    fn list_item_selected_uses_strict_gt_on_solid_blue() {
+        let shot = solid_shot(10, 10, 240, 160, 40);
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let ratio = nav_icon_selected_ratio(&shot, bounds);
+        assert!(ratio > LIST_ITEM_SELECTED_RATIO, "got {ratio}");
+        assert!(is_list_item_selected(&shot, bounds));
+        assert!(is_blue_selected_above(&shot, bounds, LIST_ITEM_SELECTED_RATIO));
+    }
+
+    #[test]
+    fn list_item_half_blue_below_threshold_when_ratio_eq_boundary() {
+        // 构造恰好 0.4：10x10 中 40 个蓝像素 → ratio=0.4，严格 > 应失败。
+        let mut pixels = Vec::with_capacity(10 * 10 * 4);
+        for i in 0..(10 * 10) {
+            if i < 40 {
+                pixels.extend_from_slice(&[240u8, 160, 40, 255]);
+            } else {
+                pixels.extend_from_slice(&[180u8, 180, 180, 255]);
+            }
+        }
+        let shot = Screenshot {
+            pixels,
+            width: 10,
+            height: 10,
+            captured_at: SystemTime::UNIX_EPOCH,
+            fingerprint: "test".into(),
+        };
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let ratio = nav_icon_selected_ratio(&shot, bounds);
+        assert!((ratio - 0.4).abs() < 1e-5, "expected ~0.4 got {ratio}");
+        assert!(!is_list_item_selected(&shot, bounds));
+        assert!(!blue_ratio_exceeds(ratio, LIST_ITEM_SELECTED_RATIO));
     }
 }
