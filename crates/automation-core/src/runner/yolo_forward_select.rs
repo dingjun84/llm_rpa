@@ -15,6 +15,12 @@ use super::Run;
 const LIST_ITEM_SELECT_MAX_CLICKS: u32 = 3;
 /// 每次左击后、再检前的间隔。
 const LIST_ITEM_SELECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// 点击结果行后、首次截屏前的等待：给企业微信关下拉 + 列表重排 + 换选中态留时间。
+const LIST_ITEM_SELECT_SETTLE: Duration = Duration::from_millis(300);
+/// 本帧找不到目标行时最多重截几帧（含首帧）。
+const LIST_ITEM_NOT_FOUND_MAX_POLLS: u32 = 3;
+/// 找不到目标行时两次重截的间隔。
+const LIST_ITEM_NOT_FOUND_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// 单次选中检查结果（纯数据，便于单测驱动重试语义）。
 #[derive(Debug, Clone, PartialEq)]
@@ -40,8 +46,10 @@ impl Run<'_> {
         step: u32,
         needle: &str,
     ) -> Result<(), AutomationError> {
-        // 首次：点击后立刻检。
-        match self.forward_check_list_item_row_selected(step, needle, 0)? {
+        // 首次：点击后先等界面重排（企业微信点结果行后会关下拉、把会话顶到列表首位并换选中态，
+        // 立刻截屏拿到的是旧列表——任务 e47d2d03 即如此），再检；没看到目标行就重截重检。
+        std::thread::sleep(LIST_ITEM_SELECT_SETTLE);
+        match self.forward_find_row_with_repoll(step, needle)? {
             RowSelectStatus::Selected { ratio, bounds } => {
                 self.evidence.push(format!(
                     "步骤{step}：选中校验通过（点击后首次；首行「{needle}」；蓝占比 {ratio:.3} > {LIST_ITEM_SELECTED_RATIO}；框 ({}, {}) {}x{}）",
@@ -51,7 +59,7 @@ impl Run<'_> {
             }
             RowSelectStatus::NotFound => {
                 return Err(AutomationError::NeedsHumanReview(format!(
-                    "步骤{step}失败：点击后未见首行含「{needle}」的 list_item，无法确认选中态。"
+                    "步骤{step}失败：点击后重截 {LIST_ITEM_NOT_FOUND_MAX_POLLS} 次仍未见首行含「{needle}」的 list_item，无法确认选中态。"
                 )));
             }
             RowSelectStatus::FoundUnselected { ratio, bounds } => {
@@ -94,6 +102,30 @@ impl Run<'_> {
         Err(AutomationError::NeedsHumanReview(format!(
             "步骤{step}失败：选中校验耗尽重试仍未通过。"
         )))
+    }
+
+    /// 点击后首检：每次都**重新截屏 + YOLO + OCR**；本帧找不到目标行（界面尚未重排）
+    /// 则间隔 [`LIST_ITEM_NOT_FOUND_POLL_INTERVAL`] 再截，最多 [`LIST_ITEM_NOT_FOUND_MAX_POLLS`] 帧。
+    fn forward_find_row_with_repoll(
+        &mut self,
+        step: u32,
+        needle: &str,
+    ) -> Result<RowSelectStatus, AutomationError> {
+        let mut status = RowSelectStatus::NotFound;
+        for poll in 1..=LIST_ITEM_NOT_FOUND_MAX_POLLS {
+            status = self.forward_check_list_item_row_selected(step, needle, 0)?;
+            if !matches!(status, RowSelectStatus::NotFound) {
+                break;
+            }
+            self.evidence.push(format!(
+                "步骤{step}：选中校验第 {poll}/{LIST_ITEM_NOT_FOUND_MAX_POLLS} 帧未见首行含「{needle}」的 list_item（界面可能未重排），重截重检"
+            ));
+            if poll < LIST_ITEM_NOT_FOUND_MAX_POLLS {
+                std::thread::sleep(LIST_ITEM_NOT_FOUND_POLL_INTERVAL);
+                self.check_deadline("等待文件传输助手结果行出现")?;
+            }
+        }
+        Ok(status)
     }
 
     /// 整窗 YOLO + 各 list_item OCR 首行匹配 + 蓝占比。
