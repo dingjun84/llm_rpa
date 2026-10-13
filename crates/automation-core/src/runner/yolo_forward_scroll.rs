@@ -21,9 +21,10 @@ use super::Run;
 /// 任务 1decbea4：按 60px/格算出 5 格，实测滚得太少；改 20px/格（约 3 倍），过量由重叠核对回退兜底。
 const PX_PER_NOTCH: i32 = 20;
 /// 到底：先一次大跳，再小步确认。
-const BOTTOM_JUMP_NOTCHES: i32 = 40;
-const BOTTOM_CONFIRM_NOTCHES: i32 = 3;
-const BOTTOM_CONFIRM_MAX: usize = 8;
+const BOTTOM_JUMP_NOTCHES: i32 = 120;
+/// 任务 3f028f56：3 格×8 次没滚到底（幽灵盒每格位移小），改 15 格×最多 15 次。
+const BOTTOM_CONFIRM_NOTCHES: i32 = 15;
+const BOTTOM_CONFIRM_MAX: usize = 15;
 /// 每次滚动后停稳等待。
 const SCROLL_SETTLE: Duration = Duration::from_millis(250);
 /// 到顶时企业微信可能懒加载更早的消息：指纹不变后再多等一下复核。
