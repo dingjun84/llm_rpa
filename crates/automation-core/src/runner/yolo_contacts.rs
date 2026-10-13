@@ -1,107 +1,160 @@
 //! 工作流 `contacts_search_send`：通讯录搜索找人并发送（Flow B）。
 //!
-//! 1. 点 `nav_contacts_icon`
-//! 2. 点 `search_bar`，逐字输入联系人名
-//! 3. 在搜索结果的 `list_item`（旧权重 `contact_item` / `conversation_item` 同样接受）里 OCR 找人并点击。
-//!    此时刚点过 `nav_contacts_icon` 并输入了关键词，所以这些行就是联系人行：
-//!    语义来自 [`ListPage::ContactsSearchResults`]，不看 class 名。
-//! 4. 右侧资料页 OCR「发消息」并点击（无 YOLO 类；落点同 YOLO 点击：文字框中心半区随机点）
-//! 5. 进入聊天后同 Flow A：估计输入区 → 输入 → send_button
+//! B2 点 `nav_contacts_icon` 并轮询选中态（[`Run::ensure_nav_selected`]）
+//! B3 定位搜索框并点到获得焦点（复用转发的 `forward_locate_search_box` / `forward_click_search_box_until_focused`）
+//! B4 输入前拍列表基线 → 清空（错误不吞）→ 逐字输入 → 确认字在搜索框里
+//! B5 轮询搜索框下方直到出现目标名（无固定 sleep）；超时报出搜索框实际内容
+//! B6 结果在一屏内：直接用 B5 的命中；同名多条即停
+//! B7 点击命中行 → 选中校验 + 左击重试（不再回退到旧坐标盲点）
+//! B8 资料页：先核名字 → 轮询「发消息」→ 点击前后比指纹，最多再点一次；
+//!    已有会话直接进了聊天也不算失败，交给标题核验
+//! B9–B13 同 Flow A 的 A5–A9（[`Run::yolo_verify_chat_and_send`]）
 
 use crate::diagnostics::{Decision, Verdict};
 use crate::ports::{AutomationError, Point, Rect, TextBox};
 use crate::state::TaskState;
-use crate::yolo::{all_by_class, best_by_class, class, random_point_in_central_half, ListPage};
+use crate::yolo::{all_by_class, best_by_class, class, random_point_in_central_half};
 
+use super::ocr_poll::{PollBudget, PollOutcome, Round, HEADER_POLL_BUDGET, HEADER_POLL_INTERVAL, PEER_POLL_BUDGET};
+use super::yolo_verify_rules::{count_same_name, header_anchor};
 use super::Run;
 
 /// 资料页「发消息」按钮文案（无 YOLO class，只能 OCR）。
 const SEND_MESSAGE_LABEL: &str = "发消息";
+/// 搜索框 OCR 回退时找的文字。
+const LABEL_SEARCH: &str = "搜索";
+/// 资料页「发消息」点击后最多再补点几次。
+const PROFILE_RECLICKS: u32 = 1;
+
+/// 资料页轮询结论。
+enum ProfileState {
+    /// 资料页上读到了目标名和「发消息」（屏幕坐标）。
+    Profile { button: Rect },
+    /// 已有会话：客户端直接进了聊天（检出 input_bar / send_button）。
+    AlreadyChat,
+}
 
 impl Run<'_> {
     /// Flow B：通讯录搜索 → 资料页发消息 → 聊天发送。
     pub(super) fn run_contacts_search_send(&mut self) -> Result<(), AutomationError> {
-        self.advance(
-            TaskState::NavigatingToView,
-            Some("目标：通讯录导航图标".into()),
-        )?;
-        {
-            let (window, shot, dets) = self.yolo_detect_window("导航·通讯录")?;
-            let nav = self.yolo_require_class(
-                &dets,
-                class::NAV_CONTACTS_ICON,
-                "请确认企业微信左侧导航可见。",
-            )?;
-            self.yolo_click_detection(window, &shot, nav, "通讯录导航")?;
+        let name = self.task.external_contact_name.trim().to_string();
+        if name.is_empty() {
+            return Err(AutomationError::NeedsHumanReview("外部联系人名称为空。".into()));
         }
+        self.advance(TaskState::NavigatingToView, Some("目标：通讯录导航图标".into()))?;
+        self.ensure_nav_selected(2, class::NAV_CONTACTS_ICON, "通讯录导航")?;
 
         self.advance(TaskState::SearchingContact, Some("通讯录搜索".into()))?;
-        {
-            let (window, shot, dets) = self.yolo_detect_window("搜索框")?;
-            let bar = self.yolo_require_class(
-                &dets,
-                class::SEARCH_BAR,
-                "请确认通讯录页顶部搜索框可见。",
-            )?;
-            self.yolo_click_detection(window, &shot, bar, "搜索框")?;
-            let expected = self.ensure_calibrated()?;
-            // 清空后再逐字输入，避免残留上次关键词。
-            let _ = self.runner.ports.platform.clear_text_field(expected);
-            let name = self.task.external_contact_name.clone();
-            self.evidence
-                .push(format!("逐字输入联系人「{name}」以过滤列表"));
-            self.runner
-                .ports
-                .platform
-                .type_text(&name, expected)?;
-            self.check_deadline("输入搜索关键词")?;
-            // 等联想/过滤出结果。
-            std::thread::sleep(self.cfg().scroll_settle_timeout);
-        }
+        let search_box = self.forward_locate_search_box(3, LABEL_SEARCH)?;
+        self.forward_click_search_box_until_focused(3, search_box)?;
 
-        // 强制落一帧「搜索下拉结果」：把当前 list_item（及同屏其它 class）画进过程回放，
-        // 再进入滚动查找——否则失败时只能看到空 evidence，看不出下拉里到底检出了什么。
+        let window = self.ensure_calibrated()?;
+        let baseline = self.forward_capture_list_baseline(4, window, search_box)?;
+        self.runner.ports.platform.clear_text_field(window)?;
+        self.evidence.push(format!("步骤4：逐字输入联系人「{name}」以过滤列表"));
+        self.runner.ports.platform.type_text(&name, window)?;
+        self.check_deadline("输入搜索关键词")?;
+        self.forward_verify_typed_in_search_box(4, &name, search_box)?;
+
+        let hit = match self.forward_ocr_best_below_polled(5, &name, search_box, window, &baseline) {
+            Ok(hit) => hit,
+            Err(AutomationError::NeedsHumanReview(msg)) => {
+                let actual = self.read_search_box(search_box)?;
+                return Err(AutomationError::NeedsHumanReview(format!(
+                    "{msg} 搜索框实际内容：「{actual}」"
+                )));
+            }
+            Err(other) => return Err(other),
+        };
         self.yolo_report_search_dropdown_results()?;
-
-        let (_found_window, _found_shot, matched) =
-            self.yolo_scroll_find_contact(ListPage::ContactsSearchResults)?;
-        self.advance(
-            TaskState::VerifyingCandidate,
-            Some(format!("命中联系人条目 conf={:.2}", matched.conf)),
-        )?;
-        {
-            let (window, shot, dets) = self.yolo_detect_window("点击联系人")?;
-            let click_target = self
-                .yolo_find_name_in_items(
-                    window,
-                    &shot,
-                    &dets,
-                    ListPage::ContactsSearchResults,
-                    &self.task.external_contact_name,
-                    "点击前确认联系人名",
-                )?
-                .unwrap_or(matched);
-            self.yolo_click_detection(window, &shot, &click_target, "联系人条目")?;
+        // B6：同屏同名多条即停。
+        let list = Self::forward_list_region_below(window, search_box);
+        let (_s, boxes) = self.capture_and_recognize(list, "搜索结果·同名检查")?;
+        let same = count_same_name(boxes.iter().map(|b| b.text.as_str()), &name);
+        if same > 1 {
+            return Err(AutomationError::AmbiguousVision(format!(
+                "搜索结果里有 {same} 条名字都是「{name}」，无法确定是哪一个，停止。"
+            )));
         }
 
-        self.advance(TaskState::VerifyingProfile, Some("资料页找「发消息」".into()))?;
-        self.yolo_click_send_message_on_profile()?;
+        self.advance(TaskState::VerifyingCandidate, Some("命中联系人搜索结果".into()))?;
+        let pane = Self::right_of(window, hit.x + hit.width);
+        let before = self.capture_frame(pane, "点击前右侧区")?.fingerprint;
+        self.forward_click_screen_box(7, "联系人搜索结果", None, hit)?;
+        self.forward_verify_file_helper_row_selected(7, &name)?;
+        let after = self.capture_frame(pane, "点击后右侧区")?.fingerprint;
+        self.last_click_reacted = Some(before != after);
+
+        self.advance(TaskState::VerifyingProfile, Some("资料页核名并找「发消息」".into()))?;
+        match self.yolo_poll_profile(&name)? {
+            ProfileState::AlreadyChat => {
+                self.evidence.push("步骤8：未停在资料页，已直接进入聊天（已有会话），交给标题核验".into());
+            }
+            ProfileState::Profile { button } => {
+                self.advance(TaskState::OpeningChatFromProfile, Some("点击「发消息」".into()))?;
+                self.yolo_click_send_message_on_profile(button)?;
+            }
+        }
 
         self.advance(TaskState::VerifyingChatHeader, Some("确认已进入聊天".into()))?;
-        let (window, shot, dets) = self.yolo_detect_window("聊天页确认")?;
-        if best_by_class(&dets, class::INPUT_BAR).is_none()
-            && best_by_class(&dets, class::MESSAGE_INPUT).is_none()
-            && best_by_class(&dets, class::SEND_BUTTON).is_none()
-        {
-            return Err(AutomationError::NeedsHumanReview(
-                "点击「发消息」后未检出 input_bar / send_button（或遗留 message_input），请确认资料页入口点对了。".into(),
-            ));
-        }
-
-        self.advance(TaskState::PreparingMessage, None)?;
-        self.yolo_type_and_send(window, &shot, &dets)
+        let window = self.ensure_calibrated()?;
+        let list_right = window.x + (window.width as f32 * 0.30).round() as i32;
+        self.yolo_verify_chat_and_send(9, &name, header_anchor(window, list_right))
     }
 
+    /// 读搜索框里的实际文字（失败文案用）。
+    fn read_search_box(&mut self, search_box: Rect) -> Result<String, AutomationError> {
+        let (_s, boxes) = self.capture_and_recognize(search_box, "搜索框实际内容")?;
+        let mut sorted: Vec<&TextBox> = boxes.iter().collect();
+        sorted.sort_by_key(|b| (b.bounds.y, b.bounds.x));
+        Ok(sorted.iter().map(|b| b.text.trim()).collect::<Vec<_>>().join(" "))
+    }
+
+    /// 资料页右栏（窗口右 55%）。
+    fn profile_region(window: Rect) -> Rect {
+        Rect {
+            x: window.x + (window.width as f32 * 0.45).round() as i32,
+            y: window.y,
+            width: (window.width as f32 * 0.55).round() as i32,
+            height: window.height,
+        }
+    }
+
+    /// B8：轮询资料页——同时读到目标名与「发消息」才算资料页；
+    /// 若检出聊天输入区则视为已直接进聊天。
+    fn yolo_poll_profile(&mut self, name: &str) -> Result<ProfileState, AutomationError> {
+        let window = self.ensure_calibrated()?;
+        let region = Self::profile_region(window);
+        let min_conf = self.cfg().min_confidence.min(0.5);
+        let mut saw_name = false;
+        let outcome = self.poll_bounded(PollBudget::WallClock(PEER_POLL_BUDGET), HEADER_POLL_INTERVAL, |run| {
+            let (_s, boxes) = run.capture_and_recognize(region, "资料页·姓名与发消息")?;
+            let has_name = boxes.iter().any(|b| b.text.contains(name));
+            saw_name |= has_name;
+            let button = boxes
+                .iter()
+                .filter(|b| b.confidence >= min_conf)
+                .find(|b| b.text.contains(SEND_MESSAGE_LABEL))
+                .map(|b| b.bounds.to_screen(Point { x: region.x, y: region.y }));
+            if let (true, Some(button)) = (has_name, button) {
+                return Ok(Round::hit(ProfileState::Profile { button }));
+            }
+            let (_w, _s, dets) = run.yolo_detect_window("资料页·是否已进聊天")?;
+            if best_by_class(&dets, class::INPUT_BAR).is_some() || best_by_class(&dets, class::SEND_BUTTON).is_some() {
+                return Ok(Round::hit(ProfileState::AlreadyChat));
+            }
+            Ok(Round::missed())
+        })?;
+        match outcome {
+            PollOutcome::Found { value, .. } => Ok(value),
+            PollOutcome::Exhausted { stats } => Err(self.annotate_click_effect(AutomationError::NeedsHumanReview(format!(
+                "步骤8失败：{}ms 内（OCR {} 次）资料页{}，且未检出聊天输入区。",
+                stats.wall.as_millis(),
+                stats.ocr_attempts,
+                if saw_name { format!("读到「{name}」但没有「{SEND_MESSAGE_LABEL}」") } else { format!("未读到「{name}」（可能点错了人）") }
+            )))),
+        }
+    }
 
     /// 输入关键词并停稳后：整窗 YOLO 一次，步骤名固定为「搜索下拉结果」。
     ///
@@ -154,65 +207,36 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// 在窗口右半侧 OCR 找「发消息」并点击。
+    /// B8：点「发消息」；点击前后比较右栏指纹，没变则最多再点 [`PROFILE_RECLICKS`] 次。
     ///
-    /// 落点与 YOLO 检测框点击同一规则：[`random_point_in_central_half`]（`cx±w/4, cy±h/4`），
-    /// 不点文字框精确中心。OCR 框已由 `capture_and_recognize` 换算成相对 `region` 的逻辑坐标，
-    /// 所以先 `to_screen` 再取点即可，无需再做 Retina 换算。
-    pub(super) fn yolo_click_send_message_on_profile(&mut self) -> Result<(), AutomationError> {
-        // 点通讯录后窗口可能已经变宽，截右栏前重读当前矩形。
+    /// 落点：[`random_point_in_central_half`]。最终是否进对了聊天交给标题核验。
+    fn yolo_click_send_message_on_profile(&mut self, button: Rect) -> Result<(), AutomationError> {
         let window = self.ensure_calibrated()?;
-        // 右栏：大约窗口右 55%（企微三栏布局）。
-        let region = Rect {
-            x: window.x + (window.width as f32 * 0.45).round() as i32,
-            y: window.y,
-            width: (window.width as f32 * 0.55).round() as i32,
-            height: window.height,
-        };
-        let (shot, boxes) = self.capture_and_recognize(region, "资料页·发消息")?;
-        if self.cfg().log_ocr_candidates {
+        let region = Self::profile_region(window);
+        for attempt in 0..=PROFILE_RECLICKS {
+            let before = self.capture_frame(region, "资料页·点击前")?.fingerprint;
+            let target = random_point_in_central_half(button);
             self.evidence.push(format!(
-                "资料页右栏读到 {} 块：{}",
-                boxes.len(),
-                crate::candidates::describe_candidates(&boxes)
+                "步骤8：点击「{SEND_MESSAGE_LABEL}」第 {} 次 → 屏幕 ({}, {})；文字框 {button:?}",
+                attempt + 1,
+                target.x,
+                target.y
             ));
-        }
-        let needle = SEND_MESSAGE_LABEL;
-        let hit = boxes
-            .iter()
-            .filter(|b| b.confidence >= self.cfg().min_confidence.min(0.5))
-            .find(|b| b.text.contains(needle))
-            .ok_or_else(|| {
-                AutomationError::NeedsHumanReview(format!(
-                    "资料页右侧未找到「{needle}」按钮（亦可能显示为其它文案）。\
-                     请确认已打开联系人资料且该入口可见。"
-                ))
+            self.ensure_not_frozen("已取消打开聊天")?;
+            self.runner.ports.platform.guarded_click(target, window)?;
+            self.check_deadline("点击发消息")?;
+            let outcome = self.poll_bounded(PollBudget::WallClock(HEADER_POLL_BUDGET), HEADER_POLL_INTERVAL, |run| {
+                let fp = run.capture_frame(region, "资料页·点击后")?.fingerprint;
+                Ok(if fp != before { Round::hit(()) } else { Round::skipped() })
             })?;
-        let screen = hit.bounds.to_screen(Point {
-            x: region.x,
-            y: region.y,
-        });
-        let target = random_point_in_central_half(screen);
-        self.evidence.push(format!(
-            "点击「{needle}」：屏幕 ({}, {}) 文字「{}」 文字框 ({}, {}) {}x{}（中心半区随机点）",
-            target.x,
-            target.y,
-            hit.text.trim(),
-            screen.x,
-            screen.y,
-            screen.width,
-            screen.height
-        ));
-        let expected = self.ensure_calibrated()?;
-        self.ensure_not_frozen("已取消打开聊天")?;
-        self.runner
-            .ports
-            .platform
-            .guarded_click(target, expected)?;
-        self.check_deadline("点击发消息")?;
-        // 等聊天页打开。
-        std::thread::sleep(self.cfg().scroll_settle_timeout);
-        let _ = shot;
+            if matches!(outcome, PollOutcome::Found { .. }) {
+                self.last_click_reacted = Some(true);
+                return Ok(());
+            }
+            self.evidence.push(format!("步骤8：点击「{SEND_MESSAGE_LABEL}」后右栏画面未变化"));
+        }
+        // 不在这里判死：交给标题核验，并带上"点击无效果"。
+        self.last_click_reacted = Some(false);
         Ok(())
     }
 }

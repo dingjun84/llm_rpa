@@ -1,4 +1,5 @@
-//! YOLO 工作流共用步骤：整窗检测、列表首行 OCR、滚动重试、输入并发送。
+//! YOLO 工作流共用步骤：整窗检测、列表首行 OCR、滚动落点。
+//! 两轮滚动查找见 [`super::yolo_list_find`]；输入并发送见 [`super::yolo_send_verify`]。
 //! 点检测框 / 点估计区见 [`super::yolo_click`]。
 //!
 //! ★ 坐标换算只用 [`crate::yolo::shot_point_to_screen`]；
@@ -10,12 +11,13 @@
 use crate::diagnostics::{Decision, MatchTrail, ReplayInput, Verdict};
 use crate::ports::{AutomationError, Point, Rect, Screenshot, TextBox};
 use crate::yolo::{
-    self, all_by_class, best_by_class, detections_as_text_boxes, estimate_message_input_region,
+    self, all_by_class, best_by_class, detections_as_text_boxes,
     item_tall_enough_for_two_lines, name_match_score, shot_point_to_screen, ListPage,
     YoloDetection, DEFAULT_MIN_ITEM_HEIGHT_PX,
 };
 
 use super::decision::name_match_decision;
+use super::yolo_verify_rules::count_same_name;
 use super::Run;
 
 impl Run<'_> {
@@ -89,7 +91,7 @@ impl Run<'_> {
         page: ListPage,
         expected_name: &str,
         step: &str,
-    ) -> Result<Option<YoloDetection>, AutomationError> {
+    ) -> Result<ItemMatch, AutomationError> {
         let items = all_by_class(dets, yolo::class::LIST_ITEM);
         let item_label = page.item_label();
         if items.is_empty() {
@@ -113,7 +115,7 @@ impl Run<'_> {
                     candidates: Vec::new(),
                 },
             );
-            return Ok(None);
+            return Ok(ItemMatch::default());
         }
         let min_h = {
             // 把默认像素阈值按 shot/window 比例调到原图像素。
@@ -128,6 +130,7 @@ impl Run<'_> {
         let mut best: Option<(YoloDetection, usize, f32, TextBox)> = None;
         let mut runners_up: Vec<TextBox> = Vec::new();
         let mut verdicts: Vec<Verdict> = Vec::new();
+        let mut first_lines: Vec<String> = Vec::new();
         // 先筛半截条目，再对剩余框裁切后并发 OCR（上限见 ocr_batch::MAX_OCR_CONCURRENCY）。
         let mut tall: Vec<YoloDetection> = Vec::new();
         for det in items {
@@ -161,6 +164,7 @@ impl Run<'_> {
                 verdicts.push(Verdict::rejected(&det_box, "bbox 内无 OCR 文字"));
                 continue;
             };
+            first_lines.push(first.text.clone());
             if self.cfg().log_ocr_candidates {
                 self.evidence.push(format!(
                     "{step}：首行「{}」conf={:.2}",
@@ -252,7 +256,8 @@ impl Run<'_> {
                 &match_result,
             ),
         );
-        Ok(best.map(|(d, _, _, _)| d))
+        let same_name = count_same_name(first_lines.iter().map(String::as_str), expected_name);
+        Ok(ItemMatch { best: best.map(|(d, _, _, _)| d), same_name })
     }
 
     /// 列表区中心作为滚轮落点：取全部 list_item 的包围盒中心；没有则窗口水平 35%、垂直居中。
@@ -283,98 +288,12 @@ impl Run<'_> {
         let cy = (y1 + y2) / 2;
         shot_point_to_screen(cx, cy, window, shot.width, shot.height)
     }
+}
 
-    /// 向下滚一格并等停稳。
-    pub(super) fn yolo_scroll_list(
-        &mut self,
-        window: Rect,
-        shot: &Screenshot,
-        dets: &[YoloDetection],
-    ) -> Result<(), AutomationError> {
-        let at = Self::yolo_list_scroll_point(window, shot, dets);
-        let expected = self.ensure_calibrated()?;
-        let notches = self.cfg().scroll_notches_per_step;
-        self.evidence.push(format!(
-            "列表滚动：屏幕 ({}, {})，向下 {notches} 格",
-            at.x, at.y
-        ));
-        self.runner
-            .ports
-            .platform
-            .scroll(at, notches, expected)?;
-        self.wait_for_settle(window)
-    }
-
-    /// 估计文字输入区并点击 → 逐字输入 → 视配置点 send_button。
-    ///
-    /// 14 类模型已去掉 `message_input`：输入区由 `input_bar` 底边与 `send_button` 左边围出。
-    /// 若仍检出遗留 `message_input`（旧权重），可作兜底。`input_bar` 本身是工具条，不能点中心。
-    ///
-    /// 调用前须已处于 [`TaskState::PreparingMessage`]。
-    pub(super) fn yolo_type_and_send(
-        &mut self,
-        window: Rect,
-        shot: &Screenshot,
-        dets: &[YoloDetection],
-    ) -> Result<(), AutomationError> {
-        use crate::audit::MessageDigest;
-        use crate::state::TaskState;
-
-        let input_region = estimate_message_input_region(dets).or_else(|| {
-            best_by_class(dets, yolo::class::MESSAGE_INPUT).map(|d| d.bounds_rect())
-        });
-        let Some(input_region) = input_region else {
-            return Err(AutomationError::NeedsHumanReview(
-                "聊天页未检出 input_bar / send_button（亦无遗留 message_input），无法聚焦输入框。\
-                 请确认已打开与目标的会话且输入区未被遮挡。"
-                    .into(),
-            ));
-        };
-        self.yolo_click_image_rect_jittered(window, shot, input_region, "输入框")?;
-
-        let text = self.task.text.clone();
-        let expected = self.ensure_calibrated()?;
-        self.evidence
-            .push(format!("逐字输入正文（{} 字）", text.chars().count()));
-        self.ensure_not_frozen("已取消填入消息正文")?;
-        self.runner
-            .ports
-            .platform
-            .type_text(&text, expected)?;
-        self.check_deadline("输入正文")?;
-
-        if self.cfg().stop_before_send {
-            self.advance(
-                TaskState::Prepared,
-                Some(format!(
-                    "已把 {} 个字符逐字填入输入框，未发送",
-                    text.chars().count()
-                )),
-            )?;
-            return Ok(());
-        }
-
-        self.runner.ledger.claim(self.task.id)?;
-        self.message_digest = Some(MessageDigest::of(&text));
-        self.advance(TaskState::Sending, None)?;
-
-        let (window, shot, dets) = self.yolo_detect_window("发送前检测")?;
-        let send = self.yolo_require_class(
-            &dets,
-            yolo::class::SEND_BUTTON,
-            "请确认输入区可见且发送按钮未被遮挡。",
-        )?;
-        self.yolo_click_detection(window, &shot, send, "发送按钮")?;
-
-        self.advance(TaskState::VerifyingDelivery, None)?;
-        let (_w, _s, after) = self.yolo_detect_window("发送后检测")?;
-        let has_out = best_by_class(&after, yolo::class::OUTGOING_BUBBLE).is_some();
-        if !has_out {
-            // 不把「暂时没框到气泡」当成硬失败：YOLO 对气泡召回不稳定。
-            self.evidence
-                .push("发送后未检出 outgoing_bubble（已点击发送；请人工核对）".into());
-        }
-        self.advance(TaskState::Completed, Some("已点击发送".into()))?;
-        Ok(())
-    }
+/// [`Run::yolo_find_name_in_items`] 的结论：最佳命中 + 本帧首行与目标名逐字相等的行数。
+#[derive(Default)]
+pub(super) struct ItemMatch {
+    pub(super) best: Option<YoloDetection>,
+    /// >1 ⇒ 同名歧义，调用方须停下（`AmbiguousVision`）。
+    pub(super) same_name: usize,
 }
