@@ -73,7 +73,7 @@ pub(super) fn step_notches(area_h_img: i32, shot_h: u32, window_h: i32) -> i32 {
 }
 
 /// 图像坐标矩形 → 屏幕矩形。
-fn img_rect_to_screen(r: Rect, window: Rect, sw: u32, sh: u32) -> Rect {
+pub(super) fn img_rect_to_screen(r: Rect, window: Rect, sw: u32, sh: u32) -> Rect {
     let a = shot_point_to_screen(r.x, r.y, window, sw, sh);
     let b = shot_point_to_screen(r.x + r.width, r.y + r.height, window, sw, sh);
     Rect { x: a.x, y: a.y, width: (b.x - a.x).max(1), height: (b.y - a.y).max(1) }

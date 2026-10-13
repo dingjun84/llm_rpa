@@ -67,6 +67,18 @@ impl Run<'_> {
     ///
     /// 选中判据只走 [`crate::nav_selected::is_nav_icon_selected`]，不在此另写阈值。
     pub(super) fn forward_ensure_message_nav_selected(&mut self) -> Result<(), AutomationError> {
+        self.ensure_nav_selected(1, class::NAV_CHAT_ICON, "消息导航")
+    }
+
+    /// 通用导航选中：`icon_class` 为 `nav_chat_icon` / `nav_contacts_icon` 等。
+    /// 已选中则跳过；否则点击后墙钟 2s 内每 200ms 重检，选中判据只走
+    /// [`crate::nav_selected::is_nav_icon_selected`]。
+    pub(super) fn ensure_nav_selected(
+        &mut self,
+        step: u32,
+        icon_class: &str,
+        what: &str,
+    ) -> Result<(), AutomationError> {
         use std::time::{Duration, Instant};
 
         use crate::nav_selected::{is_nav_icon_selected, nav_icon_selected_ratio, SELECTED_RATIO};
@@ -75,25 +87,25 @@ impl Run<'_> {
         const POLL_BUDGET: Duration = Duration::from_millis(2000);
         const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-        let (window, shot, dets) = self.yolo_detect_window("转发·1·导航消息")?;
+        let (window, shot, dets) = self.yolo_detect_window(&format!("{step}·{what}"))?;
         let nav = self.yolo_require_class(
             &dets,
-            class::NAV_CHAT_ICON,
+            icon_class,
             "请确认企业微信左侧导航可见。",
         )?;
         let bounds = nav.bounds_rect();
         let ratio = nav_icon_selected_ratio(&shot, bounds);
         if is_nav_icon_selected(&shot, bounds) {
             self.evidence.push(format!(
-                "步骤1：消息导航已选中（蓝占比 {ratio:.3} ≥ {SELECTED_RATIO}），跳过点击"
+                "步骤{step}：{what}已选中（蓝占比 {ratio:.3} ≥ {SELECTED_RATIO}），跳过点击"
             ));
             return Ok(());
         }
         self.evidence.push(format!(
-            "步骤1：消息导航未选中（蓝占比 {ratio:.3} < {SELECTED_RATIO}），点击并轮询选中态"
+            "步骤{step}：{what}未选中（蓝占比 {ratio:.3} < {SELECTED_RATIO}），点击并轮询选中态"
         ));
-        self.log_click_ctx(1, "nav_chat_icon", None, window, &shot, bounds)?;
-        self.yolo_click_detection(window, &shot, nav, "消息导航")?;
+        self.log_click_ctx(step, icon_class, None, window, &shot, bounds)?;
+        self.yolo_click_detection(window, &shot, nav, what)?;
 
         // 超时从点击后**发起检测**起算（不含点击本身）。
         let started = Instant::now();
@@ -103,15 +115,15 @@ impl Run<'_> {
         loop {
             self.check_cancel()?;
             attempts += 1;
-            let (_w, shot, dets) = self.yolo_detect_window(&format!("转发·1·选中态·第{attempts}次"))?;
-            match best_by_class(&dets, class::NAV_CHAT_ICON) {
+            let (_w, shot, dets) = self.yolo_detect_window(&format!("{step}·{what}·选中态·第{attempts}次"))?;
+            match best_by_class(&dets, icon_class) {
                 Some(nav) => {
                     saw_icon = true;
                     let bounds = nav.bounds_rect();
                     last_ratio = nav_icon_selected_ratio(&shot, bounds);
                     if is_nav_icon_selected(&shot, bounds) {
                         self.evidence.push(format!(
-                            "步骤1：点击后第 {attempts} 次检出选中（蓝占比 {last_ratio:.3}，墙钟 {}ms）",
+                            "步骤{step}：点击后第 {attempts} 次检出选中（蓝占比 {last_ratio:.3}，墙钟 {}ms）",
                             started.elapsed().as_millis()
                         ));
                         return Ok(());
@@ -119,7 +131,7 @@ impl Run<'_> {
                 }
                 None => {
                     self.evidence.push(format!(
-                        "步骤1：第 {attempts} 次未检出 nav_chat_icon（墙钟 {}ms）",
+                        "步骤{step}：第 {attempts} 次未检出 {icon_class}（墙钟 {}ms）",
                         started.elapsed().as_millis()
                     ));
                 }
@@ -130,7 +142,7 @@ impl Run<'_> {
             std::thread::sleep(POLL_INTERVAL);
         }
         Err(AutomationError::NeedsHumanReview(format!(
-            "步骤1失败：点击消息导航后 {}ms 内轮询 {attempts} 次仍未选中             （最后蓝占比 {last_ratio:.3}，阈值 {SELECTED_RATIO}；              是否检出图标：{}）。请确认企业微信左侧消息图标变为蓝色选中态。",
+            "步骤{step}失败：点击{what}后 {}ms 内轮询 {attempts} 次仍未选中             （最后蓝占比 {last_ratio:.3}，阈值 {SELECTED_RATIO}；              是否检出图标：{}）。请确认企业微信左侧该导航图标变为蓝色选中态。",
             started.elapsed().as_millis(),
             if saw_icon { "有" } else { "无" },
         )))
@@ -273,6 +285,7 @@ impl Run<'_> {
 
     pub(super) fn forward_verify_chat_header(
         &mut self,
+        step: u32,
         file_helper: &str,
         hit: Rect,
     ) -> Result<(), AutomationError> {
@@ -291,7 +304,7 @@ impl Run<'_> {
             "ocr_until_contains 轮询·会话标题",
             self.ocr_until_contains(
                 band,
-                "转发·4·会话标题带",
+                &format!("转发·{step}·会话标题带"),
                 file_helper,
                 HEADER_POLL_BUDGET,
                 HEADER_POLL_INTERVAL,
@@ -303,7 +316,7 @@ impl Run<'_> {
             String::new()
         };
         self.evidence.push(format!(
-            "步骤4：在命中点右上方区域找「{file_helper}」→ {}（等待 {}ms，OCR {} 次（最少 {} 次），\
+            "步骤{step}：在命中点右上方区域找「{file_helper}」→ {}（等待 {}ms，OCR {} 次（最少 {} 次），\
              停稳截帧 {} 次，最后一次读前{}停稳；预算 {}ms 间隔 {}ms）{read}",
             if poll.found { "成功" } else { "未找到" },
             poll.waited.as_millis(),
@@ -316,7 +329,7 @@ impl Run<'_> {
         ));
         if !poll.found {
             return Err(AutomationError::NeedsHumanReview(format!(
-                "步骤4失败：点击后 {}ms 内（OCR {} 次）右上方未见「{file_helper}」，可能未进入会话。",
+                "步骤{step}失败：点击后 {}ms 内（OCR {} 次）右上方未见「{file_helper}」，可能未进入会话。",
                 poll.waited.as_millis(),
                 poll.ocr_attempts
             )));

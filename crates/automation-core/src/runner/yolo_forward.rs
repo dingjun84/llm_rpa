@@ -90,7 +90,7 @@ impl Run<'_> {
 
         // ── 4. 命中点右上方附近有「文件传输助手」→ 进会话成功 ──
         self.step_begin(4, "确认已进入文件传输助手会话")?;
-        self.forward_verify_chat_header(&file_helper, helper_hit)?;
+        self.forward_verify_chat_header(4, &file_helper, helper_hit)?;
 
         self.advance(
             TaskState::VerifyingChatHeader,
@@ -201,7 +201,7 @@ impl Run<'_> {
     ///
     /// 1. 先 YOLO 检出 `search_bar` → 用其屏幕矩形（位移/落点都走这框）；
     /// 2. 未检出 → 回退现有 OCR「搜索」轮询逻辑。
-    fn forward_locate_search_box(
+    pub(super) fn forward_locate_search_box(
         &mut self,
         step: u32,
         ocr_needle: &str,
@@ -251,7 +251,7 @@ impl Run<'_> {
     /// 每次尝试：拍框内指纹 → 在中心半区落点（重试时先 `move_pointer` 挪进框内）→
     /// 点击 → 短暂等待后再拍同一区域。指纹变了 = 焦点已获取；否则最多共
     /// [`SEARCH_FOCUS_MAX_ATTEMPTS`] 次。
-    fn forward_click_search_box_until_focused(
+    pub(super) fn forward_click_search_box_until_focused(
         &mut self,
         step: u32,
         search_box: Rect,
