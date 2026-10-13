@@ -56,13 +56,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::audit::{AuditEntry, AuditSink, MemorySendLedger, MessageDigest, NoopAudit, SendLedger};
-use crate::candidates::describe_candidates;
 use crate::diagnostics::{
     Decision, DiagnosticRecorder, IconHit, MatchTrail, Observation, ReplayInput, WindowShot,
 };
 use crate::{EvidenceRecorder, SendTask};
 use crate::ports::{
-    AutomationError, ContactMatcher, DesktopPlatform, IconLocator, IconTemplate, LocalOcr, Point,
+    AutomationError, ContactMatcher, DesktopPlatform, IconLocator, IconTemplate, LocalOcr,
     Rect, ScreenMetrics, Screenshot, TaskId,
     TextBox,
 };
@@ -707,7 +706,6 @@ struct Run<'a> {
     step_started: Instant,
     window: Option<Rect>,
     metrics: Option<ScreenMetrics>,
-    baseline_fingerprint: Option<String>,
     message_digest: Option<MessageDigest>,
     /// 最近一次成功捕获的画面与其识别结果，仅在失败时用于生成脱敏证据。
     last_frame: Option<(Screenshot, Vec<TextBox>)>,
@@ -780,7 +778,6 @@ impl<'a> Run<'a> {
             step_started: Instant::now(),
             window: None,
             metrics: None,
-            baseline_fingerprint: None,
             message_digest: None,
             last_frame: None,
             last_click_reacted: None,

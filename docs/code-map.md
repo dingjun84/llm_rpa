@@ -88,11 +88,16 @@
 | `src/ports.rs` | 497 | **四个端口的 trait 定义** + `AutomationError` + `IconQuery`/`IconPrior` | `DesktopPlatform`、`LocalOcr`、`IconLocator`、`ContactMatcher` |
 | `src/state.rs` | 277 | 任务状态枚举与合法迁移 | `TaskState` |
 | `src/runner/mod.rs` | 1533 | **编排骨架**：配置、端口、主循环、通用工具。★ 单步超时（`check_deadline`）与**分段耗时证据**（`note_elapsed`）也在这里：超时文案必须带**实际耗时 + 判据自己的代码位置**，否则"这一步为什么慢"没有入口 | `WorkflowRunner`、`RunnerConfig`、`execute()`、`check_deadline`、`note_elapsed` |
-| `src/runner/search.rs` | 573 | **搜索式工作流**（工作流 3）。★ 点下拉那一行之后**两种落点**：通常在资料页，已有会话时直接进聊天。判据分两层——`ProfileReview` 管"资料页上认没认到人"，`ChatEntry` 管"资料页上有没有「发消息」入口"（聊天页右上栏也是他的名字，所以第一层拦不住第二种），两个结论都交回 `open_chat_from_dropdown` 定夺（见 `docs/todo.md` T32） | `search_contact_by_keyword`、`pick_contact_from_dropdown`、`verify_profile`、`open_chat_from_profile`、`open_chat_from_dropdown` |
-| `src/runner/list.rs` | 261 | **列表扫描式**（原有那条路） | `locate_contact`、`sweep_contact_list`、`scroll_to_top` |
+| `src/runner/search.rs` | 143 | **旧·搜索式（不编入）**。2026-10 清理后只剩资料页核验与搜索框诊断两个判据（供参考）；入口与只被入口引用的方法已删。`resolve_extra` 只剩这里一份（原与 `message.rs` 重复） | `verify_profile`、`ProfileReview`、`diagnose_search_field`、`resolve_extra` |
+| `src/runner/list.rs` | 82 | **旧·列表扫描式（不编入）**。只剩滚动判据（落点 / 回顶 / 滚不动了没有）供参考；`locate_contact` / `sweep_contact_list` / `open_chat_from_list` 已删 | `scroll_anchor`、`scroll_to_top`、`view_moves_when_scrolling` |
 | `src/runner/navigate.rs` | 238 | 导航图标模板匹配 + 点击（工作流 1 / 2）。★ 每一步都记一条分段耗时（`timed!` 宏 + `Run::note_elapsed`）：截屏 / `icons.locate` / 诊断上报 / 守卫 / 点击各一段，`file:line` 取在宏展开处 | `navigate_to_view`、`nav_prior` |
-| `src/runner/message.rs` | 246 | 聚焦输入框 + 把正文**逐字**敲进输入框，以及**发不发**这一步：勾了「只填不发」停在 `Prepared`，没勾就直接**点发送按钮** → 核验送达，**中间不插任何等人工的环节**。★ 判据只有 `stop_before_send` 一处，与工作流无关。★ 发送动作 = 逐字输入 + 点按钮：**不粘贴**（不碰剪贴板）、**不按 Enter**（客户端的发送键设置因人而异，按错键表现为"多了个换行、消息没出去"） | `prepare_message`、`type_into_composer`、`click_send_button`、`verify_delivery` |
+| `src/runner/message.rs` | 67 | **只剩设计说明**（不粘贴、不按快捷键、`stop_before_send` 唯一判据——对新实现同样成立）。代码已全部删除（无引用）；现实现见 `yolo_send_verify.rs`，送达判据见 `yolo_verify_rules::judge_delivery` | — |
 | `src/runner/ocr_poll.rs` | 354 | ★★ **「点击后验文字」的有界轮询本体**：预算口径（`PollBudget` 分墙钟 / 只计 sleep）与收尾判据 `poll_should_stop` **只有这一处**。四类探测（固定区域停稳后 OCR / 枚举顶层窗找弹层 / 只看指纹变没变 / 整窗 OCR 只认某条带）原来各写一份循环、收尾条件已经分叉，现统一成 `poll_bounded`：**探测交给闭包，预算口径与收尾判据留在这里**。等了多久 / 截了几帧 / OCR 几次全部带回，由调用方写进 evidence——"是没等够还是真没切过去"不该靠猜 | `poll_bounded`、`PollBudget`、`PollOutcome`、`Round`、`poll_should_stop` |
+| `src/runner/yolo_chat.rs` | 38 | 工作流 `chat_list_send` **编排**（A2 导航选中 → A3 两轮查找 → A4 复检点击 + 选中校验 → A5–A9 发送核验） | `run_chat_list_send` |
+| `src/runner/yolo_contacts.rs` | 242 | 工作流 `contacts_search_send`：B2 通讯录导航选中（`ensure_nav_selected`）→ B3 搜索框焦点 → B4 基线 + 输入确认 → B5 轮询下方结果（超时报搜索框实际内容）→ B6 同名即停 → B7 点击 + 选中校验 → B8 资料页核名 / 轮询「发消息」/ 指纹判点击生效（已有会话直接进聊天不算失败）→ B9–B13 | `run_contacts_search_send`、`yolo_poll_profile`、`yolo_click_send_message_on_profile` |
+| `src/runner/yolo_list_find.rs` | 195 | 会话列表**两轮**滚动查找（当前位置向下 + 回顶再扫）；列表区指纹判**到底 vs 卡死**；同屏同名 >1 ⇒ `AmbiguousVision`；点击前按原坐标复检防重排、点击后 `forward_verify_file_helper_row_selected` 左击重试 | `yolo_scroll_find_contact`、`yolo_click_list_row_verified` |
+| `src/runner/yolo_send_verify.rs` | 189 | 两条工作流共用后半段：标题核验（失败带"点击有没有效果"）→ 输入并 OCR 确认（不在则清空重输一次）→ 发送前确认正文仍在 → 发送后确认输入框清空 → 送达（指纹变 **且** 读到正文，有界轮询） | `yolo_verify_chat_and_send`、`annotate_click_effect` |
+| `src/runner/yolo_verify_rules.rs` | 181 | ★ 上面两条工作流的**纯判据**（可单测）：输入框是否含正文、同名计数、滚动结论、送达结论、复检找最近行、标题带锚点 | `boxes_contain_text`、`count_same_name`、`classify_scroll`、`judge_delivery`、`nearest_row`、`header_anchor` |
 | `src/runner/yolo_forward.rs` | 213 | 工作流 `forward_to_contact` 的**编排**：消息页 → 文件传输助手 → 右键转发 → 选联系人 → 创建并发送 | `run_forward_to_contact` |
 | `src/runner/yolo_forward_ops.rs` | 341 | 转发流程的**一次性**动作：落点点击、滚聊天到底、右击气泡、整窗轮询认一个标签。★ **轮询与它的参数不在这里**（在 `yolo_forward_poll.rs`）——这里只留"做一次就完"的那几个 | `forward_ocr_first_label_polled`、`forward_click_screen_box`、`forward_verify_chat_header`、`forward_scroll_chat_to_bottom`、`forward_right_click_bubble` |
 | `src/runner/yolo_forward_poll.rs` | 443 | ★★ 转发工作流里**所有**有界轮询的**参数**（机制在 `ocr_poll.rs`）：步骤 3/10 看 `BelowPoll`（输入后列表**下方**冒出目标行），步骤 7/8/9/11 看 `PeerPoll`（弹层里挑联系人）。★"两个步骤到底差在哪"只看那两个结构体 | `BelowPoll`、`PeerPoll`、`Prefer`、`forward_poll_below`、`forward_poll_peer` |
@@ -105,8 +110,8 @@
 | `src/audit.rs` | 189 | 审计契约（只存长度/哈希/时间） | `AuditSink`、`SendLedger` |
 | `src/lib.rs` | 18 | 模块声明与 re-export | — |
 
-⚠️ **`runner` 是个目录**（`runner/mod.rs` + 十一个子模块，以 `mod.rs` 顶部的
-`mod` 声明为准）。⚠️ **上表里 `search.rs` / `list.rs` / `navigate.rs` 三行是旧路**
+⚠️ **`runner` 是个目录**（`runner/mod.rs` + 一组子模块，以 `mod.rs` 顶部的
+`mod` 声明为准）。⚠️ **上表里 `search.rs` / `list.rs` / `navigate.rs` 三行是旧路**（`message.rs` 编入但只剩说明文字）
 ——YOLO 工作流已替换它们，三个文件仍在树中但**不编入**（`runner/mod.rs` 第 40 行有注），
 别按那三行去读现流程；现流程的入口是 `yolo_forward.rs` 一族。
 各子模块里各有一批
@@ -139,12 +144,12 @@
 
 | 想改什么 | 打开 |
 | --- | --- |
-| 搜索框怎么点、联想下拉怎么挑人 | `runner/search.rs` 的 `search_contact_by_keyword` / `pick_contact_from_dropdown` |
-| 资料页怎么核验、怎么滚到底、怎么点「发消息」 | `runner/search.rs` 的 `verify_profile` / `scroll_profile_to_bottom` / `open_chat_from_profile` |
-| 点完下拉那一行**没**落在资料页怎么办（对方已有会话，客户端直接开聊天） | `runner/search.rs` 的 `open_chat_from_dropdown` + `ProfileReview` + `ChatEntry`。**顺序不能反过来**：必须先核验资料页，只有它报"没认到"才拿聊天标题定论（两块区域只差 2 像素），见 `docs/todo.md` T32。★ "没落成"有两种：**没认到人**（`ProfileReview::NotFound`）与**认到了人、但资料页上没有「发消息」入口**（`ChatEntry::NotFound`）——后者**不再报错**，一样跳过、一样靠聊天标题定夺 |
-| 会话列表怎么滚、滚完怎么判「到底了」 | `runner/list.rs` 的 `sweep_contact_list` / `view_moves_when_scrolling` |
+| 搜索框怎么点、搜索结果怎么挑人 | `runner/yolo_contacts.rs`（B3–B7，复用 `forward_locate_search_box` / `forward_click_search_box_until_focused` / `forward_ocr_best_below_polled`） |
+| 资料页怎么核验、怎么点「发消息」 | `runner/yolo_contacts.rs` 的 `yolo_poll_profile` / `yolo_click_send_message_on_profile` |
+| 点完搜索结果**没**落在资料页怎么办（对方已有会话，客户端直接开聊天） | `yolo_poll_profile` 返回 `AlreadyChat`，不报错，交给 `yolo_verify_chat_and_send` 的标题核验定论 |
+| 会话列表怎么滚、滚完怎么判「到底了」 | `runner/yolo_list_find.rs`（判据 `yolo_verify_rules::classify_scroll`） |
 | 导航图标匹配与位置先验 | `runner/navigate.rs` |
-| 正文怎么填、在哪一步停下 | `runner/message.rs` 的 `prepare_message` |
+| 正文怎么填、在哪一步停下 | `runner/yolo_send_verify.rs` 的 `yolo_verify_chat_and_send` |
 
 
 ### 3.2 `crates/vision` —— 视觉层
@@ -349,10 +354,10 @@ yolo_detect_target_window  ghostbox_move_to  ghostbox_reset_device
 | **把一次现场收编成一条回归用例**（T30 的「现场 → 用例」） | ① 现场材料在原位：`data/tasks/<任务ID>/`；② 收编时**整份拷成** `data/cases/<用例名>/`，本机回归跑它；③ 要进仓库的**只有人工造的假场景**：`tools/replay/tests/fixtures/`（人名为假，由 `tools/replay/src/tests.rs` 里那个 `#[ignore]` 生成器重跑重写）。★★ **现场与用例都只在 `data/` 下，永不入库**（`.gitignore` 的 `/data/`、`**/cases/`、`**/fixtures/**/*.png`）；代价是 CI 只能跑假场景，"OCR 级"的验证只有本机能做（见 `docs/todo.md` T30） |
 | 改**事件流的格式**（加一种事件 / 加一个字段） | `src-tauri/src/task_diagnostics/events.rs`（**格式只有这一处定义**）+ `types.ts` 的 `ReplayEvent` + **`tools/replay`（读盘那侧要跟着改，否则离线重放读不懂）**。★ 加字段不算"含义变过"（`SCHEMA_VERSION` 不动），但要**同时**改 `tools/replay/src/tests.rs` 里造事件流的那两个助手，否则回归用的假场景会缺字段 |
 | 改「过程重放」页显示哪一步 / 怎么配对 | `apps/desktop/src/replayView.ts`（配对规则，只此一处）+ `components/TaskReplay.tsx`（展示）。★ 同一张盘 `tools/replay/src/lib.rs::run` 也要一起看——两个消费者必须用同一条配对规则 |
-| **改搜索式工作流**（工作流 3：点搜索框 → 下拉挑人 → 资料页 → 发消息） | `runner/search.rs`。资料页那一套（核验 / 滚到底 / 找入口）也在这里。★ 点下拉之后的**两种落点**都在 `open_chat_from_dropdown`，而"没落在资料页"有两种表现：**没认到人**、**认到了人却没有「发消息」入口**——都**跳过**资料页那两步、直接核验聊天标题（`docs/todo.md` T32） |
+| **改通讯录搜索发送**（`contacts_search_send`） | `runner/yolo_contacts.rs`；后半段（标题 → 输入 → 发送 → 送达）在 `runner/yolo_send_verify.rs`，与会话列表发送共用 |
 | **改列表扫描式**（原有那条：滚会话列表认名字） | `runner/list.rs` |
 | **改「只做导航」**（工作流 1 / 2） | `runner/navigate.rs`（判据与点击）+ `vision/src/template.rs`（匹配算法） |
-| **改「在哪一步停下 / 要不要发」** | `runner/message.rs` 的 `prepare_message`。**判据只有一处**：配置里的「只填不发」（`stop_before_send`）。勾了 ⇒ 停在 `Prepared`；没勾 ⇒ 逐字输入正文后**直接点发送按钮**（中间不插任何等人工的环节，2026-09-22 移除）。★ 与走哪条工作流**无关**——搜索式一度按工作流无条件停住，2026-09-22 已收掉（`docs/todo.md` T16） |
+| **改「在哪一步停下 / 要不要发」** | `runner/yolo_send_verify.rs` 的 `yolo_verify_chat_and_send`。**判据只有一处**：配置里的「只填不发」（`stop_before_send`）。勾了 ⇒ 停在 `Prepared`；没勾 ⇒ 逐字输入正文后**直接点发送按钮**（中间不插任何等人工的环节，2026-09-22 移除）。★ 与走哪条工作流**无关**——搜索式一度按工作流无条件停住，2026-09-22 已收掉（`docs/todo.md` T16） |
 | **改「这条工作流到底要什么」**（要标哪些区域 / 要不要填联系人·正文） | **`src-tauri/src/runtime/requirements.rs`** 的 `required_marks` 与 `workflow_inputs`。★★ **判据只有这一处**：装配期按它拒绝、界面通过 `workflow_requirements` 命令读它渲染。★ 分叉的两种后果都很难查：`required_marks` 分叉 ⇒「界面说齐了、点开始却被拒」；`workflow_inputs` 分叉 ⇒「按钮点不动、也不说为什么」（2026-09-20 实测，见 T27） |
 | **改「转发到联系人」步骤1 选中态判断**（已在会话列表 / 点击后是否变蓝） | `nav_selected.rs`（HSV 蓝占比判据，只此一处）+ `runner/yolo_forward_ops.rs::forward_ensure_message_nav_selected`（跳过点击 / 2s·200ms 轮询）+ `runner/yolo_forward.rs`（编排调用） |
 | **排查「某一步为什么慢 / 单步超时超在哪」** | ① 打开 `data/tasks/<任务ID>/task.log`：先搜 `超过单步上限`（文案里带**实际耗时**与**判据的代码位置**），再看它上面那一批 `⏱ …` 行——每条都带 `@文件:行`，走得最久的那条指的就是要开的地方；② 实测最常见的两段是 `导航·图标匹配 icons.locate`（`vision/src/template.rs`，逐位置扫搜索区 × 每个模板）与 `⏱ 单步图 NN`（`task_diagnostics.rs`：标注图的渲染/编码/写盘**跑在任务线程上**，直接吃单步预算）；③ 别先怀疑匹配阈值——阈值只决定"够不够格"，**不影响耗时**（见 `docs/todo.md` T31） |
