@@ -11,8 +11,8 @@ use windows::Win32::System::IO::DeviceIoControl;
 
 use crate::error::VhidlabError;
 use crate::protocol::{
-    button_id_to_bits, MouseIn, AXIS_MAX, AXIS_MIN, IOCTL_MOUSE_BUTTON, IOCTL_MOUSE_MOVE,
-    IOCTL_MOUSE_WHEEL, WHEEL_MAX, WHEEL_MIN,
+    button_id_to_bits, wheel_report_steps, MouseIn, AXIS_MAX, AXIS_MIN, IOCTL_MOUSE_BUTTON,
+    IOCTL_MOUSE_MOVE, IOCTL_MOUSE_WHEEL, WHEEL_MAX, WHEEL_MIN,
 };
 
 /// Process-wide open handle (open once, like GhostBox `shared_device_session`).
