@@ -121,7 +121,7 @@ impl VhidDevice {
     /// Wheel Z: positive = up, negative = down (GhostBox convention).
     ///
     /// ★ 不要一次塞很大的 |Z|：Windows 对 VHF 滚轮时常把单包大值当成「几乎一格」，
-    /// 表现为滚不动 / 幅度极小。这里拆成多次小包（每包最多 [`WHEEL_REPORT_MAX`]），
+    /// 表现为滚不动 / 幅度极小。这里拆成多次小包（每包最多 3），
     /// 更接近真鼠标连滚。调用方若需要 |Z|>127，先自行分段再调本函数。
     pub fn wheel(&self, z: i32) -> Result<(), VhidlabError> {
         if !(WHEEL_MIN..=WHEEL_MAX).contains(&z) {
