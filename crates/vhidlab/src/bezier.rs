@@ -132,4 +132,14 @@ mod tests {
         assert_eq!(crate::protocol::notches_to_wheel_z(-2), 2);
         assert_eq!(crate::protocol::notches_to_wheel_z(200), -127);
     }
+
+    #[test]
+    fn wheel_report_steps_cover_z() {
+        let s = crate::protocol::wheel_report_steps(-120);
+        assert!(s.len() >= 40);
+        assert_eq!(s.iter().map(|v| *v as i32).sum::<i32>(), -120);
+        for v in s {
+            assert!((-3..=3).contains(&(v as i32)) && v != 0);
+        }
+    }
 }

@@ -16,8 +16,9 @@ mod motion;
 
 pub use error::VhidlabError;
 pub use protocol::{
-    button_id_to_bits, notches_to_wheel_z, MouseIn, AXIS_MAX, AXIS_MIN, BTN_LEFT, BTN_MIDDLE,
-    BTN_RIGHT, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT, WHEEL_MAX, WHEEL_MIN,
+    button_id_to_bits, notches_to_wheel_z, wheel_report_steps, MouseIn, AXIS_MAX, AXIS_MIN,
+    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT,
+    WHEEL_MAX, WHEEL_MIN,
 };
 
 #[cfg(windows)]

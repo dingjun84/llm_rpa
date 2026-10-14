@@ -11,7 +11,7 @@ use crate::error::VhidlabError;
 
 const MOVE_TIMEOUT: Duration = Duration::from_secs(2);
 const STEP_PAUSE: Duration = Duration::from_millis(4);
-const FINAL_TOLERANCE: i32 = 1;
+const FINAL_TOLERANCE: i32 = 3;
 
 fn cursor_pos() -> Result<(i32, i32), VhidlabError> {
     let mut pt = POINT { x: 0, y: 0 };

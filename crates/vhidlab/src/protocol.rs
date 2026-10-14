@@ -107,3 +107,21 @@ pub fn button_id_to_bits(id: i32) -> Option<u8> {
 pub fn notches_to_wheel_z(notches: i32) -> i32 {
     (-notches).clamp(WHEEL_MIN, WHEEL_MAX)
 }
+
+/// Plan per-report wheel steps for a GhostBox-signed Z (may be any i32; clamped piecewise by caller).
+/// Each step is in [-3, 3] excluding 0, same sign as z.
+pub fn wheel_report_steps(z: i32) -> Vec<i8> {
+    const MAX: i32 = 3;
+    if z == 0 {
+        return Vec::new();
+    }
+    let sign = if z > 0 { 1i32 } else { -1 };
+    let mut left = z.abs();
+    let mut out = Vec::new();
+    while left > 0 {
+        let step = left.min(MAX);
+        out.push((sign * step) as i8);
+        left -= step;
+    }
+    out
+}

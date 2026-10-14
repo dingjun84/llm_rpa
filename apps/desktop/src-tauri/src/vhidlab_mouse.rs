@@ -55,15 +55,30 @@ fn vhid_right_click() -> Result<(), AutomationError> {
     })
 }
 
+/// VHF 每「仓库格」折合多少 HID 滚轮单位。
+///
+/// 实测（任务 06231c04）：单包大 Z 几乎不滚；拆包后单格仍比幽灵盒弱，
+/// 步骤6 被 overlap 回退砍到 1 格后往上爬极慢。增益 3 ≈ 对齐幽灵盒体感。
+#[cfg(windows)]
+const VHID_NOTCH_GAIN: i32 = 3;
+
 #[cfg(windows)]
 fn vhid_scroll(notches: i32) -> Result<(), AutomationError> {
     if notches == 0 {
         return Ok(());
     }
-    let z = vhidlab::notches_to_wheel_z(notches);
+    // 仓库 notches>0 = 向下；先乘增益，再按 ±127 分段转成 GhostBox 向的 Z。
+    let mut remaining = notches.saturating_mul(VHID_NOTCH_GAIN);
     with_dev(|dev| {
-        dev.wheel(z)
-            .map_err(|err| AutomationError::Platform(format!("VhidLab 滚轮({z}) 失败：{err}")))
+        while remaining != 0 {
+            let chunk = remaining.clamp(vhidlab::WHEEL_MIN, vhidlab::WHEEL_MAX);
+            let z = vhidlab::notches_to_wheel_z(chunk);
+            dev.wheel(z).map_err(|err| {
+                AutomationError::Platform(format!("VhidLab 滚轮(chunk={chunk}, z={z}) 失败：{err}"))
+            })?;
+            remaining -= chunk;
+        }
+        Ok(())
     })
 }
 
