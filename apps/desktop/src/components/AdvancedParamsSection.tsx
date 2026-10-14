@@ -1,5 +1,12 @@
 import type { RuntimeConfig } from "../types";
 
+type MouseBackend = RuntimeConfig["mouse_backend"];
+const MOUSE_BACKEND_LABELS: Record<MouseBackend, string> = {
+  system: "系统指针（SendInput / 原生）",
+  ghostbox: "幽灵盒 GhostBox（硬件 HID）",
+  vhidlab: "VhidLab（虚拟 HID + 贝塞尔）",
+};
+
 interface Props {
   draft: RuntimeConfig;
   onPatch: (patch: Partial<RuntimeConfig>) => void;
@@ -140,6 +147,29 @@ export function AdvancedParamsSection({ draft, onPatch }: Props) {
         </span>
       </div>
     
+
+      <label className="field">
+        <span className="field-label">鼠标方案（Windows）</span>
+        <select
+          value={draft.mouse_backend ?? "ghostbox"}
+          onChange={(event) =>
+            onPatch({ mouse_backend: event.target.value as MouseBackend })
+          }
+        >
+          {(Object.keys(MOUSE_BACKEND_LABELS) as MouseBackend[]).map((key) => (
+            <option key={key} value={key}>
+              {MOUSE_BACKEND_LABELS[key]}
+            </option>
+          ))}
+        </select>
+        <span className="field-hint">
+          任务里的移动 / 点击 / 滚轮走哪条路径。
+          <strong>幽灵盒</strong>是原行为；
+          <strong>VhidLab</strong>走自研虚拟 HID（需本机已装驱动，移动带贝塞尔曲线）；
+          <strong>系统指针</strong>走 OS 注入（容易被客户端识破）。
+          macOS 上此项无效，始终用系统指针。保存后下次任务生效。
+        </span>
+      </label>
       <label className="field">
         <span className="field-label">YOLO API 地址</span>
         <input

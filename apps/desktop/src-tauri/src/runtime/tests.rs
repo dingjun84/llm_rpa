@@ -599,3 +599,11 @@ fn task_inputs_are_decided_by_the_workflow() {
         assert_eq!(requirement.needs_message, message, "{workflow:?} 下发的要求");
     }
 }
+
+#[test]
+fn mouse_backend_defaults_to_ghostbox() {
+    assert_eq!(
+        RuntimeConfig::default().mouse_backend,
+        crate::runtime::MouseBackend::Ghostbox
+    );
+}

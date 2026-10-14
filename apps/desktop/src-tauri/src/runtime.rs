@@ -128,6 +128,23 @@ pub struct WindowGeometry {
     pub scale_factor: f32,
 }
 
+/// 真实模式下鼠标走哪条路径（仅 Windows 有效；macOS 始终用系统指针）。
+///
+/// - `ghostbox`：厂商幽灵盒 DLL（原行为，默认）
+/// - `vhidlab`：自研 VHF 虚拟 HID（贝塞尔相对移动）
+/// - `system`：系统注入（SendInput / 平台原生），不做 HID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseBackend {
+    /// 系统原生指针注入。
+    System,
+    /// GhostBox 硬件 HID（默认，保持既有行为）。
+    #[default]
+    Ghostbox,
+    /// VhidLab 虚拟 HID（需已安装驱动）。
+    Vhidlab,
+}
+
 /// 缺字段时回落到 [`Default`]。
 ///
 /// 两个用处：
@@ -355,6 +372,9 @@ pub struct RuntimeConfig {
     /// 换了窗口尺寸就得重标（见 `docs/todo.md` T2）。所以每一项都要能回答
     /// "这一份比例是在多大的窗口上量的"——只存四个浮点数是答不出来的。
     pub area_marks: calibration::AreaMarks,
+    /// 鼠标触发方案（Windows）：幽灵盒 / VhidLab / 系统。macOS 忽略，始终系统指针。
+    #[serde(default)]
+    pub mouse_backend: MouseBackend,
     /// 远程 YOLO API 根地址（如 `http://192.168.1.22:8080`）。
     #[serde(default = "default_yolo_api_base")]
     pub yolo_api_base: String,
@@ -429,6 +449,7 @@ impl Default for RuntimeConfig {
             // 空表 = 一个新增区域都还没标。这不是"缺失"，是如实反映现状：
             // 界面会把它们显示成「未标定」，而不是画一个猜出来的框。
             area_marks: calibration::AreaMarks::new(),
+            mouse_backend: MouseBackend::Ghostbox,
             yolo_api_base: default_yolo_api_base(),
             yolo_conf: default_yolo_conf(),
         }
@@ -645,10 +666,17 @@ fn live_ports(config: &RuntimeConfig) -> Result<RunnerPorts, String> {
 
     #[cfg(any(windows, target_os = "macos"))]
     {
-        // Windows：鼠标走 GhostBox；macOS：保留原生指针（HID 不可用，编译需通过）。
+        // Windows：按配置选择鼠标后端；macOS：保留原生指针。
         #[cfg(windows)]
-        let platform: Arc<dyn automation_core::DesktopPlatform> =
-            Arc::new(crate::ghostbox_mouse::GhostboxMouseDesktop::new(platform));
+        let platform: Arc<dyn automation_core::DesktopPlatform> = match config.mouse_backend {
+            MouseBackend::System => platform,
+            MouseBackend::Ghostbox => {
+                Arc::new(crate::ghostbox_mouse::GhostboxMouseDesktop::new(platform))
+            }
+            MouseBackend::Vhidlab => {
+                Arc::new(crate::vhidlab_mouse::VhidlabMouseDesktop::new(platform))
+            }
+        };
 
         let yolo: Arc<dyn automation_core::YoloDetector> = Arc::new(
             crate::yolo_http::HttpYoloDetector::new(&config.yolo_api_base),

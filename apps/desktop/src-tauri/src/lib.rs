@@ -31,6 +31,7 @@ pub mod yolo_remote;
 pub mod yolo_http;
 pub mod ocr_http;
 pub mod ghostbox_mouse;
+pub mod vhidlab_mouse;
 pub mod runtime;
 pub mod startup_log;
 pub mod task_diagnostics;

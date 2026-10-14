@@ -58,6 +58,8 @@ ureq = "2.12"
 platform-windows = { path = "../../../crates/platform-windows" }
 # 幽灵盒 HID：仅 Windows（gbilmd64.dll）。
 ghostbox = { path = "../../../crates/ghostbox" }
+# VhidLab 虚拟 HID：仅 Windows（\\\\.\\VhidLab）。
+vhidlab = { path = "../../../crates/vhidlab" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 platform-macos = { path = "../../../crates/platform-macos" }

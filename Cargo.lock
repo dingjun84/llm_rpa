@@ -1322,6 +1322,7 @@ dependencies = [
  "tauri-plugin-opener",
  "ureq",
  "uuid",
+ "vhidlab",
  "vision",
 ]
 
@@ -6270,6 +6271,14 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vhidlab"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+ "windows 0.62.2",
+]
 
 [[package]]
 name = "vision"

@@ -21,6 +21,8 @@ members = [
   # GhostBox hardware HID replay: crates/ghostbox + tools/ghostbox-play (gbilmd64.dll).
   "crates/ghostbox",
   "tools/ghostbox-play",
+  # VhidLab virtual HID client (KMDF+VHF driver companion).
+  "crates/vhidlab",
 ]
 resolver = "2"
 

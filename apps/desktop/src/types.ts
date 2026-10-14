@@ -429,6 +429,7 @@ export interface RuntimeConfig {
    * 它要在「界面标定」的「发送按钮」那一块内被认出来。同样不能留空。
    */
   send_button_text: string;
+  mouse_backend: "system" | "ghostbox" | "vhidlab"; // Windows 鼠标方案
   /** 远程 YOLO API 根地址。 */
   yolo_api_base: string;
   /** YOLO 置信度阈值。 */
