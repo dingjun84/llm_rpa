@@ -67,8 +67,9 @@ pub fn control_points(
 
 /// Number of path samples from distance (pixels).
 pub fn sample_count(distance_px: f64) -> usize {
-    let n = 20.0 + distance_px / 18.0;
-    n.round().clamp(20.0, 60.0) as usize
+    // denser samples + motion STEP_PAUSE → slower, closer to GhostBox feel
+    let n = 28.0 + distance_px / 12.0;
+    n.round().clamp(28.0, 90.0) as usize
 }
 
 /// Plan absolute screen points from start→end along a cubic Bezier with ease-in-out.
@@ -136,10 +137,10 @@ mod tests {
     #[test]
     fn wheel_report_steps_cover_z() {
         let s = crate::protocol::wheel_report_steps(-120);
-        assert!(s.len() >= 40);
+        assert_eq!(s.len(), 120);
         assert_eq!(s.iter().map(|v| *v as i32).sum::<i32>(), -120);
-        for v in s {
-            assert!((-3..=3).contains(&(v as i32)) && v != 0);
+        for v in &s {
+            assert_eq!(*v, -1);
         }
     }
 }

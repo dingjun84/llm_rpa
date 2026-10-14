@@ -58,9 +58,9 @@ fn vhid_right_click() -> Result<(), AutomationError> {
 /// VHF 每「仓库格」折合多少 HID 滚轮单位。
 ///
 /// 实测（任务 06231c04）：单包大 Z 几乎不滚；拆包后单格仍比幽灵盒弱，
-/// 步骤6 被 overlap 回退砍到 1 格后往上爬极慢。增益 3 ≈ 对齐幽灵盒体感。
+/// 连发小包已修好「几乎不滚」；增益改回 1，避免滚得过快（任务反馈）。
 #[cfg(windows)]
-const VHID_NOTCH_GAIN: i32 = 3;
+const VHID_NOTCH_GAIN: i32 = 1;
 
 #[cfg(windows)]
 fn vhid_scroll(notches: i32) -> Result<(), AutomationError> {

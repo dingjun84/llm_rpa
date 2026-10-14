@@ -10,7 +10,7 @@ use crate::device::VhidDevice;
 use crate::error::VhidlabError;
 
 const MOVE_TIMEOUT: Duration = Duration::from_secs(2);
-const STEP_PAUSE: Duration = Duration::from_millis(4);
+const STEP_PAUSE: Duration = Duration::from_millis(12);
 const FINAL_TOLERANCE: i32 = 3;
 
 fn cursor_pos() -> Result<(i32, i32), VhidlabError> {
@@ -61,8 +61,8 @@ pub fn move_to(dev: &VhidDevice, tx: i32, ty: i32) -> Result<(), VhidlabError> {
             continue;
         }
         // Cap per-sample jump so pointer acceleration doesn't overshoot wildly.
-        let dx = dx.clamp(-40, 40);
-        let dy = dy.clamp(-40, 40);
+        let dx = dx.clamp(-18, 18);
+        let dy = dy.clamp(-18, 18);
         dev.move_relative_chunked(dx, dy)?;
         std::thread::sleep(STEP_PAUSE);
     }
@@ -96,7 +96,7 @@ pub fn move_to(dev: &VhidDevice, tx: i32, ty: i32) -> Result<(), VhidlabError> {
         } else {
             dev.move_relative_chunked(step_x, step_y)?;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
