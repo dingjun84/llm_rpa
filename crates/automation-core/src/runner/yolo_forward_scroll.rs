@@ -5,14 +5,14 @@
 //! 本模块只用仓库约定：`notches > 0` = 向下（更新的消息），`< 0` = 向上（更早）。
 //!
 //! 到底 / 到顶：只对**气泡区**截图取指纹，滚动并停稳后连续 2 帧不变即判定。
-//! 防漏：每步约滚气泡区高度的 60%（保留 ~40% 重叠），滚后核对上一屏最上面气泡的文字
+//! 防漏：每步约滚气泡区高度的 35%（封顶 8 格；overlap 失败减半并本轮记住），滚后核对上一屏最上面气泡的文字
 //! 仍在新屏；不在则回退半步并减小步长。
 
 use std::time::{Duration, Instant};
 
-use crate::ports::{AutomationError, Point, Rect};
+use crate::ports::{AutomationError, Point, Rect, Screenshot};
 use crate::yolo::{
-    all_by_class, class, random_point_in_central_half, shot_point_to_screen, YoloDetection,
+    all_by_class, class, shot_point_to_screen, YoloDetection,
 };
 
 use super::Run;
@@ -20,6 +20,8 @@ use super::Run;
 /// 一格滚轮在企业微信消息区大约滚动的像素（Windows 默认 3 行）。用于把「60% 高度」换成格数。
 /// 任务 1decbea4：按 60px/格算出 5 格，实测滚得太少；改 20px/格（约 3 倍），过量由重叠核对回退兜底。
 const PX_PER_NOTCH: i32 = 20;
+/// 初始向上步长上限：公式常给出 15+，VhidLab 实测过大→反复 overlap 回退。
+const MAX_INITIAL_STEP: i32 = 8;
 /// 到底：先一次大跳，再小步确认。
 const BOTTOM_JUMP_NOTCHES: i32 = 120;
 /// 任务 3f028f56：3 格×8 次没滚到底（幽灵盒每格位移小），改 15 格×最多 15 次。
@@ -31,9 +33,12 @@ const SCROLL_SETTLE: Duration = Duration::from_millis(250);
 const TOP_LAZY_LOAD_WAIT: Duration = Duration::from_millis(700);
 /// 向上找气泡的上限。
 const SEARCH_MAX_STEPS: usize = 20;
+/// 右击后等菜单出现；未见则重识别再点。
+const RIGHT_CLICK_MENU_WAIT: Duration = Duration::from_millis(900);
+const RIGHT_CLICK_MAX_TRIES: usize = 3;
 const SEARCH_BUDGET: Duration = Duration::from_secs(40);
 /// 每步滚动占气泡区高度的比例。
-const STEP_RATIO: f32 = 0.6;
+const STEP_RATIO: f32 = 0.35;
 /// 气泡贴边判定（图像像素）。
 const EDGE_PX: i32 = 4;
 
@@ -69,7 +74,21 @@ pub(super) fn chat_area_img(w: u32, h: u32, dets: &[YoloDetection]) -> Rect {
 pub(super) fn step_notches(area_h_img: i32, shot_h: u32, window_h: i32) -> i32 {
     let scale = window_h as f32 / shot_h.max(1) as f32;
     let px = area_h_img as f32 * scale * STEP_RATIO;
-    ((px / PX_PER_NOTCH as f32).round() as i32).max(1)
+    let n = ((px / PX_PER_NOTCH as f32).round() as i32).max(1);
+    n.min(MAX_INITIAL_STEP)
+}
+
+/// 重叠核对用短钥匙：整段 OCR 偶发抖动会导致假失败；取前若干字即可。
+fn overlap_key(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).take(16).collect()
+}
+
+fn looks_like_context_menu(w: &crate::ports::PeerTopWindow) -> bool {
+    let title = w.title.to_lowercase();
+    title.contains("menu")
+        || w.class_name.contains("DuiMenu")
+        || w.class_name.contains("Menu")
+        || (!w.is_main && w.rect.height < 400 && w.rect.width < 400)
 }
 
 /// 图像坐标矩形 → 屏幕矩形。
@@ -140,19 +159,27 @@ impl Run<'_> {
     }
 
     /// 步骤6：当前屏找含 `message_text` 的气泡（多条取最下=最新）；没有就向上滚一步再找。
+    ///
+    /// 向上步长：公式初值（封顶 [`MAX_INITIAL_STEP`]）；overlap 失败则减半并**本轮记住**，
+    /// 后续不再用过大步子。右击用气泡几何中心；点后短等菜单，未见则重识别再点。
     pub(super) fn forward_right_click_bubble(&mut self, message_text: &str) -> Result<(), AutomationError> {
         let started = Instant::now();
         let mut notches: Option<i32> = None;
-        let mut prev_top_text: Option<String> = None;
+        let mut prev_top_key: Option<String> = None;
         let mut edge_fixes = 0;
         let mut backed_off = false;
+        let mut learned = false;
         for step in 0..=SEARCH_MAX_STEPS {
             let label = format!("转发·6·找气泡#{step}");
             let (window, shot, dets) = self.yolo_detect_window(&label)?;
             let area_img = chat_area_img(shot.width, shot.height, &dets);
             let area = img_rect_to_screen(area_img, window, shot.width, shot.height);
             let at = Point { x: area.x + area.width / 2, y: area.y + area.height / 2 };
-            let n = *notches.get_or_insert_with(|| step_notches(area_img.height, shot.height, window.height));
+            let n = *notches.get_or_insert_with(|| {
+                let v = step_notches(area_img.height, shot.height, window.height);
+                self.evidence.push(format!("步骤6：初始向上步长 {v} 格（封顶 {MAX_INITIAL_STEP}）"));
+                v
+            });
 
             let mut bubbles = bubbles_of(&dets);
             bubbles.sort_by_key(|b| b.bounds_rect().y);
@@ -162,18 +189,27 @@ impl Run<'_> {
                 .map(|bs| bs.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(""))
                 .collect();
 
-            // 防漏：上一屏最上面气泡的文字应仍在本屏（重叠区）。
-            if let Some(pt) = prev_top_text.as_ref().filter(|t| !t.trim().is_empty()) {
-                let seen = texts.iter().any(|t| t.contains(pt.as_str()) || pt.contains(t.as_str()) && !t.is_empty());
+            // 防漏：上一屏顶部气泡短钥匙应仍在本屏（重叠区）。
+            if let Some(pk) = prev_top_key.as_ref().filter(|t| t.chars().count() >= 4) {
+                let seen = texts.iter().any(|t| {
+                    let k = overlap_key(t);
+                    !k.is_empty() && (k.contains(pk.as_str()) || pk.contains(k.as_str()) || t.contains(pk.as_str()))
+                });
                 if !seen && !backed_off && n > 1 {
                     let back = (n / 2).max(1);
                     self.evidence.push(format!(
-                        "步骤6：重叠核对失败（上屏顶部「{pt}」不在本屏）→ 回退 {back} 格，步长 {n}→{back}"
+                        "步骤6：重叠核对失败（钥匙「{pk}」不在本屏）→ 回退 {back} 格，本轮记住步长 {n}→{back}"
                     ));
                     self.wheel(at, back, window)?;
                     notches = Some(back);
+                    learned = true;
                     backed_off = true;
                     continue;
+                }
+                if seen && !learned {
+                    // 首轮 overlap 通过：锁定当前步长，避免后面又被公式抬高（notches 已固定）。
+                    learned = true;
+                    self.evidence.push(format!("步骤6：重叠通过，本轮锁定向上步长 {n} 格"));
                 }
             }
             backed_off = false;
@@ -194,16 +230,7 @@ impl Run<'_> {
                     self.wheel(at, adj, window)?;
                     continue;
                 }
-                let img_pt = random_point_in_central_half(r);
-                let target = shot_point_to_screen(img_pt.x, img_pt.y, window, shot.width, shot.height);
-                self.evidence.push(format!(
-                    "步骤6：第 {step} 屏命中 {} conf={:.2} → 右击 ({}, {})",
-                    det.class_name, det.conf, target.x, target.y
-                ));
-                self.ensure_not_frozen("已取消右击气泡")?;
-                timed!(self, "右击 guarded_right_click", {
-                    self.runner.ports.platform.guarded_right_click(target, window)
-                })?;
+                self.right_click_bubble_with_retry(message_text, &det, &window, &shot)?;
                 self.note_elapsed("步骤6 找气泡", concat!(file!(), ":", line!()), started.elapsed());
                 return self.check_deadline("右击气泡");
             }
@@ -212,11 +239,9 @@ impl Run<'_> {
                 break;
             }
 
-            // 向上滚一步；指纹不变（含懒加载复核）即到顶。
-            prev_top_text = texts.first().cloned();
+            prev_top_key = texts.first().map(|t| overlap_key(t)).filter(|k| !k.is_empty());
             let before = self.chat_fp(area)?;
             self.wheel(at, -n, window)?;
-            // 每滚一步是一次独立尝试：重置单步计时（同 list.rs），总上限由 SEARCH_BUDGET 管。
             self.step_started = Instant::now();
             if self.chat_fp(area)? == before {
                 std::thread::sleep(TOP_LAZY_LOAD_WAIT);
@@ -234,6 +259,88 @@ impl Run<'_> {
             started.elapsed().as_secs()
         )))
     }
+
+    /// 右击气泡：几何中心落点；短等菜单；未见则整窗重识别同文气泡再点（最多 [`RIGHT_CLICK_MAX_TRIES`]）。
+    fn right_click_bubble_with_retry(
+        &mut self,
+        message_text: &str,
+        first: &YoloDetection,
+        window0: &Rect,
+        shot0: &Screenshot,
+    ) -> Result<(), AutomationError> {
+        let mut det = first.clone();
+        let mut window = *window0;
+        let mut shot_w = shot0.width;
+        let mut shot_h = shot0.height;
+        for try_no in 1..=RIGHT_CLICK_MAX_TRIES {
+            if try_no > 1 {
+                let label = format!("转发·6·右击重识别#{try_no}");
+                let (w, shot, dets) = self.yolo_detect_window(&label)?;
+                window = w;
+                shot_w = shot.width;
+                shot_h = shot.height;
+                let mut bubbles = bubbles_of(&dets);
+                bubbles.sort_by_key(|b| b.bounds_rect().y);
+                let ocr = self.yolo_ocr_bboxes(window, &shot, &bubbles, &format!("{label}·OCR"))?;
+                let texts: Vec<String> = ocr
+                    .iter()
+                    .map(|bs| bs.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join(""))
+                    .collect();
+                let hit = bubbles
+                    .iter()
+                    .zip(texts.iter())
+                    .filter(|(_, t)| t.contains(message_text))
+                    .map(|(d, _)| d.clone())
+                    .last();
+                let Some(d) = hit else {
+                    self.evidence.push(format!(
+                        "步骤6：右击重试 {try_no}/{RIGHT_CLICK_MAX_TRIES} 未再找到含「{message_text}」的气泡"
+                    ));
+                    continue;
+                };
+                det = d;
+            }
+            let r = det.bounds_rect();
+            // 右击用几何中心：中心半区随机在任务 bc3e4263 上偏了一点点导致菜单未出。
+            let img_pt = Point {
+                x: r.x + r.width.max(1) / 2,
+                y: r.y + r.height.max(1) / 2,
+            };
+            let target = shot_point_to_screen(img_pt.x, img_pt.y, window, shot_w, shot_h);
+            self.evidence.push(format!(
+                "步骤6：右击尝试 {try_no}/{RIGHT_CLICK_MAX_TRIES} {} conf={:.2} → 中心 ({}, {})",
+                det.class_name, det.conf, target.x, target.y
+            ));
+            self.ensure_not_frozen("已取消右击气泡")?;
+            timed!(self, "右击 guarded_right_click", {
+                self.runner.ports.platform.guarded_right_click(target, window)
+            })?;
+            if self.wait_context_menu(RIGHT_CLICK_MENU_WAIT)? {
+                self.evidence.push(format!("步骤6：右击尝试 {try_no} 后菜单已出现"));
+                return Ok(());
+            }
+            self.evidence.push(format!(
+                "步骤6：右击尝试 {try_no} 后未见菜单窗，准备重识别再点"
+            ));
+            std::thread::sleep(Duration::from_millis(120));
+        }
+        // 仍交给步骤7 完整轮询 OCR「转发」——这里只尽量提高菜单出现概率。
+        self.evidence.push("步骤6：多次右击仍未见菜单窗，交步骤7 继续轮询".into());
+        Ok(())
+    }
+
+    fn wait_context_menu(&self, budget: Duration) -> Result<bool, AutomationError> {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            let peers = self.runner.ports.platform.list_peer_top_windows()?;
+            if peers.iter().any(looks_like_context_menu) {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(false)
+    }
+
 }
 
 #[cfg(test)]
@@ -245,10 +352,17 @@ mod tests {
     }
 
     #[test]
-    fn step_is_sixty_percent_of_area() {
-        // 500px 高（1:1 缩放）→ 300px → 15 格
-        assert_eq!(step_notches(500, 1000, 1000), 15);
+    fn step_is_capped_fraction_of_area() {
+        // 500px 高 ×0.35 → 175px → 9 格，封顶 8
+        assert_eq!(step_notches(500, 1000, 1000), 8);
         assert_eq!(step_notches(20, 1000, 1000), 1);
+        assert_eq!(step_notches(200, 1000, 1000), 4); // 70px → 4
+    }
+
+    #[test]
+    fn overlap_key_trims() {
+        assert_eq!(overlap_key("  hello world 12345"), "helloworld12345");
+        assert_eq!(overlap_key("一二三四五六七八九十一二三四五六七八").chars().count(), 16);
     }
 
     #[test]
