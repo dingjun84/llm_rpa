@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::ports::{AutomationError, Point, Rect, Screenshot};
 use crate::yolo::{
-    all_by_class, class, shot_point_to_screen, YoloDetection,
+    all_by_class, class, random_point_in_central_half, shot_point_to_screen, YoloDetection,
 };
 
 use super::Run;
@@ -161,7 +161,7 @@ impl Run<'_> {
     /// 步骤6：当前屏找含 `message_text` 的气泡（多条取最下=最新）；没有就向上滚一步再找。
     ///
     /// 向上步长：公式初值（封顶 [`MAX_INITIAL_STEP`]）；overlap 失败则减半并**本轮记住**，
-    /// 后续不再用过大步子。右击用气泡几何中心；点后短等菜单，未见则重识别再点。
+    /// 后续不再用过大步子。右击仍中心半区随机；点后短等菜单，未见则重识别再点。
     pub(super) fn forward_right_click_bubble(&mut self, message_text: &str) -> Result<(), AutomationError> {
         let started = Instant::now();
         let mut notches: Option<i32> = None;
@@ -260,7 +260,7 @@ impl Run<'_> {
         )))
     }
 
-    /// 右击气泡：几何中心落点；短等菜单；未见则整窗重识别同文气泡再点（最多 [`RIGHT_CLICK_MAX_TRIES`]）。
+    /// 右击气泡：中心半区随机落点；短等菜单；未见则整窗重识别同文气泡再点（最多 [`RIGHT_CLICK_MAX_TRIES`]）。
     fn right_click_bubble_with_retry(
         &mut self,
         message_text: &str,
@@ -301,14 +301,11 @@ impl Run<'_> {
                 det = d;
             }
             let r = det.bounds_rect();
-            // 右击用几何中心：中心半区随机在任务 bc3e4263 上偏了一点点导致菜单未出。
-            let img_pt = Point {
-                x: r.x + r.width.max(1) / 2,
-                y: r.y + r.height.max(1) / 2,
-            };
+            // 落点仍用中心半区随机（与其它 YOLO 点击一致）；点偏靠重试兜底。
+            let img_pt = random_point_in_central_half(r);
             let target = shot_point_to_screen(img_pt.x, img_pt.y, window, shot_w, shot_h);
             self.evidence.push(format!(
-                "步骤6：右击尝试 {try_no}/{RIGHT_CLICK_MAX_TRIES} {} conf={:.2} → 中心 ({}, {})",
+                "步骤6：右击尝试 {try_no}/{RIGHT_CLICK_MAX_TRIES} {} conf={:.2} → 随机半区 ({}, {})",
                 det.class_name, det.conf, target.x, target.y
             ));
             self.ensure_not_frozen("已取消右击气泡")?;
